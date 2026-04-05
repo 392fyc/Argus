@@ -298,22 +298,156 @@ def apply_patch():
         gh_mod.GithubProvider.publish_comment = patched_publish_comment
 
         # -- Step B: After original run, combine body + inline → one Review --
+        # -- with conditional approval algorithm --
         original_run = pr_reviewer.PRReviewer.run
 
-        async def patched_run(self):
-            """Run original /review, then post unified GitHub Review."""
-            # Clear capture state
-            self.git_provider._argus_review_body = None
+        # Approval config
+        BLOCKING_SEVERITIES = {"Critical", "Major"}
+        MAX_ITERATIONS = 5
+        BOT_LOGIN = "argus-review[bot]"
 
-            # Run original — it generates prediction, captures body via patched publish
+        def _classify_finding_severity(issue_header: str) -> str:
+            h = issue_header.lower()
+            if any(k in h for k in ("critical", "bug", "security")):
+                return "Critical"
+            if any(k in h for k in ("possible", "error", "major")):
+                return "Major"
+            if any(k in h for k in ("performance", "issue", "medium")):
+                return "Medium"
+            return "Minor"
+
+        def _get_thread_state(provider, pr_number):
+            """Query unresolved Argus threads + past review count via GitHub API."""
+            import requests as _requests
+            import json as _json
+
+            try:
+                # Use PyGithub's requester for authenticated access
+                repo = provider.repo
+                if not repo:
+                    return [], 0
+
+                # repo can be PyGithub object or string
+                full_name = repo.full_name if hasattr(repo, 'full_name') else str(repo)
+                owner, name = full_name.split("/", 1)
+
+                # GraphQL query via PyGithub's underlying requester
+                query = """
+                {
+                  repository(owner: "%s", name: "%s") {
+                    pullRequest(number: %d) {
+                      reviewThreads(first: 100) {
+                        nodes {
+                          isResolved
+                          comments(first: 3) {
+                            nodes { author { login } body }
+                          }
+                        }
+                      }
+                      reviews(first: 50) {
+                        nodes { author { login } state }
+                      }
+                    }
+                  }
+                }""" % (owner, name, pr_number)
+
+                # Get auth token from PyGithub's connection (varies by version)
+                try:
+                    token = provider.github_client._Github__requester._Requester__auth.token
+                except AttributeError:
+                    try:
+                        token = provider.github_client._Github__requester.auth.token
+                    except AttributeError:
+                        # Fallback: get from settings
+                        from pr_agent.config_loader import get_settings
+                        token = get_settings().get("github.user_token", "")
+                headers = {
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                }
+                resp = _requests.post(
+                    "https://api.github.com/graphql",
+                    json={"query": query},
+                    headers=headers,
+                    timeout=30,
+                )
+                data = resp.json()
+                pr_data = data["data"]["repository"]["pullRequest"]
+
+                # Unresolved threads from Argus
+                threads = pr_data["reviewThreads"]["nodes"]
+                argus_unresolved = []
+                for t in threads:
+                    authors = [c["author"]["login"] for c in t["comments"]["nodes"]
+                               if c.get("author")]
+                    if BOT_LOGIN in authors and not t["isResolved"]:
+                        argus_unresolved.append(t)
+
+                # Count past Argus reviews
+                reviews = pr_data["reviews"]["nodes"]
+                argus_review_count = sum(
+                    1 for r in reviews
+                    if r.get("author", {}).get("login") == BOT_LOGIN
+                )
+
+                print(f"[Argus] Thread state: {len(argus_unresolved)} unresolved, {argus_review_count} past reviews")
+                return argus_unresolved, argus_review_count
+            except Exception as e:
+                print(f"[Argus] GraphQL thread check failed: {e}")
+                import traceback
+                traceback.print_exc()
+                return [], 0
+
+        def _decide_review_event(findings, unresolved_threads, iteration):
+            """
+            Returns (event, reason):
+              "REQUEST_CHANGES" — blocking issues found
+              "APPROVE"         — all clear
+              "COMMENT"         — non-blocking / first review / escalation
+            """
+            critical_major = [f for f in findings
+                              if _classify_finding_severity(f.get("issue_header", "")) in BLOCKING_SEVERITIES]
+
+            # Rule 1: First review never approves
+            if iteration <= 1:
+                if critical_major:
+                    return ("REQUEST_CHANGES",
+                            f"🔴 {len(critical_major)} critical/major issue(s) found — changes requested.")
+                return ("COMMENT",
+                        "Initial review complete — no blocking issues found.")
+
+            # Rule 2: Unresolved threads from previous reviews
+            if unresolved_threads:
+                return ("REQUEST_CHANGES",
+                        f"🔴 {len(unresolved_threads)} unresolved thread(s) from previous review.")
+
+            # Rule 3: New critical/major findings
+            if critical_major:
+                return ("REQUEST_CHANGES",
+                        f"🔴 {len(critical_major)} new critical/major issue(s) in this review.")
+
+            # Rule 4: Max iterations → escalate to human
+            if iteration >= MAX_ITERATIONS:
+                return ("COMMENT",
+                        f"⚠️ Review iteration {iteration}/{MAX_ITERATIONS} reached. "
+                        f"Escalating to human reviewer.")
+
+            # Rule 5: All clear → approve
+            return ("APPROVE",
+                    f"✅ All threads resolved, no critical/major issues. "
+                    f"Review iteration {iteration}/{MAX_ITERATIONS}.")
+
+        async def patched_run(self):
+            """Run /review with conditional approval algorithm."""
+            self.git_provider._argus_review_body = None
             result = await original_run(self)
 
             review_body = getattr(self.git_provider, '_argus_review_body', None)
             if not review_body:
-                # Body wasn't captured (maybe no issues found), nothing to do
                 return result
 
-            # Build inline comments from key_issues
+            # Parse findings from prediction
+            findings = []
             inline_comments = []
             try:
                 if hasattr(self, 'prediction') and self.prediction:
@@ -326,10 +460,10 @@ def apply_patch():
                                      first_key="review", last_key="key_issues_to_review")
 
                     if data and 'review' in data:
-                        issues = data['review'].get('key_issues_to_review', [])
+                        findings = data['review'].get('key_issues_to_review', [])
                         diff_files = self.git_provider.diff_files or self.git_provider.get_diff_files()
 
-                        for issue in issues:
+                        for issue in findings:
                             try:
                                 filepath = issue.get('relevant_file', '').strip()
                                 end_line = int(issue.get('end_line', 0))
@@ -350,41 +484,51 @@ def apply_patch():
             except Exception as e:
                 print(f"[Argus] Failed to parse key_issues: {e}")
 
-            # Post unified review: body + inline comments in ONE create_review call
+            # Get thread state + iteration count
+            pr_number = self.git_provider.pr_num if hasattr(self.git_provider, 'pr_num') else 0
+            unresolved_threads, past_reviews = _get_thread_state(self.git_provider, pr_number)
+            iteration = past_reviews + 1
+
+            # Decide review event
+            event, reason = _decide_review_event(findings, unresolved_threads, iteration)
+
+            # Append decision to review body
+            review_body += f"\n\n---\n**Review Decision**: {reason}\n"
+            review_body += f"*Iteration {iteration}/{MAX_ITERATIONS} | "
+            review_body += f"{len(findings)} findings | "
+            review_body += f"{len(unresolved_threads)} unresolved threads*"
+
+            # Post unified review
             try:
                 self.git_provider.pr.create_review(
                     commit=self.git_provider.last_commit_id,
                     body=review_body,
-                    event="COMMENT",
+                    event=event,
                     comments=inline_comments,
                 )
                 n = len(inline_comments)
-                print(f"[Argus] Posted unified review ({len(review_body)} chars, {n} inline threads)")
+                print(f"[Argus] Posted {event} review ({n} inline, iteration {iteration})")
             except Exception as e:
-                print(f"[Argus] Unified review failed ({e}), posting body only")
+                print(f"[Argus] Unified review failed ({e}), fallback to COMMENT")
                 try:
                     self.git_provider.pr.create_review(
                         commit=self.git_provider.last_commit_id,
                         body=review_body,
                         event="COMMENT",
+                        comments=inline_comments,
                     )
-                    # Post inline separately as fallback
-                    if inline_comments:
-                        self.git_provider.pr.create_review(
-                            commit=self.git_provider.last_commit_id,
-                            comments=inline_comments,
-                        )
                 except Exception as e2:
-                    print(f"[Argus] All review posting failed ({e2}), using original publish")
+                    print(f"[Argus] All posting failed ({e2})")
                     original_publish_comment(self.git_provider, review_body)
 
-            # Edit the placeholder comment to point to the review
+            # Edit placeholder
             try:
                 if hasattr(self.git_provider, 'pr') and hasattr(self.git_provider.pr, 'comments_list'):
                     for c in getattr(self.git_provider.pr, 'comments_list', []):
                         if getattr(c, 'is_temporary', False):
                             n = len(inline_comments)
-                            c.edit(f"✅ Review complete — **{n} findings** posted as inline threads above.")
+                            status = "✅" if event == "APPROVE" else "🔴" if event == "REQUEST_CHANGES" else "💬"
+                            c.edit(f"{status} Review complete — **{n} findings** | {reason}")
                             break
             except Exception:
                 try:
@@ -395,6 +539,6 @@ def apply_patch():
             return result
 
         pr_reviewer.PRReviewer.run = patched_run
-        print("[Argus] /review unified (body + inline) patched")
+        print("[Argus] /review with conditional approval patched")
     except Exception as e:
         print(f"[Argus] Failed to patch /review: {e}")
