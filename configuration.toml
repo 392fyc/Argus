@@ -100,6 +100,7 @@ final_update_message = true
 enable_help_text=false
 enable_help_comment=false
 enable_pr_diagram=true # adds a section with a diagram of the PR changes
+enable_large_pr_handling=false  # Workaround for PR-Agent Bug #2238 (DynaBox crash)
 # describe as comment
 publish_description_as_comment=false
 publish_description_as_comment_persistent=true
@@ -240,7 +241,7 @@ push_trigger_pending_tasks_backlog = true
 push_trigger_pending_tasks_ttl = 300
 push_commands = [
     "/describe",
-    "/review",
+    "/review -i",
 ]
 
 [gitlab]

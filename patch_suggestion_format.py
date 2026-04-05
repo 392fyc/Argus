@@ -3,6 +3,8 @@ Argus — Patches PR-Agent output to CodeRabbit-style structured format.
 
 Review body: summary + aggregated 🤖 Prompt for all comments
 Inline threads: severity badge, description, suggestion, committable, agent prompt
+Thread auto-resolve: resolve outdated threads after push
+@mention support: rewrite @argus-review mentions as /ask commands
 
 Reference: CodeRabbit PR review format (2026)
 """
@@ -211,6 +213,288 @@ def build_aggregated_agent_prompt(issues: list) -> str:
     return "\n".join(lines)
 
 
+def build_review_body_additions(findings: list, inline_count: int,
+                                diff_files=None) -> str:
+    """Build CodeRabbit-style additions to prepend/append to review body.
+
+    Adds: actionable comments count, aggregated AI prompt, review info.
+    """
+    parts = []
+
+    # Actionable comments count (CodeRabbit header)
+    parts.append(f"**Actionable comments posted: {inline_count}**")
+    parts.append("")
+
+    # Aggregated AI prompt for all findings
+    if findings:
+        prompt = build_aggregated_agent_prompt(findings)
+        parts.append("<details>")
+        parts.append("<summary>🤖 Prompt for all review comments with AI agents</summary>")
+        parts.append("")
+        parts.append("```")
+        parts.append(prompt)
+        parts.append("```")
+        parts.append("")
+        parts.append("</details>")
+        parts.append("")
+
+    # Review info section
+    file_list = []
+    if diff_files:
+        try:
+            file_list = [getattr(f, 'filename', str(f)) for f in diff_files[:30]]
+        except Exception:
+            pass
+
+    parts.append("---")
+    parts.append("")
+    parts.append("<details>")
+    parts.append("<summary>ℹ️ Review info</summary>")
+    parts.append("")
+    parts.append("<details>")
+    parts.append("<summary>⚙️ Configuration</summary>")
+    parts.append("")
+    parts.append("**Engine**: PR-Agent 0.34 + Argus patches")
+    parts.append("**Model**: gpt-5.3-codex")
+    parts.append("**Mode**: CodeRabbit-compatible")
+    parts.append("")
+    parts.append("</details>")
+    parts.append("")
+    if file_list:
+        parts.append("<details>")
+        parts.append(f"<summary>📒 Files reviewed ({len(file_list)})</summary>")
+        parts.append("")
+        for f in file_list:
+            parts.append(f"* `{f}`")
+        parts.append("")
+        parts.append("</details>")
+        parts.append("")
+    parts.append("</details>")
+
+    return "\n".join(parts)
+
+
+# ── Thread auto-resolve ──────────────────────────────────────────
+
+def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[bot]"):
+    """Resolve Argus review threads where the underlying code has changed.
+
+    Uses GitHub GraphQL resolveReviewThread mutation.
+    Only resolves threads that are:
+    - Authored by Argus
+    - Marked as outdated (code was modified in subsequent commit)
+    - Have no human replies (to preserve discussion)
+
+    Refs:
+    - https://docs.github.com/en/graphql/reference/mutations#resolvereviewthread
+    - Permission required: Contents: Write
+    """
+    import requests as _req
+
+    try:
+        repo = provider.repo
+        if not repo:
+            return 0
+        full_name = repo.full_name if hasattr(repo, 'full_name') else str(repo)
+        owner, name = full_name.split("/", 1)
+
+        # Get token
+        token = _get_github_token(provider)
+        if not token:
+            print("[Argus] No token — skipping auto-resolve")
+            return 0
+
+        auth_h = {"Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json"}
+
+        # Query all unresolved threads with isOutdated flag
+        # Fetch up to 20 comments per thread to reliably detect human replies
+        query = """{
+          repository(owner: "%s", name: "%s") {
+            pullRequest(number: %d) {
+              reviewThreads(first: 100) {
+                nodes {
+                  id
+                  isResolved
+                  isOutdated
+                  comments(first: 20) {
+                    totalCount
+                    nodes {
+                      author { login }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }""" % (owner, name, pr_number)
+
+        g = _req.post("https://api.github.com/graphql",
+                      json={"query": query}, headers=auth_h, timeout=15)
+        if g.status_code != 200 or "data" not in g.json():
+            print(f"[Argus] Auto-resolve query failed: {g.status_code}")
+            return 0
+
+        threads = g.json()["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+        resolved_count = 0
+
+        for t in threads:
+            # Only unresolved + outdated threads
+            if t["isResolved"] or not t.get("isOutdated", False):
+                continue
+
+            # Only Argus-authored threads
+            comments = t["comments"]
+            authors = [c["author"]["login"]
+                       for c in comments["nodes"]
+                       if c.get("author")]
+            if bot_login not in authors:
+                continue
+
+            # Skip threads with human replies (preserve discussion)
+            # Also skip if we couldn't fetch all comments (totalCount > fetched)
+            human_authors = [a for a in authors if a != bot_login]
+            if human_authors:
+                continue
+            if comments.get("totalCount", 0) > len(comments["nodes"]):
+                continue
+
+            # Resolve via GraphQL mutation
+            thread_id = t["id"]
+            mutation = """mutation {
+              resolveReviewThread(input: {threadId: "%s"}) {
+                thread { isResolved }
+              }
+            }""" % thread_id
+
+            m = _req.post("https://api.github.com/graphql",
+                          json={"query": mutation}, headers=auth_h, timeout=10)
+            if m.status_code == 200:
+                data = m.json()
+                if data.get("data", {}).get("resolveReviewThread", {}).get("thread", {}).get("isResolved"):
+                    resolved_count += 1
+                elif data.get("errors"):
+                    print(f"[Argus] Resolve failed for {thread_id}: {data['errors']}")
+            else:
+                print(f"[Argus] Resolve request failed: {m.status_code}")
+
+        if resolved_count:
+            print(f"[Argus] Auto-resolved {resolved_count} outdated thread(s)")
+        return resolved_count
+
+    except Exception as e:
+        print(f"[Argus] Auto-resolve failed: {e}")
+        return 0
+
+
+def _get_github_token(provider):
+    """Extract GitHub token from PR-Agent provider."""
+    token = None
+    try:
+        token = provider.github_client._Github__requester._Requester__auth.token
+    except Exception:
+        pass
+    if not token:
+        try:
+            token = provider.github_client._Github__requester.auth.token
+        except Exception:
+            pass
+    if not token:
+        try:
+            from pr_agent.config_loader import get_settings
+            token = get_settings().get("github.user_token", "")
+        except Exception:
+            pass
+    return token
+
+
+# ── Walkthrough format ────────────────────────────────────────────
+
+def format_walkthrough_comment(data: dict, diagram: str = "") -> str:
+    """Format /describe prediction as CodeRabbit-style walkthrough comment.
+
+    Args:
+        data: Parsed prediction dict with keys: description, pr_files, type
+        diagram: Optional Mermaid diagram string
+    """
+    parts = []
+    parts.append("<!-- walkthrough_start -->")
+    parts.append("<details open>")
+    parts.append("<summary>📝 Walkthrough</summary>")
+    parts.append("")
+
+    # Summary section
+    description = data.get("description", "")
+    if description:
+        parts.append("## Summary")
+        parts.append("")
+        # description may be a string with bullet points or a plain string
+        if isinstance(description, str):
+            for line in description.strip().split("\n"):
+                line = line.strip()
+                if line and not line.startswith("-"):
+                    line = f"- {line}"
+                if line:
+                    parts.append(line)
+        parts.append("")
+
+    # Changes table grouped by semantic label
+    pr_files = data.get("pr_files", [])
+    if pr_files and isinstance(pr_files, list):
+        parts.append("## Changes")
+        parts.append("")
+        parts.append("| Files | Summary |")
+        parts.append("|-------|---------|")
+
+        # Group files by label
+        groups = {}
+        for f in pr_files:
+            if not isinstance(f, dict):
+                continue
+            label = str(f.get("label", "other") or "other").strip()
+            groups.setdefault(label, []).append(f)
+
+        for label, files in groups.items():
+            filenames = ", ".join(
+                f"`{str(f.get('filename', '?') or '?')}`" for f in files)
+            # Combine summaries
+            summaries = []
+            for f in files:
+                title = str(f.get("changes_title", "") or "").strip()
+                # Escape pipe characters that break Markdown tables
+                title = title.replace("|", "\\|").replace("\n", " ")
+                if title:
+                    summaries.append(title)
+            summary_text = "; ".join(summaries) if summaries else "—"
+            parts.append(f"| **{label}** {filenames} | {summary_text} |")
+
+        if not groups:
+            # Remove empty table header if no valid files
+            parts.pop()  # "|-------|---------|"
+            parts.pop()  # "| Files | Summary |"
+
+        parts.append("")
+
+    # Diagram section
+    if diagram and isinstance(diagram, str) and diagram.strip():
+        parts.append("## Diagram")
+        parts.append("")
+        # Diagram may already be wrapped in ```mermaid``` or not
+        diag = diagram.strip()
+        if not diag.startswith("```"):
+            parts.append("```mermaid")
+            parts.append(diag)
+            parts.append("```")
+        else:
+            parts.append(diag)
+        parts.append("")
+
+    parts.append("</details>")
+    parts.append("<!-- walkthrough_end -->")
+
+    return "\n".join(parts)
+
+
 # ── Apply patches ─────────────────────────────────────────────────
 
 def apply_patch():
@@ -303,7 +587,7 @@ def apply_patch():
 
         # Approval config
         BLOCKING_SEVERITIES = {"Critical", "Major"}
-        MAX_ITERATIONS = 5
+        MAX_ITERATIONS = 10
         BOT_LOGIN = "argus-review[bot]"
 
         def _classify_finding_severity(issue_header: str) -> str:
@@ -332,20 +616,7 @@ def apply_patch():
                 full_name = repo.full_name if hasattr(repo, 'full_name') else str(repo)
                 owner, name = full_name.split("/", 1)
 
-                # Get token from PyGithub or fallback to user_token
-                token = None
-                try:
-                    token = provider.github_client._Github__requester._Requester__auth.token
-                except Exception:
-                    pass
-                if not token:
-                    try:
-                        token = provider.github_client._Github__requester.auth.token
-                    except Exception:
-                        pass
-                if not token:
-                    from pr_agent.config_loader import get_settings
-                    token = get_settings().get("github.user_token", "")
+                token = _get_github_token(provider)
                 if not token:
                     print("[Argus] No token — skipping thread check")
                     return [], 0
@@ -353,26 +624,32 @@ def apply_patch():
                 auth_h = {"Authorization": f"Bearer {token}",
                           "Accept": "application/vnd.github+json"}
 
-                # REST: count past Argus reviews
+                # REST: count past Argus /review reviews only (exclude /improve, /describe)
                 argus_review_count = 0
                 r = _req.get(f"https://api.github.com/repos/{full_name}/pulls/{pr_number}/reviews",
                              headers=auth_h, timeout=15)
                 if r.status_code == 200:
                     argus_review_count = sum(
                         1 for rv in r.json()
-                        if rv.get("user", {}).get("login") == BOT_LOGIN)
+                        if rv.get("user", {}).get("login") == BOT_LOGIN
+                        and "PR Reviewer Guide" in (rv.get("body") or ""))
 
-                # GraphQL: thread resolution
+                # GraphQL: thread resolution (exclude /improve suggestion threads)
                 argus_unresolved = []
-                query = '{repository(owner:"%s",name:"%s"){pullRequest(number:%d){reviewThreads(first:100){nodes{isResolved comments(first:3){nodes{author{login}}}}}}}}' % (owner, name, pr_number)
+                query = '{repository(owner:"%s",name:"%s"){pullRequest(number:%d){reviewThreads(first:100){nodes{isResolved isOutdated comments(first:3){nodes{author{login} body}}}}}}}' % (owner, name, pr_number)
                 g = _req.post("https://api.github.com/graphql",
                               json={"query": query}, headers=auth_h, timeout=15)
                 if g.status_code == 200 and "data" in g.json():
                     threads = g.json()["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
                     for t in threads:
                         authors = [c["author"]["login"] for c in t["comments"]["nodes"] if c.get("author")]
-                        if BOT_LOGIN in authors and not t["isResolved"]:
-                            argus_unresolved.append(t)
+                        if BOT_LOGIN not in authors or t["isResolved"]:
+                            continue
+                        # Skip /improve suggestion threads (optional style suggestions)
+                        first_body = t["comments"]["nodes"][0].get("body", "") if t["comments"]["nodes"] else ""
+                        if "Committable suggestion" in first_body or "📝 Suggestion" in first_body:
+                            continue
+                        argus_unresolved.append(t)
 
                 print(f"[Argus] Thread state: {len(argus_unresolved)} unresolved, {argus_review_count} past reviews")
                 return argus_unresolved, argus_review_count
@@ -421,8 +698,18 @@ def apply_patch():
                     f"Iteration {iteration}/{MAX_ITERATIONS}.")
 
         async def patched_run(self):
-            """Run /review with conditional approval algorithm."""
+            """Run /review with conditional approval + auto-resolve + format enhancements."""
             self.git_provider._argus_review_body = None
+
+            # Phase 1: Auto-resolve outdated threads before running review
+            pr_number = self.git_provider.pr_num if hasattr(self.git_provider, 'pr_num') else 0
+            if pr_number:
+                resolved = auto_resolve_outdated_threads(
+                    self.git_provider, pr_number, BOT_LOGIN)
+                if resolved:
+                    print(f"[Argus] Pre-review: auto-resolved {resolved} outdated thread(s)")
+
+            # Phase 2: Run original /review
             result = await original_run(self)
 
             review_body = getattr(self.git_provider, '_argus_review_body', None)
@@ -432,6 +719,7 @@ def apply_patch():
             # Parse findings from prediction
             findings = []
             inline_comments = []
+            diff_files = None
             try:
                 if hasattr(self, 'prediction') and self.prediction:
                     data = load_yaml(self.prediction.strip(),
@@ -448,18 +736,18 @@ def apply_patch():
 
                         for issue in findings:
                             try:
-                                filepath = issue.get('relevant_file', '').strip()
+                                filepath = issue.get('relevant_file', '').strip().strip('`')
                                 end_line = int(issue.get('end_line', 0))
                                 if not filepath or not end_line:
                                     continue
                                 position, _ = find_line_number_of_relevant_line_in_file(
-                                    diff_files, filepath.strip('`'), "", end_line)
+                                    diff_files, filepath, "", end_line)
                                 if position == -1:
                                     continue
                                 body = format_review_finding_body(issue)
                                 inline_comments.append({
                                     'body': body,
-                                    'path': filepath.strip(),
+                                    'path': filepath,
                                     'position': position,
                                 })
                             except Exception as e:
@@ -467,15 +755,19 @@ def apply_patch():
             except Exception as e:
                 print(f"[Argus] Failed to parse key_issues: {e}")
 
-            # Get thread state + iteration count
-            pr_number = self.git_provider.pr_num if hasattr(self.git_provider, 'pr_num') else 0
+            # Get thread state + iteration count (after auto-resolve)
             unresolved_threads, past_reviews = _get_thread_state(self.git_provider, pr_number)
             iteration = past_reviews + 1
 
             # Decide review event
             event, reason = _decide_review_event(findings, unresolved_threads, iteration)
 
-            # Append decision to review body
+            # Build enhanced review body (CodeRabbit-style)
+            body_additions = build_review_body_additions(
+                findings, len(inline_comments), diff_files)
+            review_body = body_additions + "\n\n" + review_body
+
+            # Append decision footer
             review_body += f"\n\n---\n**Review Decision**: {reason}\n"
             review_body += f"*Iteration {iteration}/{MAX_ITERATIONS} | "
             review_body += f"{len(findings)} findings | "
@@ -525,3 +817,69 @@ def apply_patch():
         print("[Argus] /review with conditional approval patched")
     except Exception as e:
         print(f"[Argus] Failed to patch /review: {e}")
+
+    # ── Patch 4: /describe → CodeRabbit-style walkthrough comment ──
+    #
+    # Strategy:
+    #   - Patch PRDescription.run to: run original, then build walkthrough
+    #     comment from parsed prediction data, post as separate issue comment.
+    #   - Original behavior (update PR body) is preserved.
+    #   - Walkthrough is posted as a persistent comment with HTML markers
+    #     so it can be updated on subsequent /describe runs.
+    #
+    try:
+        from pr_agent.tools import pr_description
+
+        original_describe_run = pr_description.PRDescription.run
+
+        async def patched_describe_run(self):
+            """Run /describe and additionally post walkthrough comment."""
+            result = await original_describe_run(self)
+
+            # Extract prediction data for walkthrough
+            try:
+                data = getattr(self, 'data', None)
+                if not data or not isinstance(data, dict):
+                    return result
+
+                pr_files = data.get("pr_files", [])
+                if not pr_files:
+                    print("[Argus] /describe: no pr_files in prediction, skipping walkthrough")
+                    return result
+
+                # Extract diagram if available
+                diagram = data.get("changes_diagram", "")
+
+                # Build walkthrough comment
+                walkthrough = format_walkthrough_comment(data, diagram)
+
+                # Post as persistent comment (updates existing walkthrough)
+                # Use git_provider.pr directly to avoid review-body interceptor
+                pr = self.git_provider.pr
+                marker = "<!-- walkthrough_start -->"
+                updated = False
+                try:
+                    for comment in pr.get_issue_comments():
+                        if marker in (comment.body or ""):
+                            try:
+                                comment.edit(walkthrough)
+                                updated = True
+                            except Exception as edit_err:
+                                print(f"[Argus] Walkthrough edit failed: {edit_err}")
+                            break
+                except Exception:
+                    pass  # comment scan failed, will create new
+                if not updated:
+                    pr.create_issue_comment(walkthrough)
+                n_files = len(pr_files) if isinstance(pr_files, list) else 0
+                print(f"[Argus] Posted walkthrough comment ({n_files} files)")
+
+            except Exception as e:
+                print(f"[Argus] Walkthrough comment failed: {e}")
+
+            return result
+
+        pr_description.PRDescription.run = patched_describe_run
+        print("[Argus] /describe walkthrough patched")
+    except Exception as e:
+        print(f"[Argus] Failed to patch /describe: {e}")
