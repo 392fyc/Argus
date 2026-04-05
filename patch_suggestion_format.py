@@ -378,11 +378,19 @@ def apply_patch():
                     print(f"[Argus] All review posting failed ({e2}), using original publish")
                     original_publish_comment(self.git_provider, review_body)
 
-            # Delete the placeholder "Preparing review..." comment
+            # Edit the placeholder comment to point to the review
             try:
-                self.git_provider.remove_initial_comment()
+                if hasattr(self.git_provider, 'pr') and hasattr(self.git_provider.pr, 'comments_list'):
+                    for c in getattr(self.git_provider.pr, 'comments_list', []):
+                        if getattr(c, 'is_temporary', False):
+                            n = len(inline_comments)
+                            c.edit(f"✅ Review complete — **{n} findings** posted as inline threads above.")
+                            break
             except Exception:
-                pass
+                try:
+                    self.git_provider.remove_initial_comment()
+                except Exception:
+                    pass
 
             return result
 
