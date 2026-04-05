@@ -408,6 +408,93 @@ def _get_github_token(provider):
     return token
 
 
+# ── Walkthrough format ────────────────────────────────────────────
+
+def format_walkthrough_comment(data: dict, diagram: str = "") -> str:
+    """Format /describe prediction as CodeRabbit-style walkthrough comment.
+
+    Args:
+        data: Parsed prediction dict with keys: description, pr_files, type
+        diagram: Optional Mermaid diagram string
+    """
+    parts = []
+    parts.append("<!-- walkthrough_start -->")
+    parts.append("<details open>")
+    parts.append("<summary>📝 Walkthrough</summary>")
+    parts.append("")
+
+    # Summary section
+    description = data.get("description", "")
+    if description:
+        parts.append("## Summary")
+        parts.append("")
+        # description may be a string with bullet points or a plain string
+        if isinstance(description, str):
+            for line in description.strip().split("\n"):
+                line = line.strip()
+                if line and not line.startswith("-"):
+                    line = f"- {line}"
+                if line:
+                    parts.append(line)
+        parts.append("")
+
+    # Changes table grouped by semantic label
+    pr_files = data.get("pr_files", [])
+    if pr_files and isinstance(pr_files, list):
+        parts.append("## Changes")
+        parts.append("")
+        parts.append("| Files | Summary |")
+        parts.append("|-------|---------|")
+
+        # Group files by label
+        groups = {}
+        for f in pr_files:
+            if not isinstance(f, dict):
+                continue
+            label = str(f.get("label", "other") or "other").strip()
+            groups.setdefault(label, []).append(f)
+
+        for label, files in groups.items():
+            filenames = ", ".join(
+                f"`{str(f.get('filename', '?') or '?')}`" for f in files)
+            # Combine summaries
+            summaries = []
+            for f in files:
+                title = str(f.get("changes_title", "") or "").strip()
+                # Escape pipe characters that break Markdown tables
+                title = title.replace("|", "\\|").replace("\n", " ")
+                if title:
+                    summaries.append(title)
+            summary_text = "; ".join(summaries) if summaries else "—"
+            parts.append(f"| **{label}** {filenames} | {summary_text} |")
+
+        if not groups:
+            # Remove empty table header if no valid files
+            parts.pop()  # "|-------|---------|"
+            parts.pop()  # "| Files | Summary |"
+
+        parts.append("")
+
+    # Diagram section
+    if diagram and isinstance(diagram, str) and diagram.strip():
+        parts.append("## Diagram")
+        parts.append("")
+        # Diagram may already be wrapped in ```mermaid``` or not
+        diag = diagram.strip()
+        if not diag.startswith("```"):
+            parts.append("```mermaid")
+            parts.append(diag)
+            parts.append("```")
+        else:
+            parts.append(diag)
+        parts.append("")
+
+    parts.append("</details>")
+    parts.append("<!-- walkthrough_end -->")
+
+    return "\n".join(parts)
+
+
 # ── Apply patches ─────────────────────────────────────────────────
 
 def apply_patch():
@@ -730,3 +817,69 @@ def apply_patch():
         print("[Argus] /review with conditional approval patched")
     except Exception as e:
         print(f"[Argus] Failed to patch /review: {e}")
+
+    # ── Patch 4: /describe → CodeRabbit-style walkthrough comment ──
+    #
+    # Strategy:
+    #   - Patch PRDescription.run to: run original, then build walkthrough
+    #     comment from parsed prediction data, post as separate issue comment.
+    #   - Original behavior (update PR body) is preserved.
+    #   - Walkthrough is posted as a persistent comment with HTML markers
+    #     so it can be updated on subsequent /describe runs.
+    #
+    try:
+        from pr_agent.tools import pr_description
+
+        original_describe_run = pr_description.PRDescription.run
+
+        async def patched_describe_run(self):
+            """Run /describe and additionally post walkthrough comment."""
+            result = await original_describe_run(self)
+
+            # Extract prediction data for walkthrough
+            try:
+                data = getattr(self, 'data', None)
+                if not data or not isinstance(data, dict):
+                    return result
+
+                pr_files = data.get("pr_files", [])
+                if not pr_files:
+                    print("[Argus] /describe: no pr_files in prediction, skipping walkthrough")
+                    return result
+
+                # Extract diagram if available
+                diagram = data.get("changes_diagram", "")
+
+                # Build walkthrough comment
+                walkthrough = format_walkthrough_comment(data, diagram)
+
+                # Post as persistent comment (updates existing walkthrough)
+                # Use git_provider.pr directly to avoid review-body interceptor
+                pr = self.git_provider.pr
+                marker = "<!-- walkthrough_start -->"
+                updated = False
+                try:
+                    for comment in pr.get_issue_comments():
+                        if marker in (comment.body or ""):
+                            try:
+                                comment.edit(walkthrough)
+                                updated = True
+                            except Exception as edit_err:
+                                print(f"[Argus] Walkthrough edit failed: {edit_err}")
+                            break
+                except Exception:
+                    pass  # comment scan failed, will create new
+                if not updated:
+                    pr.create_issue_comment(walkthrough)
+                n_files = len(pr_files) if isinstance(pr_files, list) else 0
+                print(f"[Argus] Posted walkthrough comment ({n_files} files)")
+
+            except Exception as e:
+                print(f"[Argus] Walkthrough comment failed: {e}")
+
+            return result
+
+        pr_description.PRDescription.run = patched_describe_run
+        print("[Argus] /describe walkthrough patched")
+    except Exception as e:
+        print(f"[Argus] Failed to patch /describe: {e}")
