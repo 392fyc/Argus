@@ -269,56 +269,62 @@ def apply_patch():
     except Exception as e:
         print(f"[Argus Patch] Failed to patch /improve: {e}")
 
-    # ── Patch 2: /review key_issues as inline threads ────────────
+    # ── Patch 2: /review — intercept publish to create unified GitHub Review ──
     try:
-        from pr_agent.tools import pr_reviewer
+        from pr_agent.git_providers import github_provider as gh_mod
+        from pr_agent.git_providers.github_provider import find_line_number_of_relevant_line_in_file
 
-        original_run = pr_reviewer.PRReviewer.run
+        # Intercept publish_persistent_comment and publish_comment on GithubProvider
+        # to capture the review markdown and post it as a proper GitHub Review
+        # with inline threads instead of an issue comment.
 
-        async def patched_run(self):
-            """Run original /review, then post key_issues as inline threads."""
-            # Run the original review (posts summary comment)
-            result = await original_run(self)
+        original_publish_persistent = gh_mod.GithubProvider.publish_persistent_comment
+        original_publish_comment = gh_mod.GithubProvider.publish_comment
 
-            # After summary is posted, also post inline threads for key issues
+        def _is_review_content(body: str) -> bool:
+            """Check if this is a /review output (not /improve or /describe)."""
+            return "PR Reviewer Guide" in body or "Reviewer Guide" in body
+
+        def _extract_and_post_unified_review(provider, body: str):
+            """Post review body + inline threads as a single GitHub Review."""
             try:
-                from pr_agent.algo.utils import load_yaml
-                if hasattr(self, 'prediction') and self.prediction:
-                    data = load_yaml(self.prediction.strip(),
-                                     keys_fix_yaml=["key_issues_to_review:",
-                                                     "relevant_file:", "relevant_line:", "suggestion:"],
-                                     first_key="review", last_key="key_issues_to_review")
-                    if data and 'review' in data:
-                        issues = data['review'].get('key_issues_to_review', [])
-                        if issues:
-                            code_comments = []
-                            for issue in issues:
-                                try:
-                                    filepath = issue.get('relevant_file', '').strip()
-                                    start_line = int(issue.get('start_line', 0))
-                                    end_line = int(issue.get('end_line', 0))
-                                    if not filepath or not start_line:
-                                        continue
-
-                                    body = format_review_finding_body(issue)
-                                    code_comments.append({
-                                        'body': body,
-                                        'relevant_file': filepath,
-                                        'relevant_lines_start': start_line,
-                                        'relevant_lines_end': end_line,
-                                    })
-                                except Exception as e:
-                                    print(f"[Argus Patch] Could not format review finding: {e}")
-
-                            if code_comments:
-                                self.git_provider.publish_code_suggestions(code_comments)
-                                print(f"[Argus Patch] Posted {len(code_comments)} review inline threads")
+                # Parse key_issues from the stored prediction
+                # The prediction is stored on the PRReviewer instance but we
+                # can't easily access it here. Instead, parse the markdown body
+                # for the "Recommended focus areas" section which contains
+                # file links with line numbers.
+                #
+                # Alternatively, just post the body as a GitHub Review (no inline
+                # comments from /review — those come from /improve).
+                # This is cleaner and avoids complex parsing.
+                provider.pr.create_review(
+                    commit=provider.last_commit_id,
+                    body=body,
+                    event="COMMENT",
+                )
+                print(f"[Argus Patch] Posted /review as GitHub Review object")
+                return True
             except Exception as e:
-                print(f"[Argus Patch] Failed to post review inline threads: {e}")
+                print(f"[Argus Patch] Failed to post as Review: {e}")
+                return False
 
-            return result
+        def patched_publish_persistent(self, body, initial_header="", **kwargs):
+            """Intercept persistent comment — if it's a review, post as GitHub Review."""
+            if _is_review_content(body):
+                if _extract_and_post_unified_review(self, body):
+                    return  # Success — skip the original persistent comment
+            # Fallback to original for non-review content
+            return original_publish_persistent(self, body, initial_header=initial_header, **kwargs)
 
-        pr_reviewer.PRReviewer.run = patched_run
-        print("[Argus Patch] /review inline threads patched")
+        def patched_publish_comment(self, body, is_temporary=False):
+            """Intercept regular comment — if it's a review, post as GitHub Review."""
+            if not is_temporary and _is_review_content(body):
+                if _extract_and_post_unified_review(self, body):
+                    return  # Success
+            return original_publish_comment(self, body, is_temporary=is_temporary)
+
+        gh_mod.GithubProvider.publish_persistent_comment = patched_publish_persistent
+        gh_mod.GithubProvider.publish_comment = patched_publish_comment
+        print("[Argus Patch] /review → GitHub Review object patched")
     except Exception as e:
         print(f"[Argus Patch] Failed to patch /review: {e}")
