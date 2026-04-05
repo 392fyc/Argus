@@ -68,6 +68,18 @@ GitHub PR: APPROVED / CHANGES_REQUESTED
 5. Generate private key (.pem), save to `.secrets.toml`
 6. Install the app on 392fyc/Mercury
 
+## User Whitelist
+
+Argus includes a guard middleware that restricts which GitHub users can trigger reviews.
+
+Configure in `.env`:
+```bash
+# Only these users can trigger reviews (comma-separated, case-insensitive)
+ARGUS_ALLOWED_USERS=392fyc,trusted-bot
+```
+
+Leave empty to allow all users. The guard logs all allow/block decisions.
+
 ## Cost
 
 ~$0.08-0.25 per review with GPT-5.3-Codex API ($1.75/MTok input, $14/MTok output).

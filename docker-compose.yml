@@ -1,15 +1,17 @@
-version: "3.8"
-
 services:
-  # ── PR-Agent (GitHub App webhook server) ──────────────────────
+  # ── Argus: PR-Agent + User Whitelist Guard ──────────────────────
   pr-agent:
-    image: codiumai/pr-agent:0.34-github_app
+    build: .
     container_name: argus
     restart: unless-stopped
     ports:
       - "${PR_AGENT_PORT:-3000}:3000"
     env_file:
       - .env
+    environment:
+      # Comma-separated list of GitHub usernames allowed to trigger reviews.
+      # Leave empty to allow ALL users.
+      - ARGUS_ALLOWED_USERS=${ARGUS_ALLOWED_USERS:-}
     volumes:
       - ./configuration.toml:/app/pr_agent/settings/configuration.toml:ro
       - ./.secrets.toml:/app/pr_agent/settings/.secrets.toml:ro
@@ -21,10 +23,7 @@ services:
       start_period: 15s
 
   # ── Cloudflare Tunnel (exposes webhook to internet) ───────────
-  # Cloudflare Tunnel needs network_mode: host on QNAP NAS
-  # to reach pr-agent on localhost:3000 (host-published port).
-  # depends_on is incompatible with network_mode: host in some
-  # Docker versions; restart: unless-stopped handles ordering.
+  # network_mode: host required on QNAP NAS for container-to-host routing.
   cloudflared:
     image: cloudflare/cloudflared:latest
     container_name: argus-tunnel
