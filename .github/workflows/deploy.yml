@@ -14,35 +14,50 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup SSH
+      - name: Install cloudflared
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
+            -o /tmp/cloudflared.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+
+      - name: Setup SSH via Cloudflare Tunnel
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.NAS_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -p 22 ${{ secrets.NAS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+          # Configure SSH to use cloudflared as proxy for ssh.fyc-space.uk
+          cat >> ~/.ssh/config << 'EOF'
+          Host nas
+            HostName ssh.fyc-space.uk
+            User 392fyc
+            IdentityFile ~/.ssh/id_ed25519
+            ProxyCommand cloudflared access ssh --hostname %h
+            StrictHostKeyChecking no
+          EOF
+
+          # Test connection
+          ssh nas "echo 'SSH via Cloudflare Tunnel OK'"
 
       - name: Transfer files to NAS
         run: |
-          NAS="${{ secrets.NAS_USER }}@${{ secrets.NAS_HOST }}"
           ARGUS_DIR="/share/homes/392fyc/argus"
 
-          # Transfer updated files (config, patches, Dockerfile, compose)
           for f in Dockerfile entrypoint-guard.py patch_suggestion_format.py \
                    configuration.toml docker-compose.yml docker-compose.polling.yml; do
             if [ -f "$f" ]; then
-              cat "$f" | ssh -i ~/.ssh/id_ed25519 "$NAS" "cat > $ARGUS_DIR/$f"
+              cat "$f" | ssh nas "cat > $ARGUS_DIR/$f"
               echo "✓ $f"
             fi
           done
 
       - name: Rebuild and restart on NAS
         run: |
-          NAS="${{ secrets.NAS_USER }}@${{ secrets.NAS_HOST }}"
           ARGUS_DIR="/share/homes/392fyc/argus"
           DOCKER="/share/CACHEDEV1_DATA/.qpkg/container-station/bin/docker"
           DHOST="DOCKER_HOST=unix:///var/run/system-docker.sock"
 
-          ssh -i ~/.ssh/id_ed25519 "$NAS" "
+          ssh nas "
             echo '${{ secrets.NAS_SUDO_PASS }}' | sudo -S $DHOST $DOCKER compose \
               -f $ARGUS_DIR/docker-compose.yml build --no-cache pr-agent 2>&1 | tail -5
             echo '${{ secrets.NAS_SUDO_PASS }}' | sudo -S $DHOST $DOCKER compose \
@@ -52,11 +67,10 @@ jobs:
       - name: Verify deployment
         run: |
           sleep 15
-          NAS="${{ secrets.NAS_USER }}@${{ secrets.NAS_HOST }}"
           DOCKER="/share/CACHEDEV1_DATA/.qpkg/container-station/bin/docker"
           DHOST="DOCKER_HOST=unix:///var/run/system-docker.sock"
 
-          STATUS=$(ssh -i ~/.ssh/id_ed25519 "$NAS" \
+          STATUS=$(ssh nas \
             "echo '${{ secrets.NAS_SUDO_PASS }}' | sudo -S $DHOST $DOCKER ps --filter name=argus --format '{{.Status}}' 2>/dev/null | head -1")
           echo "Container status: $STATUS"
           if echo "$STATUS" | grep -q "Up"; then
