@@ -61,7 +61,9 @@ class ArgusGuardMiddleware:
         except (json.JSONDecodeError, KeyError):
             actor = None
 
-        if actor and actor.lower() not in ALLOWED_USERS:
+        # Always allow bot users (e.g. argus-review[bot]) — they are self-triggered
+        is_bot = actor and ("[bot]" in actor.lower())
+        if not is_bot and actor and actor.lower() not in ALLOWED_USERS:
             print(f"[Argus Guard] BLOCKED: '{actor}' not in whitelist")
             resp = json.dumps({"status": "skipped", "reason": f"user '{actor}' not in whitelist"}).encode()
             await send({"type": "http.response.start", "status": 200,
