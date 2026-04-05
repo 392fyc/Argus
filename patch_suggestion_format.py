@@ -301,9 +301,11 @@ def apply_patch():
                         if not filepath or not end_line:
                             continue
 
+                        # absolute_position = line number in the new file
                         position, _ = find_line_number_of_relevant_line_in_file(
-                            diff_files, filepath.strip('`'), end_line, None)
+                            diff_files, filepath.strip('`'), "", end_line)
                         if position == -1:
+                            print(f"[Argus] Position -1 for {filepath}:{end_line}, skipping")
                             continue
 
                         body = format_review_finding_body(issue)
