@@ -77,7 +77,7 @@ require_ticket_analysis_review=true
 publish_output_no_suggestions=true # Set to "false" if you only need the reviewer's remarks (not labels, not "security audit", etc.) and want to avoid noisy "No major issues detected" comments.
 persistent_comment=true
 extra_instructions = ""
-num_max_findings = 3
+num_max_findings = 5
 final_update_message = true
 # review labels
 enable_review_labels_security=true
@@ -118,8 +118,8 @@ use_conversation_history=true
 
 
 [pr_code_suggestions] # /improve #
-commitable_code_suggestions = false
-dual_publishing_score_threshold=-1 # -1 to disable, [0-10] to set the threshold (>=) for publishing a code suggestion both in a table and as commitable
+commitable_code_suggestions = true  # Post suggestions as inline comments on specific code lines (creates review threads)
+dual_publishing_score_threshold=7 # Score >= 7: publish both in summary table AND as inline code comment
 focus_only_on_problems=true
 #
 extra_instructions = ""
@@ -232,7 +232,7 @@ pr_commands = [
     "/improve",
 ]
 # settings for "pull_request" event with "synchronize" action - used to detect and handle push triggers for new commits
-handle_push_trigger = false
+handle_push_trigger = true  # Auto review when new commits are pushed to a PR
 push_trigger_ignore_bot_commits = true
 push_trigger_ignore_merge_commits = true
 push_trigger_wait_for_initial_review = true
