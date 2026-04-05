@@ -9,12 +9,16 @@ services:
     env_file:
       - .env
     environment:
-      # Comma-separated list of GitHub usernames allowed to trigger reviews.
-      # Leave empty to allow ALL users.
       - ARGUS_ALLOWED_USERS=${ARGUS_ALLOWED_USERS:-}
     volumes:
       - ./configuration.toml:/app/pr_agent/settings/configuration.toml:ro
       - ./.secrets.toml:/app/pr_agent/settings/.secrets.toml:ro
+      - argus-logs:/var/log/argus
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "7"    # ~7 days at normal volume
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:3000/')\" || exit 1"]
       interval: 30s
@@ -22,8 +26,7 @@ services:
       retries: 3
       start_period: 15s
 
-  # ── Cloudflare Tunnel (exposes webhook to internet) ───────────
-  # network_mode: host required on QNAP NAS for container-to-host routing.
+  # ── Cloudflare Tunnel ───────────────────────────────────────────
   cloudflared:
     image: cloudflare/cloudflared:latest
     container_name: argus-tunnel
@@ -32,3 +35,11 @@ services:
     command: tunnel run
     environment:
       - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  argus-logs:

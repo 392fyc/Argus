@@ -86,6 +86,10 @@ class ArgusGuardMiddleware:
 
 
 # ── App initialization (imported by gunicorn) ─────────────────────
+# Apply CodeRabbit-style suggestion format patch
+from patch_suggestion_format import apply_patch
+apply_patch()
+
 # Import the original PR-Agent app and wrap it with the guard
 from pr_agent.servers.github_app import app as _original_app
 _original_app.add_middleware(ArgusGuardMiddleware)
