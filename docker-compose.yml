@@ -1,0 +1,35 @@
+version: "3.8"
+
+services:
+  # ── PR-Agent (GitHub App webhook server) ──────────────────────
+  pr-agent:
+    image: codiumai/pr-agent:0.34-github_app
+    container_name: argus
+    restart: unless-stopped
+    ports:
+      - "${PR_AGENT_PORT:-3000}:3000"
+    env_file:
+      - .env
+    volumes:
+      - ./configuration.toml:/app/pr_agent/settings/configuration.toml:ro
+      - ./.secrets.toml:/app/pr_agent/settings/.secrets.toml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:3000/')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ── Cloudflare Tunnel (exposes webhook to internet) ───────────
+  # Cloudflare Tunnel needs network_mode: host on QNAP NAS
+  # to reach pr-agent on localhost:3000 (host-published port).
+  # depends_on is incompatible with network_mode: host in some
+  # Docker versions; restart: unless-stopped handles ordering.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: argus-tunnel
+    restart: unless-stopped
+    network_mode: host
+    command: tunnel run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}

@@ -1,0 +1,18 @@
+version: "3.8"
+
+# Polling mode — no Cloudflare Tunnel needed.
+# Use this if the NAS cannot receive inbound webhooks.
+# Polls GitHub for new PRs periodically (outbound only).
+#
+# Usage: docker compose -f docker-compose.polling.yml up -d
+
+services:
+  pr-agent:
+    image: codiumai/pr-agent:0.34-github_polling
+    container_name: argus-polling
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./configuration.toml:/app/pr_agent/settings/configuration.toml:ro
+      - ./.secrets.toml:/app/pr_agent/settings/.secrets.toml:ro

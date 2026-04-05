@@ -1,0 +1,55 @@
+# Argus — PR-Agent Configuration
+# Docs: https://qodo-merge-docs.qodo.ai/usage-guide/changing_a_model/
+
+[config]
+model = "gpt-5.3-codex"
+model_turbo = "gpt-5.3-codex"
+fallback_models = ["gpt-5.4-mini"]
+custom_reasoning_model = true
+# With custom_reasoning_model = true, temperature and chat templates
+# are bypassed — suitable for reasoning models like GPT-5.3-Codex.
+
+[github_app]
+# Auto-trigger these commands on every new PR and push
+pr_commands = [
+    "/describe",
+    "/review",
+]
+handle_push_trigger = true
+push_commands = [
+    "/describe",
+    "/review --incremental",
+]
+
+[pr_reviewer]
+# Review profile
+require_focused_review = true
+require_score_review = true
+require_estimate_effort_to_review = true
+num_code_suggestions = 4
+inline_code_comments = true
+# Persistent comment mode: update the same comment instead of posting new ones
+persistent_comment = true
+
+extra_instructions = """\
+You are an ASSERTIVE code reviewer for the Mercury project — a multi-agent \
+orchestration framework built on Claude Code (TypeScript + Python).
+
+Focus on:
+- Bugs, logic errors, and security vulnerabilities
+- TypeScript type safety and async/await correctness
+- Error handling completeness
+- MCP protocol compliance
+- Git branching rules (no direct push to develop/master)
+
+Be direct. If something is wrong, say so clearly. If it looks good, say LGTM.
+"""
+
+[pr_description]
+publish_labels = true
+publish_description_as_comment = false
+add_original_user_description = true
+generate_ai_title = false
+
+[pr_code_suggestions]
+num_code_suggestions = 4

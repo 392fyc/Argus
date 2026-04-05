@@ -1,0 +1,7 @@
+# Secrets — NEVER commit
+.secrets.toml
+.env
+*.pem
+
+# Docker
+docker-compose.override.yml
