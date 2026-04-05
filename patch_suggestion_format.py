@@ -317,125 +317,108 @@ def apply_patch():
             return "Minor"
 
         def _get_thread_state(provider, pr_number):
-            """Query unresolved Argus threads + past review count via GitHub API."""
-            import requests as _requests
-            import json as _json
+            """Query unresolved Argus threads + past review count.
+            Uses REST API for reviews (reliable) + GraphQL for thread resolution.
+            REST: GET /repos/{owner}/{repo}/pulls/{number}/reviews
+            GraphQL: reviewThreads.isResolved (REST doesn't expose this)
+            Refs: https://docs.github.com/en/rest/pulls/reviews
+            """
+            import requests as _req
 
             try:
-                # Use PyGithub's requester for authenticated access
                 repo = provider.repo
                 if not repo:
                     return [], 0
-
-                # repo can be PyGithub object or string
                 full_name = repo.full_name if hasattr(repo, 'full_name') else str(repo)
                 owner, name = full_name.split("/", 1)
 
-                # GraphQL query via PyGithub's underlying requester
-                query = """
-                {
-                  repository(owner: "%s", name: "%s") {
-                    pullRequest(number: %d) {
-                      reviewThreads(first: 100) {
-                        nodes {
-                          isResolved
-                          comments(first: 3) {
-                            nodes { author { login } body }
-                          }
-                        }
-                      }
-                      reviews(first: 50) {
-                        nodes { author { login } state }
-                      }
-                    }
-                  }
-                }""" % (owner, name, pr_number)
-
-                # Get auth token from PyGithub's connection (varies by version)
+                # Get token from PyGithub or fallback to user_token
+                token = None
                 try:
                     token = provider.github_client._Github__requester._Requester__auth.token
-                except AttributeError:
+                except Exception:
+                    pass
+                if not token:
                     try:
                         token = provider.github_client._Github__requester.auth.token
-                    except AttributeError:
-                        # Fallback: get from settings
-                        from pr_agent.config_loader import get_settings
-                        token = get_settings().get("github.user_token", "")
-                headers = {
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                }
-                resp = _requests.post(
-                    "https://api.github.com/graphql",
-                    json={"query": query},
-                    headers=headers,
-                    timeout=30,
-                )
-                data = resp.json()
-                pr_data = data["data"]["repository"]["pullRequest"]
+                    except Exception:
+                        pass
+                if not token:
+                    from pr_agent.config_loader import get_settings
+                    token = get_settings().get("github.user_token", "")
+                if not token:
+                    print("[Argus] No token — skipping thread check")
+                    return [], 0
 
-                # Unresolved threads from Argus
-                threads = pr_data["reviewThreads"]["nodes"]
+                auth_h = {"Authorization": f"Bearer {token}",
+                          "Accept": "application/vnd.github+json"}
+
+                # REST: count past Argus reviews
+                argus_review_count = 0
+                r = _req.get(f"https://api.github.com/repos/{full_name}/pulls/{pr_number}/reviews",
+                             headers=auth_h, timeout=15)
+                if r.status_code == 200:
+                    argus_review_count = sum(
+                        1 for rv in r.json()
+                        if rv.get("user", {}).get("login") == BOT_LOGIN)
+
+                # GraphQL: thread resolution
                 argus_unresolved = []
-                for t in threads:
-                    authors = [c["author"]["login"] for c in t["comments"]["nodes"]
-                               if c.get("author")]
-                    if BOT_LOGIN in authors and not t["isResolved"]:
-                        argus_unresolved.append(t)
-
-                # Count past Argus reviews
-                reviews = pr_data["reviews"]["nodes"]
-                argus_review_count = sum(
-                    1 for r in reviews
-                    if r.get("author", {}).get("login") == BOT_LOGIN
-                )
+                query = '{repository(owner:"%s",name:"%s"){pullRequest(number:%d){reviewThreads(first:100){nodes{isResolved comments(first:3){nodes{author{login}}}}}}}}' % (owner, name, pr_number)
+                g = _req.post("https://api.github.com/graphql",
+                              json={"query": query}, headers=auth_h, timeout=15)
+                if g.status_code == 200 and "data" in g.json():
+                    threads = g.json()["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+                    for t in threads:
+                        authors = [c["author"]["login"] for c in t["comments"]["nodes"] if c.get("author")]
+                        if BOT_LOGIN in authors and not t["isResolved"]:
+                            argus_unresolved.append(t)
 
                 print(f"[Argus] Thread state: {len(argus_unresolved)} unresolved, {argus_review_count} past reviews")
                 return argus_unresolved, argus_review_count
             except Exception as e:
-                print(f"[Argus] GraphQL thread check failed: {e}")
-                import traceback
-                traceback.print_exc()
+                print(f"[Argus] Thread check failed: {e}")
                 return [], 0
 
         def _decide_review_event(findings, unresolved_threads, iteration):
             """
             Returns (event, reason):
               "REQUEST_CHANGES" — blocking issues found
-              "APPROVE"         — all clear
+              "APPROVE"         — all clear after at least 2 iterations
               "COMMENT"         — non-blocking / first review / escalation
             """
             critical_major = [f for f in findings
                               if _classify_finding_severity(f.get("issue_header", "")) in BLOCKING_SEVERITIES]
 
-            # Rule 1: First review never approves
-            if iteration <= 1:
-                if critical_major:
-                    return ("REQUEST_CHANGES",
-                            f"🔴 {len(critical_major)} critical/major issue(s) found — changes requested.")
-                return ("COMMENT",
-                        "Initial review complete — no blocking issues found.")
+            # Rule 1: Critical/Major findings always block (regardless of iteration)
+            if critical_major:
+                return ("REQUEST_CHANGES",
+                        f"🔴 {len(critical_major)} critical/major issue(s) — changes requested.")
 
             # Rule 2: Unresolved threads from previous reviews
             if unresolved_threads:
                 return ("REQUEST_CHANGES",
                         f"🔴 {len(unresolved_threads)} unresolved thread(s) from previous review.")
 
-            # Rule 3: New critical/major findings
-            if critical_major:
-                return ("REQUEST_CHANGES",
-                        f"🔴 {len(critical_major)} new critical/major issue(s) in this review.")
-
-            # Rule 4: Max iterations → escalate to human
+            # Rule 3: Max iterations → escalate to human
             if iteration >= MAX_ITERATIONS:
                 return ("COMMENT",
                         f"⚠️ Review iteration {iteration}/{MAX_ITERATIONS} reached. "
                         f"Escalating to human reviewer.")
 
-            # Rule 5: All clear → approve
+            # Rule 4: First review → COMMENT (never approve on first pass)
+            if iteration <= 1:
+                return ("COMMENT",
+                        "Initial review — no blocking issues. "
+                        "Minor findings posted as inline threads.")
+
+            # Rule 5: Subsequent review, no blocking issues, all threads resolved → APPROVE
+            # Minor-only findings don't block approval on iteration >= 2
+            minor_count = len(findings) - len(critical_major)
+            suffix = f" ({minor_count} minor findings noted.)" if minor_count else ""
             return ("APPROVE",
-                    f"✅ All threads resolved, no critical/major issues. "
-                    f"Review iteration {iteration}/{MAX_ITERATIONS}.")
+                    f"✅ No critical/major issues, all threads resolved.{suffix} "
+                    f"Iteration {iteration}/{MAX_ITERATIONS}.")
 
         async def patched_run(self):
             """Run /review with conditional approval algorithm."""
