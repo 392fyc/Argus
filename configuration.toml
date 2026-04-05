@@ -118,8 +118,8 @@ use_conversation_history=true
 
 
 [pr_code_suggestions] # /improve #
-commitable_code_suggestions = false  # false = summary table comment; inline threads via dual_publishing
-dual_publishing_score_threshold=0 # 0 = ALL suggestions published as both summary table + inline code threads
+commitable_code_suggestions = true  # true = inline code threads only (no summary comment)
+dual_publishing_score_threshold=-1 # -1 = disabled (commitable mode handles inline)
 focus_only_on_problems=true
 #
 extra_instructions = ""

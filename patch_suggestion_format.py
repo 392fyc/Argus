@@ -166,8 +166,63 @@ def _build_agent_prompt(d: dict, filepath: str, start: str, end: str) -> str:
     return "\n".join(lines)
 
 
+def format_review_finding_body(issue: dict) -> str:
+    """Format a /review key_issue as an inline thread comment."""
+    header = issue.get("issue_header", "Issue").strip()
+    content = issue.get("issue_content", "").strip()
+    filepath = issue.get("relevant_file", "").strip()
+    start = issue.get("start_line", "")
+    end = issue.get("end_line", "")
+
+    # Map header to severity
+    header_lower = header.lower()
+    if "bug" in header_lower or "critical" in header_lower or "security" in header_lower:
+        icon, severity = "🔴", "Critical"
+    elif "possible" in header_lower or "error" in header_lower:
+        icon, severity = "🟠", "Major"
+    elif "performance" in header_lower or "issue" in header_lower:
+        icon, severity = "🟡", "Medium"
+    else:
+        icon, severity = "🔵", "Minor"
+
+    parts = []
+    parts.append(f"{icon} **{severity}** | _{header}_")
+    if start and end and str(start) != str(end):
+        parts.append(f"**Comment on lines {start}-{end}**")
+    elif start:
+        parts.append(f"**Comment on line {start}**")
+    parts.append("")
+    parts.append(content)
+    parts.append("")
+
+    # Prompt for AI Agents
+    agent_lines = [
+        f"In file `{filepath}`",
+    ]
+    if start and end and str(start) != str(end):
+        agent_lines.append(f"around lines {start}-{end}:")
+    elif start:
+        agent_lines.append(f"around line {start}:")
+    agent_lines.append("")
+    agent_lines.append(f"[{header}] {content}")
+    agent_lines.append("")
+    agent_lines.append(f"Action required: Investigate and fix the {header.lower()} described above.")
+
+    parts.append("<details><summary>🤖 Prompt for AI Agents</summary>")
+    parts.append("")
+    parts.append("```text")
+    parts.extend(agent_lines)
+    parts.append("```")
+    parts.append("")
+    parts.append("</details>")
+
+    return "\n".join(parts)
+
+
 def apply_patch():
-    """Monkey-patch PR-Agent's suggestion rendering."""
+    """Monkey-patch PR-Agent's suggestion and review rendering."""
+
+    # ── Patch 1: /improve inline suggestions (CodeRabbit style) ──
     try:
         from pr_agent.tools import pr_code_suggestions
 
@@ -175,7 +230,6 @@ def apply_patch():
 
         def patched_push(self, data):
             """Patched version that uses CodeRabbit-style formatting."""
-            import copy
             code_suggestions = []
 
             if not data.get("code_suggestions"):
@@ -211,6 +265,60 @@ def apply_patch():
                     self.git_provider.publish_code_suggestions([cs])
 
         pr_code_suggestions.PRCodeSuggestions.push_inline_code_suggestions = patched_push
-        print("[Argus Patch] Suggestion format patched to CodeRabbit style")
+        print("[Argus Patch] /improve suggestion format patched")
     except Exception as e:
-        print(f"[Argus Patch] Failed to apply patch: {e} — using default format")
+        print(f"[Argus Patch] Failed to patch /improve: {e}")
+
+    # ── Patch 2: /review key_issues as inline threads ────────────
+    try:
+        from pr_agent.tools import pr_reviewer
+
+        original_run = pr_reviewer.PRReviewer.run
+
+        async def patched_run(self):
+            """Run original /review, then post key_issues as inline threads."""
+            # Run the original review (posts summary comment)
+            result = await original_run(self)
+
+            # After summary is posted, also post inline threads for key issues
+            try:
+                from pr_agent.algo.utils import load_yaml
+                if hasattr(self, 'prediction') and self.prediction:
+                    data = load_yaml(self.prediction.strip(),
+                                     keys_fix_yaml=["key_issues_to_review:",
+                                                     "relevant_file:", "relevant_line:", "suggestion:"],
+                                     first_key="review", last_key="key_issues_to_review")
+                    if data and 'review' in data:
+                        issues = data['review'].get('key_issues_to_review', [])
+                        if issues:
+                            code_comments = []
+                            for issue in issues:
+                                try:
+                                    filepath = issue.get('relevant_file', '').strip()
+                                    start_line = int(issue.get('start_line', 0))
+                                    end_line = int(issue.get('end_line', 0))
+                                    if not filepath or not start_line:
+                                        continue
+
+                                    body = format_review_finding_body(issue)
+                                    code_comments.append({
+                                        'body': body,
+                                        'relevant_file': filepath,
+                                        'relevant_lines_start': start_line,
+                                        'relevant_lines_end': end_line,
+                                    })
+                                except Exception as e:
+                                    print(f"[Argus Patch] Could not format review finding: {e}")
+
+                            if code_comments:
+                                self.git_provider.publish_code_suggestions(code_comments)
+                                print(f"[Argus Patch] Posted {len(code_comments)} review inline threads")
+            except Exception as e:
+                print(f"[Argus Patch] Failed to post review inline threads: {e}")
+
+            return result
+
+        pr_reviewer.PRReviewer.run = patched_run
+        print("[Argus Patch] /review inline threads patched")
+    except Exception as e:
+        print(f"[Argus Patch] Failed to patch /review: {e}")
