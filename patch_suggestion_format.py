@@ -257,137 +257,136 @@ def apply_patch():
     except Exception as e:
         print(f"[Argus] Failed to patch /improve: {e}")
 
-    # ── Patch 2: /review → unified GitHub Review (body + inline threads) ──
+    # ── Patch 2+3: /review → single unified GitHub Review (body + inline threads) ──
+    #
+    # Strategy:
+    #   - Patch publish_persistent_comment/publish_comment to CAPTURE review body
+    #     instead of posting it immediately (store in _argus_review_body)
+    #   - Patch PRReviewer.run to: run original (captures body), then build inline
+    #     comments from key_issues, then create ONE review with body + comments
+    #   - Delete the placeholder "Preparing review..." comment
+    #
     try:
         from pr_agent.tools import pr_reviewer
         from pr_agent.algo.utils import load_yaml
+        from pr_agent.git_providers import github_provider as gh_mod
         from pr_agent.git_providers.github_provider import find_line_number_of_relevant_line_in_file
 
-        original_run = pr_reviewer.PRReviewer.run
-
-        async def patched_run(self):
-            """Run original /review, then repackage as unified GitHub Review."""
-            # Run original to get prediction + labels
-            result = await original_run(self)
-
-            # Now parse prediction and post unified review with inline threads
-            try:
-                if not hasattr(self, 'prediction') or not self.prediction:
-                    return result
-
-                data = load_yaml(self.prediction.strip(),
-                                 keys_fix_yaml=["ticket_compliance_check",
-                                                 "estimated_effort_to_review_[1-5]:",
-                                                 "security_concerns:",
-                                                 "key_issues_to_review:",
-                                                 "relevant_file:", "relevant_line:", "suggestion:"],
-                                 first_key="review", last_key="key_issues_to_review")
-
-                if not data or 'review' not in data:
-                    return result
-
-                issues = data['review'].get('key_issues_to_review', [])
-                if not issues:
-                    return result
-
-                # Build inline comments
-                diff_files = self.git_provider.diff_files or self.git_provider.get_diff_files()
-                inline_comments = []
-
-                for issue in issues:
-                    try:
-                        filepath = issue.get('relevant_file', '').strip()
-                        end_line = int(issue.get('end_line', 0))
-                        if not filepath or not end_line:
-                            continue
-
-                        # absolute_position = line number in the new file
-                        position, _ = find_line_number_of_relevant_line_in_file(
-                            diff_files, filepath.strip('`'), "", end_line)
-                        if position == -1:
-                            print(f"[Argus] Position -1 for {filepath}:{end_line}, skipping")
-                            continue
-
-                        body = format_review_finding_body(issue)
-                        inline_comments.append({
-                            'body': body,
-                            'path': filepath.strip(),
-                            'position': position,
-                        })
-                    except Exception as e:
-                        print(f"[Argus] Could not build inline comment: {e}")
-
-                if inline_comments:
-                    # Post inline threads as a separate review object
-                    # (the summary was already posted by original_run)
-                    try:
-                        self.git_provider.pr.create_review(
-                            commit=self.git_provider.last_commit_id,
-                            comments=inline_comments,
-                        )
-                        print(f"[Argus] Posted {len(inline_comments)} review inline threads")
-                    except Exception as e:
-                        print(f"[Argus] Failed to post inline threads: {e}")
-                        # Try one by one
-                        for ic in inline_comments:
-                            try:
-                                self.git_provider.pr.create_review(
-                                    commit=self.git_provider.last_commit_id,
-                                    comments=[ic],
-                                )
-                            except Exception:
-                                pass
-
-            except Exception as e:
-                print(f"[Argus] Review inline threads failed: {e}")
-
-            return result
-
-        pr_reviewer.PRReviewer.run = patched_run
-        print("[Argus] /review inline threads patched")
-    except Exception as e:
-        print(f"[Argus] Failed to patch /review: {e}")
-
-    # ── Patch 3: /review summary → GitHub Review object (not issue comment) ──
-    try:
-        from pr_agent.git_providers import github_provider as gh_mod
-
+        # -- Step A: Intercept publish to capture review body --
         original_publish_persistent = gh_mod.GithubProvider.publish_persistent_comment
         original_publish_comment = gh_mod.GithubProvider.publish_comment
 
-        def _is_review_content(body: str) -> bool:
+        def _is_review_content(body):
             return isinstance(body, str) and ("PR Reviewer Guide" in body or "Reviewer Guide" in body)
 
         def patched_publish_persistent(self, body, initial_header="", **kwargs):
             if _is_review_content(body):
-                try:
-                    self.pr.create_review(
-                        commit=self.last_commit_id,
-                        body=body,
-                        event="COMMENT",
-                    )
-                    print(f"[Argus] Posted /review as GitHub Review object")
-                    return
-                except Exception as e:
-                    print(f"[Argus] Review object failed ({e}), falling back")
+                # Capture body, don't publish yet — patched_run will post unified review
+                self._argus_review_body = body
+                print(f"[Argus] Captured review body ({len(body)} chars), deferring publish")
+                return
             return original_publish_persistent(self, body, initial_header=initial_header, **kwargs)
 
         def patched_publish_comment(self, body, is_temporary=False):
             if not is_temporary and _is_review_content(body):
-                try:
-                    self.pr.create_review(
-                        commit=self.last_commit_id,
-                        body=body,
-                        event="COMMENT",
-                    )
-                    print(f"[Argus] Posted /review as GitHub Review object")
-                    return
-                except Exception as e:
-                    print(f"[Argus] Review object failed ({e}), falling back")
+                self._argus_review_body = body
+                print(f"[Argus] Captured review body ({len(body)} chars), deferring publish")
+                return
             return original_publish_comment(self, body, is_temporary=is_temporary)
 
         gh_mod.GithubProvider.publish_persistent_comment = patched_publish_persistent
         gh_mod.GithubProvider.publish_comment = patched_publish_comment
-        print("[Argus] /review → GitHub Review object patched")
+
+        # -- Step B: After original run, combine body + inline → one Review --
+        original_run = pr_reviewer.PRReviewer.run
+
+        async def patched_run(self):
+            """Run original /review, then post unified GitHub Review."""
+            # Clear capture state
+            self.git_provider._argus_review_body = None
+
+            # Run original — it generates prediction, captures body via patched publish
+            result = await original_run(self)
+
+            review_body = getattr(self.git_provider, '_argus_review_body', None)
+            if not review_body:
+                # Body wasn't captured (maybe no issues found), nothing to do
+                return result
+
+            # Build inline comments from key_issues
+            inline_comments = []
+            try:
+                if hasattr(self, 'prediction') and self.prediction:
+                    data = load_yaml(self.prediction.strip(),
+                                     keys_fix_yaml=["ticket_compliance_check",
+                                                     "estimated_effort_to_review_[1-5]:",
+                                                     "security_concerns:",
+                                                     "key_issues_to_review:",
+                                                     "relevant_file:", "relevant_line:", "suggestion:"],
+                                     first_key="review", last_key="key_issues_to_review")
+
+                    if data and 'review' in data:
+                        issues = data['review'].get('key_issues_to_review', [])
+                        diff_files = self.git_provider.diff_files or self.git_provider.get_diff_files()
+
+                        for issue in issues:
+                            try:
+                                filepath = issue.get('relevant_file', '').strip()
+                                end_line = int(issue.get('end_line', 0))
+                                if not filepath or not end_line:
+                                    continue
+                                position, _ = find_line_number_of_relevant_line_in_file(
+                                    diff_files, filepath.strip('`'), "", end_line)
+                                if position == -1:
+                                    continue
+                                body = format_review_finding_body(issue)
+                                inline_comments.append({
+                                    'body': body,
+                                    'path': filepath.strip(),
+                                    'position': position,
+                                })
+                            except Exception as e:
+                                print(f"[Argus] Could not build inline comment: {e}")
+            except Exception as e:
+                print(f"[Argus] Failed to parse key_issues: {e}")
+
+            # Post unified review: body + inline comments in ONE create_review call
+            try:
+                self.git_provider.pr.create_review(
+                    commit=self.git_provider.last_commit_id,
+                    body=review_body,
+                    event="COMMENT",
+                    comments=inline_comments,
+                )
+                n = len(inline_comments)
+                print(f"[Argus] Posted unified review ({len(review_body)} chars, {n} inline threads)")
+            except Exception as e:
+                print(f"[Argus] Unified review failed ({e}), posting body only")
+                try:
+                    self.git_provider.pr.create_review(
+                        commit=self.git_provider.last_commit_id,
+                        body=review_body,
+                        event="COMMENT",
+                    )
+                    # Post inline separately as fallback
+                    if inline_comments:
+                        self.git_provider.pr.create_review(
+                            commit=self.git_provider.last_commit_id,
+                            comments=inline_comments,
+                        )
+                except Exception as e2:
+                    print(f"[Argus] All review posting failed ({e2}), using original publish")
+                    original_publish_comment(self.git_provider, review_body)
+
+            # Delete the placeholder "Preparing review..." comment
+            try:
+                self.git_provider.remove_initial_comment()
+            except Exception:
+                pass
+
+            return result
+
+        pr_reviewer.PRReviewer.run = patched_run
+        print("[Argus] /review unified (body + inline) patched")
     except Exception as e:
-        print(f"[Argus] Failed to patch review publish: {e}")
+        print(f"[Argus] Failed to patch /review: {e}")
