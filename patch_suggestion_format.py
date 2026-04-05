@@ -121,31 +121,47 @@ def _detect_lang(filepath: str) -> str:
 
 
 def _build_agent_prompt(d: dict, filepath: str, start: str, end: str) -> str:
-    """Build a prompt that AI coding agents can directly use."""
+    """Build an English prompt that AI coding agents can directly use."""
     content = d.get("suggestion_content", "").rstrip()
     label = d.get("label", "").strip()
     improved = d.get("improved_code", "").rstrip()
+    existing = d.get("existing_code", "").rstrip()
+    summary = d.get("one_sentence_summary", "").rstrip()
+
+    # Use one_sentence_summary (typically shorter/English-ish) or label as fallback
+    issue_title = summary if summary else label
 
     lines = [
-        f"In file {filepath}",
+        f"In file `{filepath}`",
     ]
     if start and end and start != end:
-        lines.append(f"at lines {start}-{end}:")
+        lines.append(f"around lines {start}-{end}:")
     elif start:
-        lines.append(f"at line {start}:")
-    else:
-        lines.append(":")
+        lines.append(f"around line {start}:")
 
     lines.append("")
-    lines.append(f"Issue: {content}")
-    lines.append(f"Category: {label}")
+    lines.append(f"[{label}] {issue_title}")
+    lines.append("")
+    lines.append(f"Description: {content}")
     lines.append("")
 
-    if improved:
-        lines.append("Replace the existing code with:")
+    if existing and improved:
+        lines.append("Current code:")
+        lines.append(f"```")
+        lines.append(existing)
+        lines.append(f"```")
+        lines.append("")
+        lines.append("Suggested replacement:")
+        lines.append(f"```")
         lines.append(improved)
+        lines.append(f"```")
+    elif improved:
+        lines.append("Suggested fix:")
+        lines.append(f"```")
+        lines.append(improved)
+        lines.append(f"```")
     else:
-        lines.append(f"Fix: {content}")
+        lines.append(f"Action required: {content}")
 
     return "\n".join(lines)
 
