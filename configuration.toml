@@ -206,12 +206,12 @@ enable_help_text=false
 
 [github]
 # The type of deployment to create. Valid values are 'app' or 'user'.
-deployment_type = "user"
+deployment_type = "app"
 ratelimit_retries = 5
 base_url = "https://api.github.com"
 publish_inline_comments_fallback_with_verification = true
 try_fix_invalid_inline_comments = true
-app_name = "pr-agent"
+app_name = "argus-review"
 ignore_bot_pr = true
 
 [github_action_config]
@@ -222,7 +222,7 @@ ignore_bot_pr = true
 
 [github_app]
 # these toggles allows running the github app from custom deployments
-bot_user = "github-actions[bot]"
+bot_user = "argus-review[bot]"
 override_deployment_type = true
 # settings for "pull_request" event
 handle_pr_actions = ['opened', 'reopened', 'ready_for_review']
