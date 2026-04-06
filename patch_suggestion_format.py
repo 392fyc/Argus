@@ -894,19 +894,24 @@ def apply_patch():
                         "Initial review — no blocking issues. "
                         "Minor findings posted as inline threads.")
 
-            # Rule 5: New findings in this review → COMMENT (defer approval)
-            # Even minor findings should be addressed before approval;
-            # approval happens on the NEXT iteration when no new findings appear.
-            minor_count = len(findings) - len(critical_major)
-            if findings:
+            # Rule 5: Medium+ new findings → COMMENT (defer approval)
+            # Minor-only findings are noted but don't block approval.
+            DEFERRING_SEVERITIES = {"Critical", "Major", "Medium"}
+            medium_plus = [f for f in findings
+                           if _classify_finding_severity(f.get("issue_header", "")) in DEFERRING_SEVERITIES]
+            minor_count = len(findings) - len(medium_plus)
+
+            if medium_plus:
                 return ("COMMENT",
-                        f"💬 {minor_count} new finding(s) posted. "
+                        f"💬 {len(medium_plus)} medium+ finding(s) posted. "
                         f"Address or discuss before approval. "
                         f"Iteration {iteration}/{MAX_ITERATIONS}.")
 
-            # Rule 6: No new findings, no blocking issues, all threads resolved → APPROVE
+            # Rule 6: No blocking findings, all threads resolved → APPROVE
+            # Minor-only findings are noted but don't block.
+            suffix = f" ({minor_count} minor finding(s) noted.)" if minor_count else ""
             return ("APPROVE",
-                    f"✅ No issues found, all threads resolved. "
+                    f"✅ No blocking issues, all threads resolved.{suffix} "
                     f"Iteration {iteration}/{MAX_ITERATIONS}.")
 
         async def patched_run(self):
@@ -977,6 +982,17 @@ def apply_patch():
             # Build enhanced review body (CodeRabbit-style)
             body_additions = build_review_body_additions(
                 findings, len(inline_comments), diff_files)
+
+            # Strip PR Reviewer Guide from incremental reviews (iteration >= 2)
+            # The full guide is only useful on the first review; subsequent reviews
+            # should focus on incremental findings only.
+            if iteration >= 2 and "PR Reviewer Guide" in review_body:
+                import re
+                # Remove the guide section (## PR Reviewer Guide ... up to next ## or end)
+                review_body = re.sub(
+                    r'## PR Reviewer Guide.*?(?=\n## |\n---|\Z)',
+                    '', review_body, flags=re.DOTALL).strip()
+
             review_body = body_additions + "\n\n" + review_body
 
             # Append decision footer
