@@ -999,7 +999,8 @@ def apply_patch():
                 return [], 0
 
         def _decide_review_event(findings, unresolved_threads, iteration,
-                                 has_inline_comments=False):
+                                 has_inline_comments=False,
+                                 no_new_code=False):
             """
             Returns (event, reason):
               "REQUEST_CHANGES" — blocking issues found
@@ -1009,12 +1010,15 @@ def apply_patch():
             has_inline_comments: True if this review will post new inline
             comments. Approval is deferred when new comments are posted,
             regardless of severity, because the author hasn't seen them yet.
+            no_new_code: True if HEAD == last review commit (no new push).
+            When set, new findings are noise and should not block approval.
             """
             critical_major = [f for f in findings
                               if _classify_finding_severity(f.get("issue_header", "")) in BLOCKING_SEVERITIES]
 
             # Rule 1: Critical/Major findings always block (regardless of iteration)
-            if critical_major:
+            # But only on actual new code — re-analyzing unchanged code is noise.
+            if critical_major and not no_new_code:
                 return ("REQUEST_CHANGES",
                         f"🔴 {len(critical_major)} critical/major issue(s) — changes requested.")
 
@@ -1035,7 +1039,14 @@ def apply_patch():
                         "Initial review — no blocking issues. "
                         "Minor findings posted as inline threads.")
 
-            # Rule 5: New inline comments being posted → COMMENT (defer approval)
+            # Rule 5: No new code + all threads resolved → APPROVE immediately
+            # Threads were resolved via replies, no new commit to review.
+            if no_new_code and not unresolved_threads:
+                return ("APPROVE",
+                        f"✅ All threads resolved, no new code to review. "
+                        f"Iteration {iteration}/{MAX_ITERATIONS}.")
+
+            # Rule 6: New inline comments being posted → COMMENT (defer approval)
             # Cannot APPROVE in the same API call that posts new comments,
             # because the author hasn't had a chance to see/address them.
             if has_inline_comments:
@@ -1113,44 +1124,60 @@ def apply_patch():
             unresolved_threads, past_reviews = _get_thread_state(self.git_provider, pr_number)
             iteration = past_reviews + 1
 
+            # Detect if there's new code since the last review
+            no_new_code = False
+            last_review_sha = None
+            try:
+                import requests as _req_inc
+                token_inc = _get_github_token(self.git_provider)
+                if token_inc:
+                    repo_inc = self.git_provider.repo
+                    fn_inc = repo_inc.full_name if hasattr(repo_inc, 'full_name') else str(repo_inc)
+                    auth_inc = {"Authorization": f"Bearer {token_inc}",
+                                "Accept": "application/vnd.github+json"}
+                    r_rv = _req_inc.get(
+                        f"https://api.github.com/repos/{fn_inc}/pulls/{pr_number}/reviews",
+                        headers=auth_inc, timeout=15)
+                    if r_rv.status_code == 200:
+                        for rv in reversed(r_rv.json()):
+                            if _is_bot_author(rv.get("user", {}).get("login", ""), BOT_LOGIN):
+                                last_review_sha = rv.get("commit_id")
+                                break
+                    current_sha = getattr(self.git_provider, 'last_commit_id', None)
+                    if current_sha and last_review_sha:
+                        current_str = current_sha.sha if hasattr(current_sha, 'sha') else str(current_sha)
+                        if current_str == last_review_sha:
+                            no_new_code = True
+                            print(f"[Argus] No new code since last review ({last_review_sha[:7]})")
+            except Exception as e:
+                print(f"[Argus] New-code detection failed (non-fatal): {e}")
+
             # --- Fix B: Incremental diff filter ---
             # After iteration 1, drop findings on lines NOT changed since last review.
-            if iteration >= 2 and inline_comments and pr_number:
+            # Skip entirely if no new code (all findings would be noise).
+            if no_new_code and inline_comments:
+                print(f"[Argus] No new code: dropping all {len(inline_comments)} findings")
+                inline_comments = []
+            elif iteration >= 2 and inline_comments and pr_number and last_review_sha:
                 try:
-                    import requests as _req_inc
-                    token_inc = _get_github_token(self.git_provider)
                     if token_inc:
-                        repo_inc = self.git_provider.repo
-                        fn_inc = repo_inc.full_name if hasattr(repo_inc, 'full_name') else str(repo_inc)
-                        auth_inc = {"Authorization": f"Bearer {token_inc}",
-                                    "Accept": "application/vnd.github+json"}
-                        last_sha = None
-                        r_rv = _req_inc.get(
-                            f"https://api.github.com/repos/{fn_inc}/pulls/{pr_number}/reviews",
-                            headers=auth_inc, timeout=15)
-                        if r_rv.status_code == 200:
-                            for rv in reversed(r_rv.json()):
-                                if _is_bot_author(rv.get("user", {}).get("login", ""), BOT_LOGIN):
-                                    last_sha = rv.get("commit_id")
-                                    break
-                        if last_sha:
-                            changed = _get_changed_files_lines(auth_inc, fn_inc,
-                                                                pr_number, since_sha=last_sha)
-                            if changed:
-                                def _line_in_changed(path, end_line, changed_set):
-                                    if (path, None) in changed_set:
-                                        return True
-                                    return any((path, ln) in changed_set
-                                               for ln in range(end_line - 5, end_line + 6))
+                        changed = _get_changed_files_lines(auth_inc, fn_inc,
+                                                            pr_number, since_sha=last_review_sha)
+                        if changed:
+                            def _line_in_changed(path, end_line, changed_set):
+                                if (path, None) in changed_set:
+                                    return True
+                                return any((path, ln) in changed_set
+                                           for ln in range(end_line - 5, end_line + 6))
 
-                                before = len(inline_comments)
-                                inline_comments = [
-                                    c for c in inline_comments
-                                    if _line_in_changed(c['path'], c['_end_line'], changed)
-                                ]
-                                dropped = before - len(inline_comments)
-                                if dropped:
-                                    print(f"[Argus] Incremental filter: dropped {dropped}/{before} findings on unchanged lines")
+                            before = len(inline_comments)
+                            inline_comments = [
+                                c for c in inline_comments
+                                if _line_in_changed(c['path'], c['_end_line'], changed)
+                            ]
+                            dropped = before - len(inline_comments)
+                            if dropped:
+                                print(f"[Argus] Incremental filter: dropped {dropped}/{before} findings on unchanged lines")
                 except Exception as e:
                     print(f"[Argus] Incremental filter failed (non-fatal): {e}")
 
@@ -1186,7 +1213,8 @@ def apply_patch():
             # Decide review event
             event, reason = _decide_review_event(
                 findings, unresolved_threads, iteration,
-                has_inline_comments=bool(inline_comments))
+                has_inline_comments=bool(inline_comments),
+                no_new_code=no_new_code)
 
             # Build enhanced review body (CodeRabbit-style)
             body_additions = build_review_body_additions(
