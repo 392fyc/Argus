@@ -954,17 +954,26 @@ def apply_patch():
                 auth_h = {"Authorization": f"Bearer {token}",
                           "Accept": "application/vnd.github+json"}
 
-                # REST: count past Argus /review reviews only (exclude /improve, /describe)
-                # Match on "Review Decision" — present in all review footers.
-                # (Cannot use "PR Reviewer Guide" because it's stripped for iteration >= 2.)
+                # Count past Argus /review iterations.
+                # Check both review objects AND issue comments, because earlier
+                # reviews may have fallen back to issue comments due to API errors.
                 argus_review_count = 0
+                # Source 1: review objects
                 r = _req.get(f"https://api.github.com/repos/{full_name}/pulls/{pr_number}/reviews",
                              headers=auth_h, timeout=15)
                 if r.status_code == 200:
-                    argus_review_count = sum(
+                    argus_review_count += sum(
                         1 for rv in r.json()
                         if rv.get("user", {}).get("login") == BOT_LOGIN
                         and "Review Decision" in (rv.get("body") or ""))
+                # Source 2: issue comments (fallback path)
+                r2 = _req.get(f"https://api.github.com/repos/{full_name}/issues/{pr_number}/comments?per_page=100",
+                              headers=auth_h, timeout=15)
+                if r2.status_code == 200:
+                    argus_review_count += sum(
+                        1 for c in r2.json()
+                        if _is_bot_author(c.get("user", {}).get("login", ""), BOT_LOGIN)
+                        and "Review Decision" in (c.get("body") or ""))
 
                 # GraphQL: thread resolution (exclude /improve suggestion threads)
                 argus_unresolved = []
