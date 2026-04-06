@@ -739,6 +739,7 @@ def apply_patch():
             if not is_successful:
                 for cs in code_suggestions:
                     self.git_provider.publish_code_suggestions([cs])
+            return True
 
         pr_code_suggestions.PRCodeSuggestions.push_inline_code_suggestions = patched_push
         print("[Argus] /improve format patched")
