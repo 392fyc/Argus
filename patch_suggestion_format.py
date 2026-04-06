@@ -276,18 +276,170 @@ def build_review_body_additions(findings: list, inline_count: int,
 
 # ── Thread auto-resolve ──────────────────────────────────────────
 
-def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[bot]"):
-    """Resolve Argus review threads where the underlying code has changed.
+def _get_changed_files_lines(auth_h, full_name, pr_number):
+    """Get set of (filepath, line) tuples changed in the latest commit of a PR.
 
-    Uses GitHub GraphQL resolveReviewThread mutation.
-    Only resolves threads that are:
-    - Authored by Argus
-    - Marked as outdated (code was modified in subsequent commit)
-    - Have no human replies (to preserve discussion)
+    Uses the compare API to get the diff between the last two commits.
+    Falls back to empty set on failure (disables fix-detection, keeps isOutdated path).
+    """
+    import requests as _req
+
+    try:
+        # Get the latest two commits on the PR
+        r = _req.get(f"https://api.github.com/repos/{full_name}/pulls/{pr_number}/commits",
+                     headers=auth_h, timeout=15)
+        if r.status_code != 200:
+            return set()
+        commits = r.json()
+        if len(commits) < 2:
+            return set()
+
+        base_sha = commits[-2]["sha"]
+        head_sha = commits[-1]["sha"]
+
+        # Get diff between last two commits
+        r = _req.get(f"https://api.github.com/repos/{full_name}/compare/{base_sha}...{head_sha}",
+                     headers=auth_h, timeout=15)
+        if r.status_code != 200:
+            return set()
+
+        changed = set()
+        for f in r.json().get("files", []):
+            filepath = f.get("filename", "")
+            if not filepath:
+                continue
+            # Parse patch hunks for changed line numbers
+            patch = f.get("patch", "")
+            if not patch:
+                # Whole file changed (binary or rename) — mark all lines
+                changed.add((filepath, None))
+                continue
+            for line in patch.split("\n"):
+                if line.startswith("@@"):
+                    # Parse @@ -a,b +c,d @@ format
+                    try:
+                        plus_part = line.split("+")[1].split("@@")[0].strip()
+                        start = int(plus_part.split(",")[0])
+                        count = int(plus_part.split(",")[1]) if "," in plus_part else 1
+                        for ln in range(start, start + count):
+                            changed.add((filepath, ln))
+                    except (IndexError, ValueError):
+                        pass
+        return changed
+    except Exception as e:
+        print(f"[Argus] Changed-files detection failed: {e}")
+        return set()
+
+
+def _resolve_thread(auth_h, thread_id):
+    """Resolve a single review thread via GraphQL mutation."""
+    import requests as _req
+
+    mutation = """mutation {
+      resolveReviewThread(input: {threadId: "%s"}) {
+        thread { isResolved }
+      }
+    }""" % thread_id
+    m = _req.post("https://api.github.com/graphql",
+                  json={"query": mutation}, headers=auth_h, timeout=10)
+    if m.status_code == 200:
+        data = m.json()
+        if data.get("data", {}).get("resolveReviewThread", {}).get("thread", {}).get("isResolved"):
+            return True
+        if data.get("errors"):
+            print(f"[Argus] Resolve failed for {thread_id}: {data['errors']}")
+    else:
+        print(f"[Argus] Resolve request failed: {m.status_code}")
+    return False
+
+
+def _reply_to_thread(auth_h, full_name, pr_number, thread_comment_id, body):
+    """Post a reply to a review thread (uses REST pull request comment reply)."""
+    import requests as _req
+
+    r = _req.post(
+        f"https://api.github.com/repos/{full_name}/pulls/{pr_number}/comments/{thread_comment_id}/replies",
+        json={"body": body}, headers=auth_h, timeout=10)
+    return r.status_code == 201
+
+
+def _judge_reply_with_llm(original_finding, reply_body):
+    """Use LLM to judge whether a reply justifies resolving a thread.
+
+    Uses litellm (PR-Agent's underlying LLM library) directly.
+    Model is read from PR-Agent's config.model setting.
+
+    Returns: ("ACCEPT", reason) | ("REJECT", follow_up) | ("ESCALATE", reason)
+    """
+    try:
+        import litellm
+        from pr_agent.config_loader import get_settings
+
+        model = get_settings().get("config.model", "")
+        if not model:
+            return "ESCALATE", "No LLM model configured"
+
+        system_prompt = (
+            "You are a code review arbitrator. A reviewer posted a finding on a pull request, "
+            "and the PR author replied. Judge the reply.\n\n"
+            "Respond with EXACTLY one of these formats:\n"
+            "ACCEPT: <one-line reason why the reply is valid>\n"
+            "REJECT: <one-line follow-up question or counter-argument>\n"
+            "ESCALATE: <one-line reason this needs human review>\n\n"
+            "Rules:\n"
+            "- ACCEPT if the reply provides a valid justification, demonstrates the finding "
+            "is a false positive, or explains why the current code is correct.\n"
+            "- REJECT if the reply is vague, doesn't address the finding, or the justification "
+            "is technically incorrect.\n"
+            "- ESCALATE if the discussion involves architecture decisions, trade-offs, or "
+            "policy choices that need human judgment.\n"
+            "- Be conservative: when uncertain, prefer REJECT over ACCEPT."
+        )
+        user_prompt = (
+            f"## Original Finding\n{original_finding}\n\n"
+            f"## Author Reply\n{reply_body}\n\n"
+            f"Your judgment:"
+        )
+
+        response = litellm.completion(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=150,
+            temperature=0.1,
+        )
+        text = response.choices[0].message.content.strip()
+
+        for verdict in ("ACCEPT", "REJECT", "ESCALATE"):
+            if text.upper().startswith(verdict):
+                reason = text[len(verdict):].lstrip(":").strip()
+                return verdict, reason
+        return "ESCALATE", f"Unparseable LLM response: {text[:100]}"
+
+    except Exception as e:
+        print(f"[Argus] LLM reply judgment failed: {e}")
+        return "ESCALATE", f"LLM error: {e}"
+
+
+# Max reply-judgment rounds per thread before forced escalation
+MAX_REPLY_ROUNDS = 3
+
+
+def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[bot]"):
+    """Resolve Argus review threads using fix-detection + reply-aware judging.
+
+    Resolution strategies (in priority order):
+    1. Fix-detection: thread targets a file+line modified in latest commit → resolve
+    2. isOutdated fallback: GitHub marks thread as outdated → resolve
+    3. Reply-aware: thread has human reply → LLM judges ACCEPT/REJECT/ESCALATE
+
+    Threads authored by non-Argus users are never touched.
+    Threads with incomplete comment data are skipped for safety.
 
     Refs:
     - https://docs.github.com/en/graphql/reference/mutations#resolvereviewthread
-    - Permission required: Contents: Write
     """
     import requests as _req
 
@@ -298,7 +450,6 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
         full_name = repo.full_name if hasattr(repo, 'full_name') else str(repo)
         owner, name = full_name.split("/", 1)
 
-        # Get token
         token = _get_github_token(provider)
         if not token:
             print("[Argus] No token — skipping auto-resolve")
@@ -307,8 +458,10 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
         auth_h = {"Authorization": f"Bearer {token}",
                   "Accept": "application/vnd.github+json"}
 
-        # Query all unresolved threads with isOutdated flag
-        # Fetch up to 20 comments per thread to reliably detect human replies
+        # Build set of (file, line) changed in latest commit for fix-detection
+        changed_lines = _get_changed_files_lines(auth_h, full_name, pr_number)
+
+        # Query threads with path, line, body for fix-detection + reply judging
         query = """{
           repository(owner: "%s", name: "%s") {
             pullRequest(number: %d) {
@@ -317,10 +470,15 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
                   id
                   isResolved
                   isOutdated
+                  path
+                  line
                   comments(first: 20) {
                     totalCount
                     nodes {
+                      id
+                      databaseId
                       author { login }
+                      body
                     }
                   }
                 }
@@ -337,49 +495,95 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
 
         threads = g.json()["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
         resolved_count = 0
+        reply_judged = 0
 
         for t in threads:
-            # Only unresolved + outdated threads
-            if t["isResolved"] or not t.get("isOutdated", False):
+            if t["isResolved"]:
                 continue
 
-            # Only Argus-authored threads
             comments = t["comments"]
-            authors = [c["author"]["login"]
-                       for c in comments["nodes"]
-                       if c.get("author")]
+            authors = [c["author"]["login"] for c in comments["nodes"] if c.get("author")]
+
+            # Only touch Argus-authored threads
             if bot_login not in authors:
                 continue
 
-            # Skip threads with human replies (preserve discussion)
-            # Also skip if we couldn't fetch all comments (totalCount > fetched)
-            human_authors = [a for a in authors if a != bot_login]
-            if human_authors:
-                continue
+            # Skip if we couldn't fetch all comments
             if comments.get("totalCount", 0) > len(comments["nodes"]):
                 continue
 
-            # Resolve via GraphQL mutation
+            human_authors = [a for a in authors if a != bot_login]
             thread_id = t["id"]
-            mutation = """mutation {
-              resolveReviewThread(input: {threadId: "%s"}) {
-                thread { isResolved }
-              }
-            }""" % thread_id
+            thread_path = t.get("path", "")
+            thread_line = t.get("line")
 
-            m = _req.post("https://api.github.com/graphql",
-                          json={"query": mutation}, headers=auth_h, timeout=10)
-            if m.status_code == 200:
-                data = m.json()
-                if data.get("data", {}).get("resolveReviewThread", {}).get("thread", {}).get("isResolved"):
+            # --- Strategy 1: Fix-detection (file+line in latest commit diff) ---
+            if not human_authors and changed_lines and thread_path:
+                # Check if the exact line was modified, or if the whole file changed
+                file_touched = (thread_path, thread_line) in changed_lines or \
+                               (thread_path, None) in changed_lines
+                if file_touched:
+                    if _resolve_thread(auth_h, thread_id):
+                        resolved_count += 1
+                        print(f"[Argus] Fix-detected: {thread_path}:{thread_line} → resolved")
+                    continue
+
+            # --- Strategy 2: isOutdated fallback (no human replies) ---
+            if not human_authors and t.get("isOutdated", False):
+                if _resolve_thread(auth_h, thread_id):
                     resolved_count += 1
-                elif data.get("errors"):
-                    print(f"[Argus] Resolve failed for {thread_id}: {data['errors']}")
-            else:
-                print(f"[Argus] Resolve request failed: {m.status_code}")
+                continue
 
-        if resolved_count:
-            print(f"[Argus] Auto-resolved {resolved_count} outdated thread(s)")
+            # --- Strategy 3: Reply-aware judging (thread has human replies) ---
+            if human_authors:
+                # Count how many Argus judgment replies already exist
+                argus_judgment_count = sum(
+                    1 for c in comments["nodes"]
+                    if c.get("author", {}).get("login") == bot_login
+                    and any(tag in c.get("body", "") for tag in ("✅ Acknowledged", "❓ Follow-up", "⚠️ Escalated")))
+
+                if argus_judgment_count >= MAX_REPLY_ROUNDS:
+                    # Too many rounds — escalate silently (don't spam)
+                    continue
+
+                # Get original finding (first Argus comment) and latest human reply
+                original_finding = ""
+                latest_reply = ""
+                first_comment_db_id = None
+                for c in comments["nodes"]:
+                    if c.get("author", {}).get("login") == bot_login and not original_finding:
+                        original_finding = c.get("body", "")
+                        first_comment_db_id = c.get("databaseId")
+                    if c.get("author", {}).get("login") in human_authors:
+                        latest_reply = c.get("body", "")
+
+                if not original_finding or not latest_reply or not first_comment_db_id:
+                    continue
+
+                verdict, reason = _judge_reply_with_llm(original_finding, latest_reply)
+                reply_judged += 1
+
+                if verdict == "ACCEPT":
+                    _reply_to_thread(auth_h, full_name, pr_number,
+                                     first_comment_db_id,
+                                     f"✅ Acknowledged — {reason}")
+                    if _resolve_thread(auth_h, thread_id):
+                        resolved_count += 1
+                        print(f"[Argus] Reply accepted: {thread_path} → resolved")
+                elif verdict == "REJECT":
+                    _reply_to_thread(auth_h, full_name, pr_number,
+                                     first_comment_db_id,
+                                     f"❓ Follow-up — {reason}")
+                    print(f"[Argus] Reply rejected: {thread_path} → follow-up posted")
+                else:  # ESCALATE
+                    _reply_to_thread(auth_h, full_name, pr_number,
+                                     first_comment_db_id,
+                                     f"⚠️ Escalated — {reason}\n\n"
+                                     f"*This thread requires human reviewer input.*")
+                    print(f"[Argus] Reply escalated: {thread_path}")
+
+        if resolved_count or reply_judged:
+            print(f"[Argus] Auto-resolve: {resolved_count} resolved, {reply_judged} replies judged")
         return resolved_count
 
     except Exception as e:
@@ -456,7 +660,7 @@ def format_walkthrough_comment(data: dict, diagram: str = "") -> str:
 
         for label, files in groups.items():
             filenames = ", ".join(
-                f"`{str(f.get('filename', '?') or '?')}`" for f in files)
+                f"`{str(f.get('filename', '?') or '?').strip()}`" for f in files)
             # Combine summaries
             summaries = []
             for f in files:
@@ -689,12 +893,19 @@ def apply_patch():
                         "Initial review — no blocking issues. "
                         "Minor findings posted as inline threads.")
 
-            # Rule 5: Subsequent review, no blocking issues, all threads resolved → APPROVE
-            # Minor-only findings don't block approval on iteration >= 2
+            # Rule 5: New findings in this review → COMMENT (defer approval)
+            # Even minor findings should be addressed before approval;
+            # approval happens on the NEXT iteration when no new findings appear.
             minor_count = len(findings) - len(critical_major)
-            suffix = f" ({minor_count} minor findings noted.)" if minor_count else ""
+            if findings:
+                return ("COMMENT",
+                        f"💬 {minor_count} new finding(s) posted. "
+                        f"Address or discuss before approval. "
+                        f"Iteration {iteration}/{MAX_ITERATIONS}.")
+
+            # Rule 6: No new findings, no blocking issues, all threads resolved → APPROVE
             return ("APPROVE",
-                    f"✅ No critical/major issues, all threads resolved.{suffix} "
+                    f"✅ No issues found, all threads resolved. "
                     f"Iteration {iteration}/{MAX_ITERATIONS}.")
 
         async def patched_run(self):

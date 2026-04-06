@@ -116,16 +116,33 @@ def _should_rewrite_mention(body: str) -> bool:
     return False
 
 
+PR_AGENT_COMMANDS = {
+    "review", "describe", "improve", "ask", "help",
+    "update_changelog", "similar_issue", "add_docs", "test",
+}
+
+
 def _rewrite_mention(body: str) -> str:
-    """Rewrite @argus-review mention to /ask command."""
-    # Remove the @mention prefix
+    """Rewrite @argus-review mentions to PR-Agent slash commands.
+
+    Supports both styles:
+      @argus-review review        → /review
+      @argus-review review -i     → /review -i
+      @argus-review /review       → /review
+      @argus-review why is X bad? → /ask why is X bad?
+    """
     cleaned = BOT_MENTION_RE.sub("", body).strip()
     if not cleaned:
         return ""
-    # If already a command, just strip the @mention
+    # Already a slash command — pass through
     if cleaned.startswith("/"):
         return cleaned
-    # Rewrite as /ask
+    # Check if first word is a known PR-Agent command
+    first_word = cleaned.split()[0].lower()
+    if first_word in PR_AGENT_COMMANDS:
+        rest = cleaned[len(first_word):].strip()
+        return f"/{first_word} {rest}".rstrip()
+    # Fallback: treat as /ask
     return f"/ask {cleaned}"
 
 
@@ -147,7 +164,7 @@ def _patch_mention_handler():
 
         async def patched_handle(body, event, sender, sender_id,
                                  action, log_context, agent):
-            # Rewrite @mentions to /ask before PR-Agent filters them
+            # Rewrite @mentions to PR-Agent slash commands
             if (action == "created" and "comment" in body
                     and isinstance(body["comment"], dict)):
                 comment_body = body["comment"].get("body", "")
@@ -155,6 +172,7 @@ def _patch_mention_handler():
                 if sender and "argus-review" in sender.lower():
                     return {}
 
+                # Rewrite @mentions to PR-Agent commands
                 if _should_rewrite_mention(comment_body):
                     rewritten = _rewrite_mention(comment_body)
                     if rewritten:
