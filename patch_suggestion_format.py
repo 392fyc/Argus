@@ -568,6 +568,15 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
                     # Too many rounds — escalate silently (don't spam)
                     continue
 
+                # Skip if the last comment is already a bot judgment — no new
+                # human input to judge, re-running would duplicate the reply.
+                JUDGMENT_TAGS = ("✅ Acknowledged", "❓ Follow-up", "⚠️ Escalated")
+                last_comment = comments["nodes"][-1]
+                last_is_bot = _is_bot_author(
+                    last_comment.get("author", {}).get("login", ""), bot_login)
+                if last_is_bot and any(tag in last_comment.get("body", "") for tag in JUDGMENT_TAGS):
+                    continue
+
                 # Get original finding (first Argus comment) and latest human reply
                 original_finding = ""
                 latest_reply = ""
@@ -580,11 +589,6 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
                         latest_reply = c.get("body", "")
 
                 if not original_finding or not latest_reply or not first_comment_db_id:
-                    continue
-
-                # Skip if latest reply is itself a judgment tag (loop prevention)
-                JUDGMENT_TAGS = ("✅ Acknowledged", "❓ Follow-up", "⚠️ Escalated")
-                if any(tag in latest_reply for tag in JUDGMENT_TAGS):
                     continue
 
                 verdict, reason = _judge_reply_with_llm(original_finding, latest_reply)
