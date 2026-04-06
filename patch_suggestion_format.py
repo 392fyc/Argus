@@ -802,6 +802,10 @@ def format_walkthrough_comment(data: dict, diagram: str = "") -> str:
         parts.append("")
         # Diagram may already be wrapped in ```mermaid``` or not
         diag = diagram.strip()
+        # Sanitize: strip backticks inside node labels — they break Mermaid rendering.
+        # Matches `text` within ["..."] or ("...") node labels and removes the backticks.
+        import re
+        diag = re.sub(r'`([^`\n]+)`', r'\1', diag)
         if not diag.startswith("```"):
             parts.append("```mermaid")
             parts.append(diag)
@@ -1198,12 +1202,15 @@ def apply_patch():
             review_body += f"{len(unresolved_threads)} unresolved threads*"
 
             # Post unified review
+            # Strip internal keys before passing to PyGithub (GitHub API rejects unknown fields)
+            api_comments = [{k: v for k, v in c.items() if not k.startswith('_')}
+                            for c in inline_comments]
             try:
                 self.git_provider.pr.create_review(
                     commit=self.git_provider.last_commit_id,
                     body=review_body,
                     event=event,
-                    comments=inline_comments,
+                    comments=api_comments,
                 )
                 n = len(inline_comments)
                 print(f"[Argus] Posted {event} review ({n} inline, iteration {iteration})")
@@ -1214,7 +1221,7 @@ def apply_patch():
                         commit=self.git_provider.last_commit_id,
                         body=review_body,
                         event="COMMENT",
-                        comments=inline_comments,
+                        comments=api_comments,
                     )
                 except Exception as e2:
                     print(f"[Argus] All posting failed ({e2})")
