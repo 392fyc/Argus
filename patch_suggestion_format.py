@@ -276,16 +276,18 @@ def build_review_body_additions(findings: list, inline_count: int,
 
 # ── Thread auto-resolve ──────────────────────────────────────────
 
-def _get_changed_files_lines(auth_h, full_name, pr_number):
-    """Get set of (filepath, line) tuples changed in the latest commit of a PR.
+def _get_changed_files_lines(auth_h, full_name, pr_number, since_sha=None):
+    """Get set of (filepath, line) tuples changed since a given commit.
 
-    Uses the compare API to get the diff between the last two commits.
+    If since_sha is provided, compares since_sha...HEAD (captures all fixes
+    since the last Argus review).  Otherwise falls back to comparing the last
+    two PR commits (single-commit delta).
     Falls back to empty set on failure (disables fix-detection, keeps isOutdated path).
     """
     import requests as _req
 
     try:
-        # Get the latest two commits on the PR
+        # Get the PR commits
         r = _req.get(f"https://api.github.com/repos/{full_name}/pulls/{pr_number}/commits",
                      headers=auth_h, timeout=15)
         if r.status_code != 200:
@@ -294,10 +296,10 @@ def _get_changed_files_lines(auth_h, full_name, pr_number):
         if len(commits) < 2:
             return set()
 
-        base_sha = commits[-2]["sha"]
         head_sha = commits[-1]["sha"]
+        base_sha = since_sha or commits[-2]["sha"]
 
-        # Get diff between last two commits
+        # Get diff between base and head
         r = _req.get(f"https://api.github.com/repos/{full_name}/compare/{base_sha}...{head_sha}",
                      headers=auth_h, timeout=15)
         if r.status_code != 200:
@@ -480,8 +482,25 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
         auth_h = {"Authorization": f"Bearer {token}",
                   "Accept": "application/vnd.github+json"}
 
-        # Build set of (file, line) changed in latest commit for fix-detection
-        changed_lines = _get_changed_files_lines(auth_h, full_name, pr_number)
+        # Find the commit SHA of the last Argus review so fix-detection covers
+        # ALL changes since that review, not just the latest single commit.
+        last_review_sha = None
+        try:
+            r = _req.get(f"https://api.github.com/repos/{full_name}/pulls/{pr_number}/reviews",
+                         headers=auth_h, timeout=15)
+            if r.status_code == 200:
+                for rv in reversed(r.json()):
+                    if _is_bot_author(rv.get("user", {}).get("login", ""), bot_login):
+                        last_review_sha = rv.get("commit_id")
+                        break
+        except Exception:
+            pass
+        if last_review_sha:
+            print(f"[Argus] Fix-detection base: last review commit {last_review_sha[:7]}")
+
+        # Build set of (file, line) changed since last review for fix-detection
+        changed_lines = _get_changed_files_lines(auth_h, full_name, pr_number,
+                                                  since_sha=last_review_sha)
 
         # Query threads with path, line, body for fix-detection + reply judging
         query = """{
