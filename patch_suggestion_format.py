@@ -569,10 +569,13 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
                         print(f"[Argus] Fix-detected: {thread_path}:{thread_line} → resolved")
                     continue
 
-            # --- Strategy 2: isOutdated fallback (no human replies) ---
-            if not human_authors and t.get("isOutdated", False):
+            # --- Strategy 2: isOutdated ---
+            # Resolve unconditionally: if GitHub marks the code as changed,
+            # the original context is moot (even if a human replied).
+            if t.get("isOutdated", False):
                 if _resolve_thread(auth_h, thread_id):
                     resolved_count += 1
+                    print(f"[Argus] Outdated: {thread_path}:{thread_line} → resolved")
                 continue
 
             # --- Strategy 3: Reply-aware judging (thread has human replies) ---
@@ -948,6 +951,8 @@ def apply_patch():
                           "Accept": "application/vnd.github+json"}
 
                 # REST: count past Argus /review reviews only (exclude /improve, /describe)
+                # Match on "Review Decision" — present in all review footers.
+                # (Cannot use "PR Reviewer Guide" because it's stripped for iteration >= 2.)
                 argus_review_count = 0
                 r = _req.get(f"https://api.github.com/repos/{full_name}/pulls/{pr_number}/reviews",
                              headers=auth_h, timeout=15)
@@ -955,7 +960,7 @@ def apply_patch():
                     argus_review_count = sum(
                         1 for rv in r.json()
                         if rv.get("user", {}).get("login") == BOT_LOGIN
-                        and "PR Reviewer Guide" in (rv.get("body") or ""))
+                        and "Review Decision" in (rv.get("body") or ""))
 
                 # GraphQL: thread resolution (exclude /improve suggestion threads)
                 argus_unresolved = []
@@ -1084,6 +1089,7 @@ def apply_patch():
                                     'body': body,
                                     'path': filepath,
                                     'position': position,
+                                    '_end_line': end_line,
                                 })
                             except Exception as e:
                                 print(f"[Argus] Could not build inline comment: {e}")
@@ -1093,6 +1099,76 @@ def apply_patch():
             # Get thread state + iteration count (after auto-resolve)
             unresolved_threads, past_reviews = _get_thread_state(self.git_provider, pr_number)
             iteration = past_reviews + 1
+
+            # --- Fix B: Incremental diff filter ---
+            # After iteration 1, drop findings on lines NOT changed since last review.
+            if iteration >= 2 and inline_comments and pr_number:
+                try:
+                    import requests as _req_inc
+                    token_inc = _get_github_token(self.git_provider)
+                    if token_inc:
+                        repo_inc = self.git_provider.repo
+                        fn_inc = repo_inc.full_name if hasattr(repo_inc, 'full_name') else str(repo_inc)
+                        auth_inc = {"Authorization": f"Bearer {token_inc}",
+                                    "Accept": "application/vnd.github+json"}
+                        last_sha = None
+                        r_rv = _req_inc.get(
+                            f"https://api.github.com/repos/{fn_inc}/pulls/{pr_number}/reviews",
+                            headers=auth_inc, timeout=15)
+                        if r_rv.status_code == 200:
+                            for rv in reversed(r_rv.json()):
+                                if _is_bot_author(rv.get("user", {}).get("login", ""), BOT_LOGIN):
+                                    last_sha = rv.get("commit_id")
+                                    break
+                        if last_sha:
+                            changed = _get_changed_files_lines(auth_inc, fn_inc,
+                                                                pr_number, since_sha=last_sha)
+                            if changed:
+                                def _line_in_changed(path, end_line, changed_set):
+                                    if (path, None) in changed_set:
+                                        return True
+                                    return any((path, ln) in changed_set
+                                               for ln in range(end_line - 5, end_line + 6))
+
+                                before = len(inline_comments)
+                                inline_comments = [
+                                    c for c in inline_comments
+                                    if _line_in_changed(c['path'], c['_end_line'], changed)
+                                ]
+                                dropped = before - len(inline_comments)
+                                if dropped:
+                                    print(f"[Argus] Incremental filter: dropped {dropped}/{before} findings on unchanged lines")
+                except Exception as e:
+                    print(f"[Argus] Incremental filter failed (non-fatal): {e}")
+
+            # --- Fix C: Deduplicate against existing open threads ---
+            # Skip findings if an open thread already exists on same path within +-5 lines.
+            if inline_comments and unresolved_threads:
+                try:
+                    existing = set()
+                    for t in unresolved_threads:
+                        tp = t.get("path", "")
+                        if not tp:
+                            continue
+                        tl = t.get("line")
+                        if tl:
+                            for off in range(-5, 6):
+                                existing.add((tp, tl + off))
+                        else:
+                            existing.add((tp, None))
+
+                    before = len(inline_comments)
+                    inline_comments = [
+                        c for c in inline_comments
+                        if (c['path'], None) not in existing
+                        and not any((c['path'], c['_end_line'] + off) in existing
+                                    for off in range(-2, 3))
+                    ]
+                    dropped = before - len(inline_comments)
+                    if dropped:
+                        print(f"[Argus] Dedup: dropped {dropped}/{before} findings near existing threads")
+                except Exception as e:
+                    print(f"[Argus] Dedup failed (non-fatal): {e}")
 
             # Decide review event
             event, reason = _decide_review_event(
