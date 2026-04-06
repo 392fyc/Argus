@@ -781,6 +781,10 @@ def apply_patch():
                 self._argus_review_body = body
                 print(f"[Argus] Captured review body ({len(body)} chars), deferring publish")
                 return
+            # Suppress noisy PR-Agent error comments that leak to PR
+            if isinstance(body, str) and "Failed to generate" in body:
+                print(f"[Argus] Suppressed error comment: {body[:80]}")
+                return
             return original_publish_comment(self, body, is_temporary=is_temporary)
 
         gh_mod.GithubProvider.publish_persistent_comment = patched_publish_persistent
