@@ -270,6 +270,11 @@ def _handle_reply_to_argus(body, sender):
             verdict, reason = _judge_reply_with_llm(original_finding, reply_body)
             thread_path = t.get("path", "?")
 
+            # Never post replies for LLM errors — log and return silently
+            if verdict == "ESCALATE" and "LLM error" in reason:
+                print(f"[Argus] Reply judgment LLM failed for {thread_path}: {reason}")
+                return
+
             if verdict == "ACCEPT":
                 _reply_to_thread(auth_h, repo_full, pr_number, first_db_id,
                                  f"✅ Acknowledged — {reason}")
@@ -279,7 +284,7 @@ def _handle_reply_to_argus(body, sender):
                 _reply_to_thread(auth_h, repo_full, pr_number, first_db_id,
                                  f"❓ Follow-up — {reason}")
                 print(f"[Argus] Reply rejected: {thread_path} → follow-up")
-            else:
+            else:  # ESCALATE (genuine, not LLM error)
                 _reply_to_thread(auth_h, repo_full, pr_number, first_db_id,
                                  f"⚠️ Escalated — {reason}\n\n"
                                  f"*This thread requires human reviewer input.*")

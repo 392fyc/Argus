@@ -366,18 +366,18 @@ def _reply_to_thread(auth_h, full_name, pr_number, thread_comment_id, body):
 def _judge_reply_with_llm(original_finding, reply_body):
     """Use LLM to judge whether a reply justifies resolving a thread.
 
-    Uses litellm (PR-Agent's underlying LLM library) directly.
-    Model is read from PR-Agent's config.model setting.
+    Uses PR-Agent's AiHandler which manages model config and API keys.
 
     Returns: ("ACCEPT", reason) | ("REJECT", follow_up) | ("ESCALATE", reason)
     """
     try:
-        import litellm
+        from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
         from pr_agent.config_loader import get_settings
+        import asyncio
 
         model = get_settings().get("config.model", "")
         if not model:
-            return "ESCALATE", "No LLM model configured"
+            return "ESCALATE", "LLM error: No model configured"
 
         system_prompt = (
             "You are a code review arbitrator. A reviewer posted a finding on a pull request, "
@@ -401,21 +401,36 @@ def _judge_reply_with_llm(original_finding, reply_body):
             f"Your judgment:"
         )
 
-        response = litellm.completion(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=150,
-        )
-        text = response.choices[0].message.content.strip()
+        ai_handler = LiteLLMAIHandler()
 
+        # Get or create event loop for async call
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            # Already in async context — create a task
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                text, _ = pool.submit(
+                    asyncio.run,
+                    ai_handler.chat_completion(
+                        model=model, system=system_prompt, user=user_prompt,
+                        max_tokens=150)
+                ).result(timeout=30)
+        else:
+            text, _ = asyncio.run(
+                ai_handler.chat_completion(
+                    model=model, system=system_prompt, user=user_prompt,
+                    max_tokens=150))
+
+        text = text.strip()
         for verdict in ("ACCEPT", "REJECT", "ESCALATE"):
             if text.upper().startswith(verdict):
                 reason = text[len(verdict):].lstrip(":").strip()
                 return verdict, reason
-        return "ESCALATE", f"Unparseable LLM response: {text[:100]}"
+        return "ESCALATE", f"LLM error: Unparseable response: {text[:100]}"
 
     except Exception as e:
         print(f"[Argus] LLM reply judgment failed: {e}")
@@ -577,6 +592,11 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
                 verdict, reason = _judge_reply_with_llm(original_finding, latest_reply)
                 reply_judged += 1
 
+                # Never post replies for LLM errors — log only
+                if verdict == "ESCALATE" and "LLM error" in reason:
+                    print(f"[Argus] Reply judgment LLM failed for {thread_path}: {reason}")
+                    continue
+
                 if verdict == "ACCEPT":
                     _reply_to_thread(auth_h, full_name, pr_number,
                                      first_comment_db_id,
@@ -589,7 +609,7 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
                                      first_comment_db_id,
                                      f"❓ Follow-up — {reason}")
                     print(f"[Argus] Reply rejected: {thread_path} → follow-up posted")
-                else:  # ESCALATE
+                else:  # ESCALATE (genuine, not LLM error)
                     _reply_to_thread(auth_h, full_name, pr_number,
                                      first_comment_db_id,
                                      f"⚠️ Escalated — {reason}\n\n"
