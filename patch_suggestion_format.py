@@ -416,14 +416,12 @@ def _judge_reply_with_llm(original_finding, reply_body):
                 text, _ = pool.submit(
                     asyncio.run,
                     ai_handler.chat_completion(
-                        model=model, system=system_prompt, user=user_prompt,
-                        max_tokens=150)
+                        model=model, system=system_prompt, user=user_prompt)
                 ).result(timeout=30)
         else:
             text, _ = asyncio.run(
                 ai_handler.chat_completion(
-                    model=model, system=system_prompt, user=user_prompt,
-                    max_tokens=150))
+                    model=model, system=system_prompt, user=user_prompt))
 
         text = text.strip()
         for verdict in ("ACCEPT", "REJECT", "ESCALATE"):
