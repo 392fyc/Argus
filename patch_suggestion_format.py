@@ -427,6 +427,16 @@ def _judge_reply_with_llm(original_finding, reply_body):
 MAX_REPLY_ROUNDS = 3
 
 
+def _is_bot_author(login, bot_login):
+    """Check if a login matches the bot, handling GraphQL vs REST naming.
+
+    REST API returns 'argus-review[bot]', GraphQL returns 'argus-review'.
+    """
+    if not login or not bot_login:
+        return False
+    return login == bot_login or login == bot_login.replace("[bot]", "")
+
+
 def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[bot]"):
     """Resolve Argus review threads using fix-detection + reply-aware judging.
 
@@ -505,14 +515,14 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
             authors = [c["author"]["login"] for c in comments["nodes"] if c.get("author")]
 
             # Only touch Argus-authored threads
-            if bot_login not in authors:
+            if not any(_is_bot_author(a, bot_login) for a in authors):
                 continue
 
             # Skip if we couldn't fetch all comments
             if comments.get("totalCount", 0) > len(comments["nodes"]):
                 continue
 
-            human_authors = [a for a in authors if a != bot_login]
+            human_authors = [a for a in authors if not _is_bot_author(a, bot_login)]
             thread_id = t["id"]
             thread_path = t.get("path", "")
             thread_line = t.get("line")
@@ -539,7 +549,7 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
                 # Count how many Argus judgment replies already exist
                 argus_judgment_count = sum(
                     1 for c in comments["nodes"]
-                    if c.get("author", {}).get("login") == bot_login
+                    if _is_bot_author(c.get("author", {}).get("login", ""), bot_login)
                     and any(tag in c.get("body", "") for tag in ("✅ Acknowledged", "❓ Follow-up", "⚠️ Escalated")))
 
                 if argus_judgment_count >= MAX_REPLY_ROUNDS:
@@ -551,7 +561,7 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
                 latest_reply = ""
                 first_comment_db_id = None
                 for c in comments["nodes"]:
-                    if c.get("author", {}).get("login") == bot_login and not original_finding:
+                    if _is_bot_author(c.get("author", {}).get("login", ""), bot_login) and not original_finding:
                         original_finding = c.get("body", "")
                         first_comment_db_id = c.get("databaseId")
                     if c.get("author", {}).get("login") in human_authors:
@@ -852,7 +862,7 @@ def apply_patch():
                     threads = g.json()["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
                     for t in threads:
                         authors = [c["author"]["login"] for c in t["comments"]["nodes"] if c.get("author")]
-                        if BOT_LOGIN not in authors or t["isResolved"]:
+                        if not any(_is_bot_author(a, BOT_LOGIN) for a in authors) or t["isResolved"]:
                             continue
                         # Skip /improve suggestion threads (optional style suggestions)
                         first_body = t["comments"]["nodes"][0].get("body", "") if t["comments"]["nodes"] else ""
