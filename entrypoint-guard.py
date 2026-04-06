@@ -173,8 +173,7 @@ def _handle_reply_to_argus(body, sender):
         if not reply_body:
             return
 
-        # Prevent loops: skip if the reply is itself a judgment tag
-        # (can happen when Argus replies via user token instead of app token)
+        # Defense-in-depth: skip replies that contain judgment tags
         JUDGMENT_TAGS = ("✅ Acknowledged", "❓ Follow-up", "⚠️ Escalated")
         if any(tag in reply_body for tag in JUDGMENT_TAGS):
             return
@@ -188,10 +187,11 @@ def _handle_reply_to_argus(body, sender):
         )
         import requests as _req
 
-        # Get token from settings (no provider object available here)
-        from pr_agent.config_loader import get_settings
-        token = get_settings().get("github.user_token", "")
+        # Get App installation token so replies come from argus-review[bot]
+        from patch_suggestion_format import _get_app_installation_token
+        token = _get_app_installation_token()
         if not token:
+            print("[Argus] No app installation token — cannot reply as bot")
             return
 
         auth_h = {"Authorization": f"Bearer {token}",

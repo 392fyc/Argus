@@ -623,6 +623,66 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
         return 0
 
 
+_app_token_cache = {"token": None, "exp": 0}
+
+
+def _get_app_installation_token():
+    """Generate a GitHub App installation token from app credentials.
+
+    This ensures API calls are made as argus-review[bot] rather than
+    a personal user account.  Tokens are cached for up to 1 hour.
+    """
+    import time
+
+    now = int(time.time())
+    if _app_token_cache["token"] and now < _app_token_cache["exp"] - 60:
+        return _app_token_cache["token"]
+
+    try:
+        import jwt
+        import requests as _req
+        from pr_agent.config_loader import get_settings
+
+        app_id = get_settings().get("github.app_id", "")
+        private_key = get_settings().get("github.private_key", "")
+        if not app_id or not private_key:
+            return None
+
+        # 1. Create JWT
+        payload = {"iat": now - 60, "exp": now + 600, "iss": int(app_id)}
+        encoded = jwt.encode(payload, private_key, algorithm="RS256")
+        if isinstance(encoded, bytes):
+            encoded = encoded.decode("utf-8")
+
+        headers = {"Authorization": f"Bearer {encoded}",
+                   "Accept": "application/vnd.github+json"}
+
+        # 2. Find installation ID
+        r = _req.get("https://api.github.com/app/installations",
+                     headers=headers, timeout=10)
+        data = r.json() if r.status_code == 200 else []
+        if not data:
+            print(f"[Argus] Failed to list installations: {r.status_code}")
+            return None
+        installation_id = data[0]["id"]
+
+        # 3. Create installation access token
+        r = _req.post(
+            f"https://api.github.com/app/installations/{installation_id}/access_tokens",
+            headers=headers, timeout=10)
+        if r.status_code == 201:
+            token = r.json()["token"]
+            _app_token_cache["token"] = token
+            _app_token_cache["exp"] = now + 3600
+            return token
+        print(f"[Argus] Failed to create installation token: {r.status_code}")
+        return None
+
+    except Exception as e:
+        print(f"[Argus] App token generation failed: {e}")
+        return None
+
+
 def _get_github_token(provider):
     """Extract GitHub token from PR-Agent provider."""
     token = None
@@ -637,8 +697,7 @@ def _get_github_token(provider):
             pass
     if not token:
         try:
-            from pr_agent.config_loader import get_settings
-            token = get_settings().get("github.user_token", "")
+            token = _get_app_installation_token()
         except Exception:
             pass
     return token
