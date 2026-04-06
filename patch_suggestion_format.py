@@ -408,7 +408,6 @@ def _judge_reply_with_llm(original_finding, reply_body):
                 {"role": "user", "content": user_prompt},
             ],
             max_tokens=150,
-            temperature=0.1,
         )
         text = response.choices[0].message.content.strip()
 
@@ -568,6 +567,11 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
                         latest_reply = c.get("body", "")
 
                 if not original_finding or not latest_reply or not first_comment_db_id:
+                    continue
+
+                # Skip if latest reply is itself a judgment tag (loop prevention)
+                JUDGMENT_TAGS = ("✅ Acknowledged", "❓ Follow-up", "⚠️ Escalated")
+                if any(tag in latest_reply for tag in JUDGMENT_TAGS):
                     continue
 
                 verdict, reason = _judge_reply_with_llm(original_finding, latest_reply)

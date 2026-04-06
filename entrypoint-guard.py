@@ -173,6 +173,12 @@ def _handle_reply_to_argus(body, sender):
         if not reply_body:
             return
 
+        # Prevent loops: skip if the reply is itself a judgment tag
+        # (can happen when Argus replies via user token instead of app token)
+        JUDGMENT_TAGS = ("✅ Acknowledged", "❓ Follow-up", "⚠️ Escalated")
+        if any(tag in reply_body for tag in JUDGMENT_TAGS):
+            return
+
         owner, name = repo_full.split("/", 1)
 
         from patch_suggestion_format import (
