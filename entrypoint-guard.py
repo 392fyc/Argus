@@ -146,12 +146,150 @@ def _rewrite_mention(body: str) -> str:
     return f"/ask {cleaned}"
 
 
-def _patch_mention_handler():
-    """Patch PR-Agent's comment handler to support @mentions.
+def _handle_reply_to_argus(body, sender):
+    """Handle replies to Argus review threads — trigger LLM judgment.
 
-    Intercepts handle_comments_on_pr to rewrite @mentions before
-    the slash-command filter drops them. This runs AFTER get_body()
-    has already verified the HMAC signature.
+    When a non-bot user replies to an Argus review comment, run the
+    reply-aware judging logic (ACCEPT/REJECT/ESCALATE) immediately
+    instead of waiting for the next push-triggered review.
+    """
+    try:
+        comment = body.get("comment", {})
+        # Only process replies (in_reply_to_id is set)
+        in_reply_to = comment.get("in_reply_to_id")
+        if not in_reply_to:
+            return
+
+        # Skip bot's own replies
+        if sender and "argus-review" in sender.lower():
+            return
+
+        pr_number = body.get("pull_request", {}).get("number")
+        repo_full = body.get("repository", {}).get("full_name", "")
+        if not pr_number or not repo_full:
+            return
+
+        reply_body = comment.get("body", "")
+        if not reply_body:
+            return
+
+        owner, name = repo_full.split("/", 1)
+
+        from patch_suggestion_format import (
+            _get_github_token, _judge_reply_with_llm,
+            _reply_to_thread, _resolve_thread, _is_bot_author,
+            MAX_REPLY_ROUNDS,
+        )
+        import requests as _req
+
+        # Get token from settings (no provider object available here)
+        from pr_agent.config_loader import get_settings
+        token = get_settings().get("github.user_token", "")
+        if not token:
+            return
+
+        auth_h = {"Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json"}
+        bot_login = "argus-review[bot]"
+
+        # Find the thread containing this reply via GraphQL
+        query = """{
+          repository(owner: "%s", name: "%s") {
+            pullRequest(number: %d) {
+              reviewThreads(first: 100) {
+                nodes {
+                  id
+                  isResolved
+                  path
+                  comments(first: 20) {
+                    totalCount
+                    nodes {
+                      databaseId
+                      author { login }
+                      body
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }""" % (owner, name, pr_number)
+
+        g = _req.post("https://api.github.com/graphql",
+                      json={"query": query}, headers=auth_h, timeout=15)
+        if g.status_code != 200 or "data" not in g.json():
+            return
+
+        threads = g.json()["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+
+        # Find thread where in_reply_to_id matches an Argus comment
+        for t in threads:
+            if t["isResolved"]:
+                continue
+            comments_data = t["comments"]
+            if comments_data.get("totalCount", 0) > len(comments_data["nodes"]):
+                continue
+
+            # Check if any Argus comment in this thread has the replied-to databaseId
+            argus_comment_ids = [
+                c["databaseId"] for c in comments_data["nodes"]
+                if c.get("author") and _is_bot_author(c["author"]["login"], bot_login)
+            ]
+            if in_reply_to not in argus_comment_ids:
+                continue
+
+            # Found the thread — check judgment round limit
+            argus_judgment_count = sum(
+                1 for c in comments_data["nodes"]
+                if c.get("author") and _is_bot_author(c["author"]["login"], bot_login)
+                and any(tag in c.get("body", "")
+                        for tag in ("✅ Acknowledged", "❓ Follow-up", "⚠️ Escalated")))
+
+            if argus_judgment_count >= MAX_REPLY_ROUNDS:
+                print(f"[Argus] Reply judgment: max rounds reached for {t.get('path')}")
+                return
+
+            # Get original finding (first Argus comment)
+            original_finding = ""
+            first_db_id = None
+            for c in comments_data["nodes"]:
+                if c.get("author") and _is_bot_author(c["author"]["login"], bot_login):
+                    original_finding = c.get("body", "")
+                    first_db_id = c.get("databaseId")
+                    break
+
+            if not original_finding or not first_db_id:
+                return
+
+            verdict, reason = _judge_reply_with_llm(original_finding, reply_body)
+            thread_path = t.get("path", "?")
+
+            if verdict == "ACCEPT":
+                _reply_to_thread(auth_h, repo_full, pr_number, first_db_id,
+                                 f"✅ Acknowledged — {reason}")
+                _resolve_thread(auth_h, t["id"])
+                print(f"[Argus] Reply accepted: {thread_path} → resolved")
+            elif verdict == "REJECT":
+                _reply_to_thread(auth_h, repo_full, pr_number, first_db_id,
+                                 f"❓ Follow-up — {reason}")
+                print(f"[Argus] Reply rejected: {thread_path} → follow-up")
+            else:
+                _reply_to_thread(auth_h, repo_full, pr_number, first_db_id,
+                                 f"⚠️ Escalated — {reason}\n\n"
+                                 f"*This thread requires human reviewer input.*")
+                print(f"[Argus] Reply escalated: {thread_path}")
+            return  # Only handle one thread per comment
+
+    except Exception as e:
+        print(f"[Argus] Reply handler error: {e}")
+
+
+def _patch_mention_handler():
+    """Patch PR-Agent's comment handler to support @mentions + reply judging.
+
+    Intercepts handle_comments_on_pr to:
+    1. Judge replies to Argus review threads via LLM
+    2. Rewrite @mentions before the slash-command filter drops them
 
     handle_comments_on_pr signature (PR-Agent 0.34):
       async def handle_comments_on_pr(body, event, sender, sender_id,
@@ -164,13 +302,15 @@ def _patch_mention_handler():
 
         async def patched_handle(body, event, sender, sender_id,
                                  action, log_context, agent):
-            # Rewrite @mentions to PR-Agent slash commands
-            if (action == "created" and "comment" in body
-                    and isinstance(body["comment"], dict)):
+            if action == "created" and "comment" in body and isinstance(body["comment"], dict):
                 comment_body = body["comment"].get("body", "")
-                # Skip self-mentions (prevent loops)
+                # Skip self-comments (prevent loops)
                 if sender and "argus-review" in sender.lower():
                     return {}
+
+                # Handle replies to Argus threads (LLM judgment)
+                if body["comment"].get("in_reply_to_id"):
+                    _handle_reply_to_argus(body, sender)
 
                 # Rewrite @mentions to PR-Agent commands
                 if _should_rewrite_mention(comment_body):
