@@ -866,12 +866,17 @@ def apply_patch():
                 print(f"[Argus] Thread check failed: {e}")
                 return [], 0
 
-        def _decide_review_event(findings, unresolved_threads, iteration):
+        def _decide_review_event(findings, unresolved_threads, iteration,
+                                 has_inline_comments=False):
             """
             Returns (event, reason):
               "REQUEST_CHANGES" — blocking issues found
               "APPROVE"         — all clear after at least 2 iterations
               "COMMENT"         — non-blocking / first review / escalation
+
+            has_inline_comments: True if this review will post new inline
+            comments. Approval is deferred when new comments are posted,
+            regardless of severity, because the author hasn't seen them yet.
             """
             critical_major = [f for f in findings
                               if _classify_finding_severity(f.get("issue_header", "")) in BLOCKING_SEVERITIES]
@@ -898,24 +903,19 @@ def apply_patch():
                         "Initial review — no blocking issues. "
                         "Minor findings posted as inline threads.")
 
-            # Rule 5: Medium+ new findings → COMMENT (defer approval)
-            # Minor-only findings are noted but don't block approval.
-            DEFERRING_SEVERITIES = {"Critical", "Major", "Medium"}
-            medium_plus = [f for f in findings
-                           if _classify_finding_severity(f.get("issue_header", "")) in DEFERRING_SEVERITIES]
-            minor_count = len(findings) - len(medium_plus)
-
-            if medium_plus:
+            # Rule 5: New inline comments being posted → COMMENT (defer approval)
+            # Cannot APPROVE in the same API call that posts new comments,
+            # because the author hasn't had a chance to see/address them.
+            if has_inline_comments:
+                minor_count = len(findings) - len(critical_major)
                 return ("COMMENT",
-                        f"💬 {len(medium_plus)} medium+ finding(s) posted. "
-                        f"Address or discuss before approval. "
+                        f"💬 {minor_count} new finding(s) posted. "
+                        f"Approval deferred until next review. "
                         f"Iteration {iteration}/{MAX_ITERATIONS}.")
 
-            # Rule 6: No blocking findings, all threads resolved → APPROVE
-            # Minor-only findings are noted but don't block.
-            suffix = f" ({minor_count} minor finding(s) noted.)" if minor_count else ""
+            # Rule 6: No new comments, no blocking issues, all threads resolved → APPROVE
             return ("APPROVE",
-                    f"✅ No blocking issues, all threads resolved.{suffix} "
+                    f"✅ No issues found, all threads resolved. "
                     f"Iteration {iteration}/{MAX_ITERATIONS}.")
 
         async def patched_run(self):
@@ -981,7 +981,9 @@ def apply_patch():
             iteration = past_reviews + 1
 
             # Decide review event
-            event, reason = _decide_review_event(findings, unresolved_threads, iteration)
+            event, reason = _decide_review_event(
+                findings, unresolved_threads, iteration,
+                has_inline_comments=bool(inline_comments))
 
             # Build enhanced review body (CodeRabbit-style)
             body_additions = build_review_body_additions(
