@@ -617,6 +617,13 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
 
             # --- Strategy 3: Reply-aware judging (thread has human replies) ---
             if human_authors:
+                # Extract first bot comment DB ID early (needed for escalation post)
+                first_comment_db_id = None
+                for c in comments["nodes"]:
+                    if _is_bot_author(c.get("author", {}).get("login", ""), bot_login):
+                        first_comment_db_id = c.get("databaseId")
+                        break
+
                 # Count how many Argus judgment replies already exist
                 argus_judgment_count = sum(
                     1 for c in comments["nodes"]
@@ -624,7 +631,16 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
                     and any(tag in c.get("body", "") for tag in ("✅ Acknowledged", "❓ Follow-up", "⚠️ Escalated")))
 
                 if argus_judgment_count >= MAX_REPLY_ROUNDS:
-                    # Too many rounds — escalate silently (don't spam)
+                    # Post final ⚠️ Escalated if not already done, then stop judging
+                    already_escalated = any(
+                        "⚠️ Escalated" in c.get("body", "")
+                        for c in comments["nodes"]
+                        if _is_bot_author(c.get("author", {}).get("login", ""), bot_login))
+                    if not already_escalated and first_comment_db_id:
+                        _reply_to_thread(auth_h, full_name, pr_number, first_comment_db_id,
+                                         "⚠️ Escalated — Maximum reply rounds reached. "
+                                         "Human reviewer decision required.")
+                        print(f"[Argus] Max reply rounds: escalation posted for {thread_path}")
                     continue
 
                 # Skip if the last comment is already a bot judgment — no new
@@ -639,16 +655,14 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
                 # Get original finding (first Argus comment) and latest human reply
                 original_finding = ""
                 latest_reply = ""
-                first_comment_db_id = None
                 for c in comments["nodes"]:
                     if _is_bot_author(c.get("author", {}).get("login", ""), bot_login) and not original_finding:
                         original_finding = c.get("body", "")
-                        first_comment_db_id = c.get("databaseId")
                     if c.get("author", {}).get("login") in human_authors:
                         latest_reply = c.get("body", "")
 
                 if not original_finding or not latest_reply or not first_comment_db_id:
-                    continue
+                    continue  # first_comment_db_id set at top of human_authors block
 
                 verdict, reason = _judge_reply_with_llm(original_finding, latest_reply)
                 reply_judged += 1
@@ -957,6 +971,23 @@ def apply_patch():
         MAX_ITERATIONS = 10
         BOT_LOGIN = "argus-review[bot]"
 
+        # Doc PR config: suppress Minor findings after this many iterations
+        _DOC_EXTS = frozenset({'md', 'mdx', 'rst', 'txt', 'adoc'})
+        _DOC_NITS_SUPPRESS_AFTER = 3
+
+        def _is_doc_pr(df):
+            """True if ≥70% of changed files are documentation files."""
+            if not df:
+                return False
+            total = len(df)
+            if not total:
+                return False
+            doc_count = sum(
+                1 for f in df
+                if (getattr(f, 'filename', None) or '').rsplit('.', 1)[-1].lower() in _DOC_EXTS
+            )
+            return doc_count / total >= 0.7
+
         def _classify_finding_severity(issue_header: str) -> str:
             h = issue_header.lower()
             if any(k in h for k in ("critical", "bug", "security")):
@@ -979,14 +1010,14 @@ def apply_patch():
             try:
                 repo = provider.repo
                 if not repo:
-                    return [], 0
+                    return [], 0, []
                 full_name = repo.full_name if hasattr(repo, 'full_name') else str(repo)
                 owner, name = full_name.split("/", 1)
 
                 token = _get_github_token(provider)
                 if not token:
                     print("[Argus] No token — skipping thread check")
-                    return [], 0
+                    return [], 0, []
 
                 auth_h = {"Authorization": f"Bearer {token}",
                           "Accept": "application/vnd.github+json"}
@@ -1013,8 +1044,10 @@ def apply_patch():
                         and "Review Decision" in (c.get("body") or ""))
 
                 # GraphQL: thread resolution (exclude /improve suggestion threads)
+                # Fetch up to 10 comments to reliably detect judgment round count.
                 argus_unresolved = []
-                query = '{repository(owner:"%s",name:"%s"){pullRequest(number:%d){reviewThreads(first:100){nodes{isResolved isOutdated comments(first:3){nodes{author{login} body}}}}}}}' % (owner, name, pr_number)
+                argus_escalated = []
+                query = '{repository(owner:"%s",name:"%s"){pullRequest(number:%d){reviewThreads(first:100){nodes{isResolved isOutdated comments(first:10){nodes{author{login} body}}}}}}}' % (owner, name, pr_number)
                 g = _req.post("https://api.github.com/graphql",
                               json={"query": query}, headers=auth_h, timeout=15)
                 if g.status_code == 200 and "data" in g.json():
@@ -1027,17 +1060,27 @@ def apply_patch():
                         first_body = t["comments"]["nodes"][0].get("body", "") if t["comments"]["nodes"] else ""
                         if "Committable suggestion" in first_body or "📝 Suggestion" in first_body:
                             continue
-                        argus_unresolved.append(t)
+                        # Separate escalated threads (⚠️ Escalated posted) from actively blocking ones
+                        is_escalated = any(
+                            "⚠️ Escalated" in c.get("body", "")
+                            for c in t["comments"]["nodes"]
+                            if _is_bot_author(c.get("author", {}).get("login", ""), BOT_LOGIN))
+                        if is_escalated:
+                            argus_escalated.append(t)
+                        else:
+                            argus_unresolved.append(t)
 
-                print(f"[Argus] Thread state: {len(argus_unresolved)} unresolved, {argus_review_count} past reviews")
-                return argus_unresolved, argus_review_count
+                print(f"[Argus] Thread state: {len(argus_unresolved)} unresolved, "
+                      f"{len(argus_escalated)} escalated, {argus_review_count} past reviews")
+                return argus_unresolved, argus_review_count, argus_escalated
             except Exception as e:
                 print(f"[Argus] Thread check failed: {e}")
-                return [], 0
+                return [], 0, []
 
         def _decide_review_event(findings, unresolved_threads, iteration,
                                  has_inline_comments=False,
-                                 no_new_code=False):
+                                 no_new_code=False,
+                                 escalated_threads=None):
             """
             Returns (event, reason):
               "REQUEST_CHANGES" — blocking issues found
@@ -1049,7 +1092,10 @@ def apply_patch():
             regardless of severity, because the author hasn't seen them yet.
             no_new_code: True if HEAD == last review commit (no new push).
             When set, new findings are noise and should not block approval.
+            escalated_threads: threads that hit MAX_REPLY_ROUNDS; not counted
+            as blocking (they are already flagged for human review).
             """
+            escalated_threads = escalated_threads or []
             critical_major = [f for f in findings
                               if _classify_finding_severity(f.get("issue_header", "")) in BLOCKING_SEVERITIES]
 
@@ -1059,16 +1105,24 @@ def apply_patch():
                 return ("REQUEST_CHANGES",
                         f"🔴 {len(critical_major)} critical/major issue(s) — changes requested.")
 
-            # Rule 2: Unresolved threads from previous reviews
+            # Rule 2: Max iterations → COMMENT (escalate to human; do NOT REQUEST_CHANGES).
+            # This must fire before the unresolved-thread check so that a bot stuck in a
+            # disagree loop doesn't keep emitting REQUEST_CHANGES past the iteration cap.
+            if iteration >= MAX_ITERATIONS:
+                parts = []
+                if unresolved_threads:
+                    parts.append(f"{len(unresolved_threads)} thread(s) unresolved")
+                if escalated_threads:
+                    parts.append(f"{len(escalated_threads)} escalated to human")
+                detail = " (" + ", ".join(parts) + ")" if parts else ""
+                return ("COMMENT",
+                        f"⚠️ Review iteration {iteration}/{MAX_ITERATIONS} reached{detail}. "
+                        f"Escalating to human reviewer — no further bot blocking.")
+
+            # Rule 3: Unresolved threads from previous reviews (only before max iterations)
             if unresolved_threads:
                 return ("REQUEST_CHANGES",
                         f"🔴 {len(unresolved_threads)} unresolved thread(s) from previous review.")
-
-            # Rule 3: Max iterations → escalate to human
-            if iteration >= MAX_ITERATIONS:
-                return ("COMMENT",
-                        f"⚠️ Review iteration {iteration}/{MAX_ITERATIONS} reached. "
-                        f"Escalating to human reviewer.")
 
             # Rule 4: First review → COMMENT (never approve on first pass)
             if iteration <= 1:
@@ -1093,7 +1147,7 @@ def apply_patch():
                         f"Approval deferred until next review. "
                         f"Iteration {iteration}/{MAX_ITERATIONS}.")
 
-            # Rule 6: No new comments, no blocking issues, all threads resolved → APPROVE
+            # Rule 7: No new comments, no blocking issues, all threads resolved → APPROVE
             return ("APPROVE",
                     f"✅ No issues found, all threads resolved. "
                     f"Iteration {iteration}/{MAX_ITERATIONS}.")
@@ -1158,7 +1212,8 @@ def apply_patch():
                 print(f"[Argus] Failed to parse key_issues: {e}")
 
             # Get thread state + iteration count (after auto-resolve)
-            unresolved_threads, past_reviews = _get_thread_state(self.git_provider, pr_number)
+            unresolved_threads, past_reviews, escalated_threads = _get_thread_state(
+                self.git_provider, pr_number)
             iteration = past_reviews + 1
 
             # Detect if there's new code since the last review
@@ -1247,11 +1302,35 @@ def apply_patch():
                 except Exception as e:
                     print(f"[Argus] Dedup failed (non-fatal): {e}")
 
+            # --- Fix D: Doc PR Minor suppression ---
+            # For documentation-only PRs, suppress Minor findings after
+            # _DOC_NITS_SUPPRESS_AFTER iterations to break the nit-loop cycle.
+            is_doc = _is_doc_pr(diff_files)
+            if is_doc and iteration > _DOC_NITS_SUPPRESS_AFTER and inline_comments:
+                sev_map = {}
+                for _f in findings:
+                    try:
+                        _k = (_f.get('relevant_file', '').strip().strip('`'),
+                              int(_f.get('end_line') or 0))
+                        sev_map[_k] = _classify_finding_severity(_f.get('issue_header', ''))
+                    except (ValueError, TypeError):
+                        pass  # malformed end_line — skip; inline_comments entry will default to Minor
+                before = len(inline_comments)
+                inline_comments = [
+                    c for c in inline_comments
+                    if sev_map.get((c['path'], c['_end_line']), 'Minor') in BLOCKING_SEVERITIES
+                ]
+                dropped = before - len(inline_comments)
+                if dropped:
+                    print(f"[Argus] Doc PR: suppressed {dropped} minor finding(s) "
+                          f"(iteration {iteration} > {_DOC_NITS_SUPPRESS_AFTER})")
+
             # Decide review event
             event, reason = _decide_review_event(
                 findings, unresolved_threads, iteration,
                 has_inline_comments=bool(inline_comments),
-                no_new_code=no_new_code)
+                no_new_code=no_new_code,
+                escalated_threads=escalated_threads)
 
             # Build enhanced review body (CodeRabbit-style)
             body_additions = build_review_body_additions(
@@ -1273,7 +1352,12 @@ def apply_patch():
             review_body += f"\n\n---\n**Review Decision**: {reason}\n"
             review_body += f"*Iteration {iteration}/{MAX_ITERATIONS} | "
             review_body += f"{len(findings)} findings | "
-            review_body += f"{len(unresolved_threads)} unresolved threads*"
+            review_body += f"{len(unresolved_threads)} unresolved"
+            if escalated_threads:
+                review_body += f" | {len(escalated_threads)} escalated"
+            if is_doc:
+                review_body += " | doc PR"
+            review_body += "*"
 
             # Post unified review
             # Strip internal keys before passing to PyGithub (GitHub API rejects unknown fields)
