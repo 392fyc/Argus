@@ -5,3 +5,6 @@
 
 # Docker
 docker-compose.override.yml
+
+# Local state — Claude Code skill working files
+.claude/state/
