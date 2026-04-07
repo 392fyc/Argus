@@ -187,6 +187,14 @@ REPLY_EXPLICIT_HUMAN = (
     "maintainer review, please have the team lead decide."
 )
 
+# Vague "we already mitigate this" reply with NO specific reference.
+# The classifier must NOT ACCEPT this — otherwise authors can trojan-horse
+# generic "already handled" phrasing past the reply classifier. See Argus
+# PR #7 iteration 2 thread on patch_suggestion_format.py:417 (误判风险).
+REPLY_VAGUE_MITIGATION = (
+    "We already have guards for this case, so it's already mitigated."
+)
+
 
 # -------- Tests ---------------------------------------------------------
 
@@ -274,6 +282,35 @@ def test_mercury_pr186_bootstrap_reply_is_accepted(judge):
     # Extra guard: make sure the actual reply text reached the LLM.
     assert "BOOTSTRAP-ONLY" in (_FakeAIHandler.last_user or "")
     assert "<100" in (_FakeAIHandler.last_user or "")
+
+
+def test_vague_mitigation_claim_is_rejected(judge):
+    """Regression guard for PR #7 iteration 2 finding (误判风险).
+
+    The prompt explicitly requires that claims of 'existing mitigation' must
+    be SPECIFIC (named function / class / guard / commit / file / prior PR)
+    to count. A bare 'we already mitigate this' with no reference must be
+    classified as non-responsive and REJECTed, not ACCEPTed.
+
+    Without this guard, an author could trojan-horse generic 'already
+    handled' phrasing to bypass the classifier.
+    """
+    _FakeAIHandler.verdict_text = (
+        "REJECT: reply claims existing mitigation but names no specific "
+        "guard, function, or file — please point to the specific "
+        "mitigation location"
+    )
+    verdict, _ = judge(
+        original_finding="The retry loop can overflow if upstream is down "
+                         "for an extended window — consider a dead-letter "
+                         "queue or circuit breaker here.",
+        reply_body=REPLY_VAGUE_MITIGATION,
+    )
+    assert verdict == "REJECT", (
+        f"vague 'we already mitigate' reply must REJECT (not ACCEPT), "
+        f"got {verdict}. Regression toward trojan-horse ACCEPT path."
+    )
+    _assert_prompt_is_narrowed(_FakeAIHandler.last_system)
 
 
 def test_parser_strips_verdict_prefix_and_colon(judge):
