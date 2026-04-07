@@ -195,6 +195,28 @@ REPLY_VAGUE_MITIGATION = (
     "We already have guards for this case, so it's already mitigated."
 )
 
+# "Sounds specific but contains no concrete identifier" reply. Prose-y
+# specificity without any code reference (no backticks, no file:line, no
+# commit, no function name). Must still REJECT under the shape-based rule
+# introduced in PR #7 iteration 3. See thread on
+# patch_suggestion_format.py:418 (误接受风险).
+REPLY_PROSEY_SPECIFIC = (
+    "The retry subsystem has an exponential backoff layer that handles this "
+    "exact failure mode in production, so the concern is already covered by "
+    "our existing resilience layer."
+)
+
+# Reply with a real code-identifier-shape mitigation reference. Must ACCEPT
+# under the shape-based rule (the classifier trusts identifiers without
+# verifying them — fabrication is out of scope for the classifier).
+REPLY_CONCRETE_MITIGATION = (
+    "The finding is already handled by `utils/retry_guard.py:45`'s "
+    "`RetryWithBackoff` class; we enforce the circuit-breaker path in "
+    "`_dispatch()` and there's a test at "
+    "`tests/test_retry_guard.py::test_circuit_breaker_opens`. "
+    "Also see commit `abc1234`."
+)
+
 
 # -------- Tests ---------------------------------------------------------
 
@@ -309,6 +331,54 @@ def test_vague_mitigation_claim_is_rejected(judge):
     assert verdict == "REJECT", (
         f"vague 'we already mitigate' reply must REJECT (not ACCEPT), "
         f"got {verdict}. Regression toward trojan-horse ACCEPT path."
+    )
+    _assert_prompt_is_narrowed(_FakeAIHandler.last_system)
+
+
+def test_prosey_specific_mitigation_without_identifier_is_rejected(judge):
+    """Regression guard for PR #7 iteration 3 finding (误接受风险).
+
+    The shape-based rule requires the mitigation reference to contain at
+    least one concrete identifier (backtick-wrapped name, file:line,
+    commit hash, PR number, fully-qualified function/class). Prose-y
+    claims like 'our resilience layer handles this' with zero concrete
+    identifiers must REJECT — otherwise authors can sound specific
+    without actually referencing any real code.
+    """
+    _FakeAIHandler.verdict_text = (
+        "REJECT: reply describes a mitigation in prose but names no "
+        "concrete identifier (no backticks, no file:line, no commit, "
+        "no function name) — please name the specific mitigation "
+        "location"
+    )
+    verdict, _ = judge(
+        original_finding="No backoff on the upstream fetch — a flaky "
+                         "upstream will thrash.",
+        reply_body=REPLY_PROSEY_SPECIFIC,
+    )
+    assert verdict == "REJECT", (
+        f"prose-y mitigation with no concrete identifier must REJECT, "
+        f"got {verdict}. Regression toward seemingly-specific ACCEPT path."
+    )
+    _assert_prompt_is_narrowed(_FakeAIHandler.last_system)
+
+
+def test_concrete_mitigation_reference_is_accepted(judge):
+    """Counterpart to the prose-y test: a reply that DOES include concrete
+    code identifiers (backtick names, file:line, commit hash) must be
+    ACCEPTed under the shape-based rule."""
+    _FakeAIHandler.verdict_text = (
+        "ACCEPT: reply names specific mitigation with concrete identifiers "
+        "(utils/retry_guard.py:45, RetryWithBackoff class, test reference, "
+        "and commit hash)"
+    )
+    verdict, _ = judge(
+        original_finding="No backoff on the upstream fetch — a flaky "
+                         "upstream will thrash.",
+        reply_body=REPLY_CONCRETE_MITIGATION,
+    )
+    assert verdict == "ACCEPT", (
+        f"concrete identifier-shaped mitigation must ACCEPT, got {verdict}"
     )
     _assert_prompt_is_narrowed(_FakeAIHandler.last_system)
 
