@@ -132,8 +132,14 @@ def _assert_prompt_is_narrowed(system_prompt):
             f"System prompt is missing required anchor phrase {anchor!r}. "
             f"Did the ESCALATE-narrowing fix regress?"
         )
+    # Normalize before the forbidden-substring check: collapse all whitespace
+    # runs to a single space and lowercase. Without normalization, the old
+    # broad ESCALATE rule could sneak back in via a case change or a newline
+    # re-wrap and still pass this guard.
+    normalized_prompt = " ".join(system_prompt.lower().split())
     for forbidden in FORBIDDEN_PROMPT_SUBSTRINGS:
-        assert forbidden not in system_prompt, (
+        normalized_forbidden = " ".join(forbidden.lower().split())
+        assert normalized_forbidden not in normalized_prompt, (
             f"System prompt still contains forbidden pre-fix phrasing: "
             f"{forbidden!r}"
         )
@@ -196,12 +202,21 @@ def test_cost_benefit_reply_with_mitigation_is_accepted(judge):
     assert verdict == "ACCEPT", (
         f"cost-benefit reply with mitigation should ACCEPT, got {verdict}")
     assert reason  # non-empty
+    # Assert the classifier actually honored config.model rather than silently
+    # defaulting. If _judge_reply_with_llm ever stops forwarding model=, this
+    # fires immediately.
+    assert _FakeAIHandler.last_model == "fake-model", (
+        f"classifier did not forward configured model, got "
+        f"{_FakeAIHandler.last_model!r}")
     _assert_prompt_is_narrowed(_FakeAIHandler.last_system)
 
 
-def test_vague_preference_reply_is_not_accepted(judge):
-    # A correctly-prompted LLM should REJECT (ask for reasoning) on a bare
-    # preference. We model that here. The contract is: NOT ACCEPT.
+def test_vague_preference_reply_is_rejected(judge):
+    # A correctly-prompted LLM must REJECT (ask for reasoning) on a bare
+    # preference. It MUST NOT ESCALATE — that would re-open the exact failure
+    # mode this PR is fixing: "bare preference" does not meet either narrow
+    # ESCALATE criterion, and escalating is the pre-fix behavior we explicitly
+    # ruled out. The assertion is strict equality to catch regressions.
     _FakeAIHandler.verdict_text = (
         "REJECT: reply states a bare preference with no technical reasoning, "
         "please explain why"
@@ -211,9 +226,10 @@ def test_vague_preference_reply_is_not_accepted(judge):
                          "clarity.",
         reply_body=REPLY_VAGUE_PREFERENCE,
     )
-    assert verdict != "ACCEPT", (
-        f"vague 'I prefer X' should not ACCEPT, got {verdict}")
-    assert verdict in ("REJECT", "ESCALATE")
+    assert verdict == "REJECT", (
+        f"vague 'I prefer X' must REJECT (not ESCALATE), got {verdict}. "
+        f"If this fails, the classifier regressed toward the pre-fix behavior."
+    )
     _assert_prompt_is_narrowed(_FakeAIHandler.last_system)
 
 
