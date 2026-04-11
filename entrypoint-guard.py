@@ -14,6 +14,8 @@ import json
 import os
 import re
 
+from argus_events import emitter, EventType
+
 _raw = os.environ.get("ARGUS_ALLOWED_USERS", "").strip()
 ALLOWED_USERS: set = set()
 if _raw:
@@ -68,6 +70,7 @@ class ArgusGuardMiddleware:
         is_self_bot = actor and actor.lower() == "argus-review[bot]"
         if not is_self_bot and actor and actor.lower() not in ALLOWED_USERS:
             print(f"[Argus Guard] BLOCKED: '{actor}' not in whitelist")
+            emitter.emit(EventType.REQUEST_BLOCKED, actor=actor)
             resp = json.dumps({"status": "skipped", "reason": f"user '{actor}' not in whitelist"}).encode()
             await send({"type": "http.response.start", "status": 200,
                         "headers": [[b"content-type", b"application/json"],
@@ -192,6 +195,8 @@ def _handle_reply_to_argus(body, sender):
         token = _get_app_installation_token()
         if not token:
             print("[Argus] No app installation token — cannot reply as bot")
+            emitter.emit(EventType.ERROR, pr_number=pr_number, repo=repo_full,
+                         message="no app installation token")
             return
 
         auth_h = {"Authorization": f"Bearer {token}",
@@ -253,6 +258,8 @@ def _handle_reply_to_argus(body, sender):
 
             if argus_judgment_count >= MAX_REPLY_ROUNDS:
                 print(f"[Argus] Reply judgment: max rounds reached for {t.get('path')}")
+                emitter.emit(EventType.REPLY_CLASSIFIED, pr_number=pr_number, repo=repo_full,
+                             verdict="max_rounds_reached", thread_path=t.get("path"))
                 return
 
             # Get original finding (first Argus comment)
@@ -273,6 +280,8 @@ def _handle_reply_to_argus(body, sender):
             # Never post replies for LLM errors — log and return silently
             if verdict == "ESCALATE" and "LLM error" in reason:
                 print(f"[Argus] Reply judgment LLM failed for {thread_path}: {reason}")
+                emitter.emit(EventType.ERROR, pr_number=pr_number, repo=repo_full,
+                             message=f"LLM failed: {reason}", thread_path=thread_path)
                 return
 
             if verdict == "ACCEPT":
@@ -280,19 +289,28 @@ def _handle_reply_to_argus(body, sender):
                                  f"✅ Acknowledged — {reason}")
                 _resolve_thread(auth_h, t["id"])
                 print(f"[Argus] Reply accepted: {thread_path} → resolved")
+                emitter.emit(EventType.REPLY_CLASSIFIED, pr_number=pr_number, repo=repo_full,
+                             verdict="ACCEPT", thread_path=thread_path, reason=reason)
+                emitter.emit(EventType.THREAD_RESOLVED, pr_number=pr_number, repo=repo_full,
+                             thread_path=thread_path)
             elif verdict == "REJECT":
                 _reply_to_thread(auth_h, repo_full, pr_number, first_db_id,
                                  f"❓ Follow-up — {reason}")
                 print(f"[Argus] Reply rejected: {thread_path} → follow-up")
+                emitter.emit(EventType.REPLY_CLASSIFIED, pr_number=pr_number, repo=repo_full,
+                             verdict="REJECT", thread_path=thread_path, reason=reason)
             else:  # ESCALATE (genuine, not LLM error)
                 _reply_to_thread(auth_h, repo_full, pr_number, first_db_id,
                                  f"⚠️ Escalated — {reason}\n\n"
                                  f"*This thread requires human reviewer input.*")
                 print(f"[Argus] Reply escalated: {thread_path}")
+                emitter.emit(EventType.REPLY_CLASSIFIED, pr_number=pr_number, repo=repo_full,
+                             verdict="ESCALATE", thread_path=thread_path, reason=reason)
             return  # Only handle one thread per comment
 
     except Exception as e:
         print(f"[Argus] Reply handler error: {e}")
+        emitter.emit(EventType.ERROR, message=f"reply handler: {e}")
 
 
 def _patch_mention_handler():
@@ -330,6 +348,11 @@ def _patch_mention_handler():
                         print(f"[Argus] @mention rewritten: "
                               f"'{comment_body[:60]}' → '{rewritten[:60]}'")
                         body["comment"]["body"] = rewritten
+                        _pr_num = body.get("pull_request", {}).get("number")
+                        _repo = body.get("repository", {}).get("full_name")
+                        emitter.emit(EventType.MENTION_REWRITTEN, pr_number=_pr_num,
+                                     repo=_repo, original=comment_body[:60],
+                                     rewritten=rewritten[:60])
 
             return await original_handle(body, event, sender, sender_id,
                                          action, log_context, agent)

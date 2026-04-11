@@ -9,6 +9,8 @@ Thread auto-resolve: resolve outdated threads after push
 Reference: CodeRabbit PR review format (2026)
 """
 
+from argus_events import emitter, EventType
+
 # ── Severity mapping ──────────────────────────────────────────────
 
 SEVERITY_MAP = {
@@ -1171,6 +1173,9 @@ def apply_patch():
             if not review_body:
                 return result
 
+            _repo = getattr(getattr(self.git_provider, 'repo', None), 'full_name', None)
+            emitter.emit(EventType.REVIEW_STARTED, pr_number=pr_number, repo=_repo)
+
             # Parse findings from prediction
             findings = []
             inline_comments = []
@@ -1372,6 +1377,8 @@ def apply_patch():
                 )
                 n = len(inline_comments)
                 print(f"[Argus] Posted {event} review ({n} inline, iteration {iteration})")
+                emitter.emit(EventType.FINDING_POSTED, pr_number=pr_number, repo=_repo,
+                             finding_count=n, review_event=event, iteration=iteration)
             except Exception as e:
                 print(f"[Argus] Unified review failed ({e}), fallback to COMMENT")
                 try:
