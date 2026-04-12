@@ -40,7 +40,12 @@ def read_events(
         return []
 
     events: List[ArgusEvent] = []
-    with open(path, encoding="utf-8") as fh:
+    try:
+        fh = open(path, encoding="utf-8")
+    except OSError as e:
+        print(f"[Argus Extractor] Cannot open sink: {e}")
+        return events
+    with fh:
         for lineno, line in enumerate(fh, 1):
             line = line.strip()
             if not line:
