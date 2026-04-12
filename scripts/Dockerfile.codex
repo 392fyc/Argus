@@ -1,0 +1,40 @@
+# Codex CLI container for Argus self-check (Plan B — NAS cron)
+#
+# Build:
+#   docker build -f scripts/Dockerfile.codex -t argus-selfcheck .
+#
+# Based on node:22-slim (Codex CLI requirement) with Python 3 and gh CLI added.
+# Source: https://github.com/openai/codex (Node.js 22 required)
+
+FROM node:22-slim
+
+# Install Python 3, pip, and gh CLI prerequisites
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install gh CLI (GitHub's official CLI)
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Codex CLI globally
+RUN npm install -g @openai/codex
+
+# Install Python dependencies for argus_self_check.py
+# (argus_events, argus_extractor, argus_log_analyzer, argus_issue_formatter are
+#  local modules — no pip install needed; only stdlib used)
+# Install requests in case argus modules need it at import time
+RUN pip3 install --no-cache-dir requests --break-system-packages || \
+    pip3 install --no-cache-dir requests
+
+WORKDIR /workspace
+
+# Default: print help (actual command passed at docker run time)
+CMD ["codex", "--help"]

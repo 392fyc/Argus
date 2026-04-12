@@ -1,0 +1,50 @@
+# LiteLLM proxy config — Plan B fallback for Argus self-check
+#
+# Routes OpenAI API key requests through LiteLLM so Claude Code can use
+# OpenAI models (gpt-4o / gpt-4o-mini) via the Anthropic-compatible API surface.
+#
+# Start server:
+#   litellm --config scripts/litellm_config.yaml
+#
+# Default listen address: http://localhost:4000
+#
+# Required env:
+#   OPENAI_API_KEY — OpenAI API key available in the NAS environment
+
+model_list:
+  # Claude Code sends requests with these Anthropic model IDs.
+  # LiteLLM routes them to OpenAI equivalents via the local OpenAI API key.
+
+  - model_name: claude-sonnet-4-5
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: "os.environ/OPENAI_API_KEY"
+
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: "os.environ/OPENAI_API_KEY"
+
+  - model_name: claude-opus-4-5
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: "os.environ/OPENAI_API_KEY"
+
+  - model_name: claude-opus-4-6
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: "os.environ/OPENAI_API_KEY"
+
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: "os.environ/OPENAI_API_KEY"
+
+litellm_settings:
+  # Drop unknown parameters that Anthropic SDK sends but OpenAI doesn't accept
+  drop_params: true
+  # Increase timeout for long-running agent tasks
+  request_timeout: 600
+
+general_settings:
+  master_key: "${LITELLM_MASTER_KEY:-litellm-argus-self-check}"  # override via env for production

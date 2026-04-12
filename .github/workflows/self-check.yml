@@ -1,0 +1,81 @@
+# Argus self-check — scheduled log analysis + auto-issue filing
+#
+# Plan A: Codex CLI via openai/codex-action@v1
+# Runs every 3 days; also supports manual dispatch.
+#
+# Required repository secrets:
+#   OPENAI_API_KEY — OpenAI API key with access to the target model
+#
+# Optional repository variables (set under Settings → Variables):
+#   SELF_CHECK_DAYS     — analysis window in days (default: 3)
+#   SELF_CHECK_MAX      — max Issues to file per run (default: 5)
+#   ARGUS_EVENTS_PATH   — path to events.jsonl on the runner (default: /var/log/argus/events.jsonl)
+#
+# To pause: set the repository variable SELF_CHECK_DISABLED=1
+# To re-enable: delete or set SELF_CHECK_DISABLED=0
+
+name: Argus self-check
+
+on:
+  schedule:
+    # Every 3 days at 02:17 UTC (off-peak, avoids :00/:30 crowding)
+    - cron: '17 2 */3 * *'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Analysis window (days)'
+        required: false
+        default: '3'
+      dry_run:
+        description: 'Dry run (no Issues filed)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  self-check:
+    runs-on: ubuntu-latest
+    # Skip if globally disabled
+    if: vars.SELF_CHECK_DISABLED != '1'
+
+    permissions:
+      issues: write   # needed for gh issue create
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run self-check via Codex CLI
+        # Inputs verified from openai/codex-action v1 action.yml:
+        #   https://raw.githubusercontent.com/openai/codex-action/v1/action.yml
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          sandbox: workspace-write
+          codex-args: '["--full-auto"]'
+          prompt: |
+            Analyze the last ${{ github.event.inputs.days || vars.SELF_CHECK_DAYS || '3' }} days of
+            Argus structured events and file GitHub Issues for any detected problems.
+
+            Steps:
+            1. Run: python argus_self_check.py --days ${{ github.event.inputs.days || vars.SELF_CHECK_DAYS || '3' }} ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }} --max-issues ${{ vars.SELF_CHECK_MAX || '5' }}
+            2. Print the output verbatim.
+            3. If any Issues were filed, list their URLs.
+            4. If the run failed, print the error and exit 1.
+
+            Constraints:
+            - Do NOT modify any source files, configs, or deploy files.
+            - Do NOT file Issues to any repo other than 392fyc/Argus.
+            - Do NOT exceed ${{ vars.SELF_CHECK_MAX || '5' }} Issues per run.
+        env:
+          ARGUS_EVENTS_PATH: ${{ vars.ARGUS_EVENTS_PATH || '/var/log/argus/events.jsonl' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
