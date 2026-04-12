@@ -61,7 +61,7 @@ jobs:
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           sandbox: workspace-write
-          codex-args: '["--approval-mode", "full-auto"]'
+          codex-args: '["--full-auto"]'
           prompt: |
             Analyze the last ${{ github.event.inputs.days || vars.SELF_CHECK_DAYS || '3' }} days of
             Argus structured events and file GitHub Issues for any detected problems.
