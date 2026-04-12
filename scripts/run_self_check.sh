@@ -67,6 +67,19 @@ fi
 MIN_INTERVAL=3
 MAX_INTERVAL=7
 
+# ── Read credentials from .secrets.toml if not already in env ────────────────
+# Set ARGUS_SECRETS_FILE to reuse the existing Argus secrets (no new credentials).
+# Defaults to <repo-dir>/.secrets.toml so on-NAS runs work without extra config.
+_SECRETS="${ARGUS_SECRETS_FILE:-${REPO_DIR}/.secrets.toml}"
+if [ -f "$_SECRETS" ]; then
+  if [ -z "${OPENAI_API_KEY:-}" ]; then
+    OPENAI_API_KEY=$(grep -A5 '^\[openai\]' "$_SECRETS" | grep '^key' | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/')
+  fi
+  if [ -z "${GH_TOKEN:-}" ]; then
+    GH_TOKEN=$(grep -A5 '^\[github\]' "$_SECRETS" | grep '^user_token' | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/')
+  fi
+fi
+
 # ── Pause check ───────────────────────────────────────────────────────────────
 if [ -f "$PAUSE_FLAG" ]; then
   echo "[self-check] Paused ($PAUSE_FLAG exists). Remove to re-enable."
