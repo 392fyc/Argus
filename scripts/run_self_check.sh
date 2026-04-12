@@ -122,7 +122,7 @@ $DOCKER_CMD run --rm \
   -v "${EVENTS_HOST}:${EVENTS_CONTAINER}:ro" \
   -w /workspace \
   "${IMAGE}" \
-  codex exec --full-auto "${PROMPT}" || DOCKER_EXIT=$?
+  codex exec --full-auto --skip-git-repo-check "${PROMPT}" || DOCKER_EXIT=$?
 
 # ── Update adaptive schedule state ───────────────────────────────────────────
 TODAY=$(date +%Y-%m-%d)
