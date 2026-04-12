@@ -26,6 +26,35 @@ services:
       retries: 3
       start_period: 15s
 
+  # ── Self-check scheduler ────────────────────────────────────────
+  # Runs argus_self_check.py daily. Uses adaptive interval gate in
+  # run_self_check.sh (starts at 3 days, grows to 7 on quiet runs).
+  # Does NOT require NAS crontab access — scheduling is internal.
+  selfcheck-scheduler:
+    image: argus-selfcheck
+    container_name: argus-selfcheck-scheduler
+    restart: unless-stopped
+    environment:
+      - USE_DIRECT_PYTHON=1
+      - EVENTS_HOST_PATH=/var/log/argus/events.jsonl
+      - ARGUS_STATE_FILE=/var/log/argus/self-check-state.json
+    volumes:
+      - ./logs:/var/log/argus
+      - .:/workspace:ro
+    working_dir: /workspace
+    # Poll every 24 h; the adaptive interval gate inside run_self_check.sh
+    # decides whether the actual check runs on any given day.
+    command: >
+      sh -c "while true;
+        do bash scripts/run_self_check.sh >> /var/log/argus/self-check.log 2>&1;
+        sleep 86400;
+      done"
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "3"
+
   # ── Cloudflare Tunnel ───────────────────────────────────────────
   cloudflared:
     image: cloudflare/cloudflared:latest
