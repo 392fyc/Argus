@@ -59,6 +59,10 @@ class ProblemCluster:
             self.signature = hashlib.sha256(raw).hexdigest()[:16]
 
 
+# ── Defaults ─────────────────────────────────────────────────────────────────
+
+_DEFAULT_SINK = "/var/log/argus/events.jsonl"
+
 # ── Thresholds ────────────────────────────────────────────────────────────────
 
 _ERROR_SPIKE_THRESHOLD = 3          # errors in window → spike
