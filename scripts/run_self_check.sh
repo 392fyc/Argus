@@ -45,6 +45,25 @@ EVENTS_CONTAINER="${ARGUS_EVENTS_PATH:-/var/log/argus/events.jsonl}"
 IMAGE="${CODEX_IMAGE:-argus-selfcheck}"
 STATE_FILE="${ARGUS_STATE_FILE:-/var/log/argus/self-check-state.json}"
 
+# ── Docker environment (QNAP Container Station) ───────────────────────────────
+# QNAP does not expose Docker on the standard /var/run/docker.sock.
+# Container Station's daemon socket is used instead.
+# Override DOCKER_CMD to use a different docker binary or connection settings.
+_QNAP_DOCKER=/share/CACHEDEV1_DATA/.qpkg/container-station/bin/docker
+_QNAP_SOCK=unix:///var/run/system-docker.sock
+_DOCKER_CFG=/tmp/docker-selfcheck-$$
+
+if [ -z "${DOCKER_CMD:-}" ]; then
+  if [ -x "$_QNAP_DOCKER" ]; then
+    mkdir -p "$_DOCKER_CFG"
+    export DOCKER_CONFIG="$_DOCKER_CFG"
+    export DOCKER_HOST="${DOCKER_HOST:-$_QNAP_SOCK}"
+    DOCKER_CMD="$_QNAP_DOCKER"
+  else
+    DOCKER_CMD="docker"  # fallback: docker in PATH (non-QNAP environments)
+  fi
+fi
+
 MIN_INTERVAL=3
 MAX_INTERVAL=7
 
@@ -113,7 +132,7 @@ PROMPT="Run the Argus self-check: execute 'python argus_self_check.py --days ${D
 
 # ── Run Codex in container ────────────────────────────────────────────────────
 DOCKER_EXIT=0
-docker run --rm \
+$DOCKER_CMD run --rm \
   --name "argus-self-check-$$" \
   -e "OPENAI_API_KEY=${OPENAI_API_KEY}" \
   -e "GH_TOKEN=${GH_TOKEN:-}" \
