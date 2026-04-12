@@ -81,40 +81,21 @@ if [ ! -f "$EVENTS_HOST" ]; then
 fi
 
 # ── Read adaptive scheduling state ───────────────────────────────────────────
+# Pure-shell JSON parsing (no python3 required on NAS host).
 CURRENT_INTERVAL=$MIN_INTERVAL
 LAST_RUN=""
 if [ -f "$STATE_FILE" ]; then
-  CURRENT_INTERVAL=$(python3 - <<PYEOF
-import json, sys
-try:
-    d = json.load(open("$STATE_FILE"))
-    print(int(d.get("interval_days", $MIN_INTERVAL)))
-except Exception:
-    print($MIN_INTERVAL)
-PYEOF
-)
-  LAST_RUN=$(python3 - <<PYEOF
-import json, sys
-try:
-    d = json.load(open("$STATE_FILE"))
-    print(d.get("last_run", ""))
-except Exception:
-    print("")
-PYEOF
-)
+  _iv=$(grep -o '"interval_days"[[:space:]]*:[[:space:]]*[0-9]*' "$STATE_FILE" 2>/dev/null | grep -o '[0-9]*$')
+  [ -n "$_iv" ] && CURRENT_INTERVAL="$_iv"
+  LAST_RUN=$(grep -o '"last_run"[[:space:]]*:[[:space:]]*"[^"]*"' "$STATE_FILE" 2>/dev/null \
+             | sed 's/.*"\([0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\)".*/\1/')
 fi
 
 # ── Interval gate ─────────────────────────────────────────────────────────────
 if [ -n "$LAST_RUN" ]; then
-  DAYS_SINCE=$(python3 - <<PYEOF
-from datetime import date
-try:
-    delta = date.today() - date.fromisoformat("$LAST_RUN")
-    print(delta.days)
-except Exception:
-    print(999)
-PYEOF
-)
+  _now=$(date +%s)
+  _last=$(date -d "$LAST_RUN" +%s 2>/dev/null || echo 0)
+  DAYS_SINCE=$(( (_now - _last) / 86400 ))
   if [ "$DAYS_SINCE" -lt "$CURRENT_INTERVAL" ]; then
     echo "[self-check] Skipping: ${DAYS_SINCE} day(s) since last run; interval is ${CURRENT_INTERVAL} days."
     exit 0
@@ -147,7 +128,8 @@ $DOCKER_CMD run --rm \
 TODAY=$(date +%Y-%m-%d)
 if [ $DOCKER_EXIT -eq 0 ]; then
   # Quiet run: no issues filed — gradually widen interval
-  NEW_INTERVAL=$(python3 -c "print(min($CURRENT_INTERVAL + 1, $MAX_INTERVAL))")
+  NEW_INTERVAL=$(( CURRENT_INTERVAL + 1 ))
+  [ "$NEW_INTERVAL" -gt "$MAX_INTERVAL" ] && NEW_INTERVAL=$MAX_INTERVAL
   echo "[self-check] Quiet run. Interval: ${CURRENT_INTERVAL} → ${NEW_INTERVAL} days."
 elif [ $DOCKER_EXIT -eq 2 ]; then
   # Findings detected: reset to minimum interval
@@ -163,13 +145,8 @@ fi
 # Ensure state directory exists
 mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null || true
 
-python3 - <<PYEOF
-import json
-state = {"interval_days": $NEW_INTERVAL, "last_run": "$TODAY"}
-with open("$STATE_FILE", "w") as f:
-    json.dump(state, f)
-print(f"[self-check] State saved: interval={state['interval_days']} days, last_run={state['last_run']}")
-PYEOF
+printf '{"interval_days": %d, "last_run": "%s"}\n' "$NEW_INTERVAL" "$TODAY" > "$STATE_FILE"
+echo "[self-check] State saved: interval=${NEW_INTERVAL} days, last_run=${TODAY}"
 
 echo "[self-check] Completed at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 exit $DOCKER_EXIT
