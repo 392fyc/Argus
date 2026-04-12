@@ -93,12 +93,22 @@ export GH_TOKEN=ghp_...            # GitHub token (issues:write)
 SELF_CHECK_DRY_RUN=1 bash scripts/run_self_check.sh
 ```
 
+**Direct Python mode** (bypass Codex — workaround for [openai/codex#13103](https://github.com/openai/codex/issues/13103) WebSocket auth bug):
+
+```bash
+USE_DIRECT_PYTHON=1 bash scripts/run_self_check.sh
+```
+
+> In this mode `OPENAI_API_KEY` is not required; only `GH_TOKEN` and the events file.
+> Use this when Codex CLI connectivity is broken but the container + Python path is working.
+
 ---
 
 ### Plan C — Claude Code + LiteLLM + ccproxy (if Codex unavailable)
 
 **When to use**: Codex CLI cannot be used (licensing, access, or quota constraints),
-and you need to run via Claude Code with an OpenAI API key as the backend model.
+and you want Claude Code to orchestrate the run while using an **OpenAI API key as
+the model backend** (reduces Anthropic subscription load).
 
 **Architecture** (all separate Docker containers, connected via Docker network):
 
@@ -122,7 +132,7 @@ docker run -d --name litellm -p 4000:4000 \
 **ccproxy + Claude Code** (custom container — see ccproxy docs):
 - Source: https://github.com/starbased-co/ccproxy
 - Install: `uv tool install claude-ccproxy --with 'litellm[proxy]'`
-- Set: `ANTHROPIC_BASE_URL=http://litellm:4000`
+- Set: `ANTHROPIC_BASE_URL=http://ccproxy:4000` (Claude Code → ccproxy → LiteLLM → OpenAI)
 
 `scripts/litellm_config.yaml` contains the model routing config for this scenario.
 

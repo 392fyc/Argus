@@ -8,3 +8,6 @@ docker-compose.override.yml
 
 # Local state — Claude Code skill working files
 .claude/state/
+
+# Argus event log (bind-mounted from Docker container, not for VCS)
+logs/

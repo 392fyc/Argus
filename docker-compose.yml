@@ -13,7 +13,7 @@ services:
     volumes:
       - ./configuration.toml:/app/pr_agent/settings/configuration.toml:ro
       - ./.secrets.toml:/app/pr_agent/settings/.secrets.toml:ro
-      - argus-logs:/var/log/argus
+      - ./logs:/var/log/argus
     logging:
       driver: json-file
       options:
@@ -41,5 +41,3 @@ services:
         max-size: "5m"
         max-file: "3"
 
-volumes:
-  argus-logs:

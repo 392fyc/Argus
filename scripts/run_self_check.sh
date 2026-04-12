@@ -19,6 +19,8 @@
 #   SELF_CHECK_DAYS         — analysis window in days (default: 3)
 #   SELF_CHECK_MAX_ISSUES   — cap on Issues per run (default: 5)
 #   SELF_CHECK_DRY_RUN      — set to 1 to preview without filing
+#   USE_DIRECT_PYTHON       — set to 1 to skip Codex and run python3 directly in the container
+#                             (workaround for Codex CLI WebSocket/auth issues; openai/codex#13103)
 #   ARGUS_EVENTS_PATH       — path to events.jsonl inside container (default: /var/log/argus/events.jsonl)
 #   EVENTS_HOST_PATH        — host path to events.jsonl (default: /var/log/argus/events.jsonl)
 #   CODEX_IMAGE             — Docker image name (default: argus-selfcheck)
@@ -40,6 +42,7 @@ PAUSE_FLAG="/var/log/argus/.self-check-disabled"
 DAYS="${SELF_CHECK_DAYS:-3}"
 MAX_ISSUES="${SELF_CHECK_MAX_ISSUES:-5}"
 DRY_RUN="${SELF_CHECK_DRY_RUN:-0}"
+DIRECT_PYTHON="${USE_DIRECT_PYTHON:-0}"
 EVENTS_HOST="${EVENTS_HOST_PATH:-/var/log/argus/events.jsonl}"
 EVENTS_CONTAINER="${ARGUS_EVENTS_PATH:-/var/log/argus/events.jsonl}"
 IMAGE="${CODEX_IMAGE:-argus-selfcheck}"
@@ -118,24 +121,38 @@ fi
 echo "[self-check] Starting at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "[self-check] Window: ${DAYS} days | max-issues: ${MAX_ISSUES} | dry-run: ${DRY_RUN} | interval: ${CURRENT_INTERVAL} days"
 
-# ── Build Codex args ──────────────────────────────────────────────────────────
+# ── Build run args ────────────────────────────────────────────────────────────
 EXTRA_ARGS=""
 [ "$DRY_RUN" = "1" ] && EXTRA_ARGS="--dry-run"
 
-PROMPT="Run the Argus self-check: execute 'python argus_self_check.py --days ${DAYS} --max-issues ${MAX_ISSUES} ${EXTRA_ARGS}' and report results. Do NOT modify any source files, configs, or deploy files."
-
-# ── Run Codex in container ────────────────────────────────────────────────────
+# ── Run self-check ────────────────────────────────────────────────────────────
 DOCKER_EXIT=0
-$DOCKER_CMD run --rm \
-  --name "argus-self-check-$$" \
-  -e "OPENAI_API_KEY=${OPENAI_API_KEY}" \
-  -e "GH_TOKEN=${GH_TOKEN:-}" \
-  -e "ARGUS_EVENTS_PATH=${EVENTS_CONTAINER}" \
-  -v "${REPO_DIR}:/workspace:ro" \
-  -v "${EVENTS_HOST}:${EVENTS_CONTAINER}:ro" \
-  -w /workspace \
-  "${IMAGE}" \
-  codex exec --full-auto --skip-git-repo-check -m "${CODEX_MODEL:-gpt-4o}" "${PROMPT}" || DOCKER_EXIT=$?
+if [ "$DIRECT_PYTHON" = "1" ]; then
+  # Direct Python mode: bypass Codex (workaround for openai/codex#13103 WebSocket auth bug)
+  # shellcheck disable=SC2086
+  $DOCKER_CMD run --rm \
+    --name "argus-self-check-$$" \
+    -e "GH_TOKEN=${GH_TOKEN:-}" \
+    -e "ARGUS_EVENTS_PATH=${EVENTS_CONTAINER}" \
+    -v "${REPO_DIR}:/workspace:ro" \
+    -v "${EVENTS_HOST}:${EVENTS_CONTAINER}:ro" \
+    -w /workspace \
+    "${IMAGE}" \
+    python3 argus_self_check.py --days "${DAYS}" --max-issues "${MAX_ISSUES}" ${EXTRA_ARGS} || DOCKER_EXIT=$?
+else
+  # Codex mode (default): LLM-orchestrated run via Codex CLI
+  PROMPT="Run the Argus self-check: execute 'python argus_self_check.py --days ${DAYS} --max-issues ${MAX_ISSUES} ${EXTRA_ARGS}' and report results. Do NOT modify any source files, configs, or deploy files."
+  $DOCKER_CMD run --rm \
+    --name "argus-self-check-$$" \
+    -e "OPENAI_API_KEY=${OPENAI_API_KEY}" \
+    -e "GH_TOKEN=${GH_TOKEN:-}" \
+    -e "ARGUS_EVENTS_PATH=${EVENTS_CONTAINER}" \
+    -v "${REPO_DIR}:/workspace:ro" \
+    -v "${EVENTS_HOST}:${EVENTS_CONTAINER}:ro" \
+    -w /workspace \
+    "${IMAGE}" \
+    codex exec --full-auto --skip-git-repo-check -m "${CODEX_MODEL:-gpt-4o}" "${PROMPT}" || DOCKER_EXIT=$?
+fi
 
 # ── Update adaptive schedule state ───────────────────────────────────────────
 TODAY=$(date +%Y-%m-%d)

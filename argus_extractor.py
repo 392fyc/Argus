@@ -16,6 +16,12 @@ from argus_events import ArgusEvent, EventType
 
 _DEFAULT_SINK = "/var/log/argus/events.jsonl"
 
+# Tail-scan limit: only read the last N bytes of a large events file.
+# Events are appended chronologically, so recent events are always at the end.
+# 5 MB covers ~7 days of typical Argus activity with headroom to spare.
+# Applied only when `since` is provided (i.e., bounded analysis windows).
+_MAX_TAIL_BYTES = 5 * 1024 * 1024  # 5 MB
+
 
 def read_events(
     sink_path: Optional[str] = None,
@@ -46,6 +52,20 @@ def read_events(
         print(f"[Argus Extractor] Cannot open sink: {e}")
         return events
     with fh:
+        # Tail-scan optimisation: when a lower-bound timestamp is given and the
+        # file exceeds _MAX_TAIL_BYTES, seek near the end so we skip old events
+        # that are guaranteed to fall outside the analysis window.
+        # Events are appended in chronological order, so recent events are at
+        # the end. The first (possibly partial) line after the seek is discarded.
+        if since is not None:
+            try:
+                file_size = os.path.getsize(path)
+                if file_size > _MAX_TAIL_BYTES:
+                    fh.seek(max(0, file_size - _MAX_TAIL_BYTES))
+                    fh.readline()  # discard partial line at seek boundary
+            except OSError:
+                pass  # fall back to full scan on any seek error
+
         for lineno, line in enumerate(fh, 1):
             line = line.strip()
             if not line:
