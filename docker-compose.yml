@@ -31,6 +31,9 @@ services:
   # run_self_check.sh (starts at 3 days, grows to 7 on quiet runs).
   # Does NOT require NAS crontab access — scheduling is internal.
   selfcheck-scheduler:
+    build:
+      context: .
+      dockerfile: scripts/Dockerfile.codex
     image: argus-selfcheck
     container_name: argus-selfcheck-scheduler
     restart: unless-stopped

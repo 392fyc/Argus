@@ -174,18 +174,44 @@ def analyze(
             ),
         ))
 
-    # ── 4. Resolution gap (ACCEPT without THREAD_RESOLVED) ───────────────────
-    accept_paths = {
-        e.payload.get("thread_path")
-        for e in reply_events
-        if e.payload.get("verdict") == "ACCEPT"
+    # ── 4. Resolution gap (ACCEPT without subsequent THREAD_RESOLVED) ────────
+    # Use latest-timestamp comparison per thread_path so that a thread which
+    # was resolved *before* a later ACCEPT is correctly flagged as unresolved.
+    _min_dt = datetime.min.replace(tzinfo=timezone.utc)
+
+    last_accept: dict = {}
+    for e in reply_events:
+        if e.payload.get("verdict") == "ACCEPT":
+            path = e.payload.get("thread_path")
+            if path:
+                try:
+                    ts = datetime.fromisoformat(e.timestamp)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
+                    ts = _min_dt
+                if path not in last_accept or ts > last_accept[path]:
+                    last_accept[path] = ts
+
+    last_resolved: dict = {}
+    for e in events:
+        if e.event_type == EventType.THREAD_RESOLVED:
+            path = e.payload.get("thread_path")
+            if path:
+                try:
+                    ts = datetime.fromisoformat(e.timestamp)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
+                    ts = _min_dt
+                if path not in last_resolved or ts > last_resolved[path]:
+                    last_resolved[path] = ts
+
+    # Unresolved: last ACCEPT is more recent than last RESOLVED (or never resolved)
+    unresolved_accepts = {
+        path for path, accept_ts in last_accept.items()
+        if path not in last_resolved or accept_ts > last_resolved[path]
     }
-    resolved_paths = {
-        e.payload.get("thread_path")
-        for e in events
-        if e.event_type == EventType.THREAD_RESOLVED
-    }
-    unresolved_accepts = accept_paths - resolved_paths - {None}
     if len(unresolved_accepts) >= _ACCEPT_WITHOUT_RESOLVE_THRESHOLD:
         clusters.append(ProblemCluster(
             type=TYPE_RESOLUTION_GAP,
@@ -194,10 +220,10 @@ def analyze(
                 f"{len(unresolved_accepts)} threads accepted but not resolved"
             ),
             evidence=[
-                f"{len(accept_paths)} ACCEPT verdicts, "
-                f"{len(resolved_paths)} THREAD_RESOLVED events.",
-                f"{len(unresolved_accepts)} thread paths appear in ACCEPT but "
-                "not in THREAD_RESOLVED.",
+                f"{len(last_accept)} ACCEPT verdicts, "
+                f"{len(last_resolved)} THREAD_RESOLVED events.",
+                f"{len(unresolved_accepts)} thread paths have ACCEPT more recent "
+                "than their last THREAD_RESOLVED (or were never resolved).",
                 "Sample paths: "
                 + ", ".join(sorted(unresolved_accepts)[:3])
                 + ("…" if len(unresolved_accepts) > 3 else ""),

@@ -47,4 +47,4 @@ litellm_settings:
   request_timeout: 600
 
 general_settings:
-  master_key: "litellm-argus-self-check"  # internal only — not exposed externally
+  master_key: "${LITELLM_MASTER_KEY:-litellm-argus-self-check}"  # override via env for production

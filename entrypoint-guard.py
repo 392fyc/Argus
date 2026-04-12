@@ -287,12 +287,18 @@ def _handle_reply_to_argus(body, sender):
             if verdict == "ACCEPT":
                 _reply_to_thread(auth_h, repo_full, pr_number, first_db_id,
                                  f"✅ Acknowledged — {reason}")
-                _resolve_thread(auth_h, t["id"])
-                print(f"[Argus] Reply accepted: {thread_path} → resolved")
+                resolved = _resolve_thread(auth_h, t["id"])
+                print(f"[Argus] Reply accepted: {thread_path} → "
+                      f"{'resolved' if resolved else 'resolve failed'}")
                 emitter.emit(EventType.REPLY_CLASSIFIED, pr_number=pr_number, repo=repo_full,
                              verdict="ACCEPT", thread_path=thread_path, reason=reason)
-                emitter.emit(EventType.THREAD_RESOLVED, pr_number=pr_number, repo=repo_full,
-                             thread_path=thread_path)
+                if resolved:
+                    emitter.emit(EventType.THREAD_RESOLVED, pr_number=pr_number, repo=repo_full,
+                                 thread_path=thread_path)
+                else:
+                    emitter.emit(EventType.ERROR, pr_number=pr_number, repo=repo_full,
+                                 message=f"_resolve_thread failed for {thread_path}",
+                                 thread_path=thread_path)
             elif verdict == "REJECT":
                 _reply_to_thread(auth_h, repo_full, pr_number, first_db_id,
                                  f"❓ Follow-up — {reason}")
