@@ -63,9 +63,11 @@ class EventEmitter:
         if self._ready is not None:
             return self._ready
         try:
-            os.makedirs(os.path.dirname(self._path), exist_ok=True)
+            dirpath = os.path.dirname(self._path)
+            if dirpath:
+                os.makedirs(dirpath, exist_ok=True)
             self._ready = True
-        except OSError as e:
+        except Exception as e:
             print(f"[Argus Events] Cannot create sink directory: {e}")
             self._ready = False
         return self._ready

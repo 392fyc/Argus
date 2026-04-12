@@ -64,8 +64,8 @@ def read_events(
                         continue
                     if until is not None and ts > until:
                         continue
-                except ValueError:
-                    pass  # unparseable timestamp — include anyway
+                except (ValueError, TypeError):
+                    pass  # unparseable or tz-incompatible timestamp — include anyway
 
             events.append(event)
 
