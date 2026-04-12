@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -58,6 +59,7 @@ class EventEmitter:
     def __init__(self, sink_path: Optional[str] = None):
         self._path = sink_path or os.environ.get("ARGUS_EVENTS_PATH", _DEFAULT_SINK)
         self._ready: Optional[bool] = None  # lazy init
+        self._lock = threading.Lock()  # guards concurrent file appends
 
     def _ensure_sink(self) -> bool:
         if self._ready is not None:
@@ -92,8 +94,9 @@ class EventEmitter:
             payload=payload_kwargs,
         )
         try:
-            with open(self._path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(event.to_dict()) + "\n")
+            with self._lock:
+                with open(self._path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(event.to_dict()) + "\n")
         except Exception as e:
             print(f"[Argus Events] Emit failed: {e}")
 

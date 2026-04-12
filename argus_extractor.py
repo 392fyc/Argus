@@ -56,16 +56,19 @@ def read_events(
                 continue
 
             if since is not None or until is not None:
+                # Normalize caller's datetimes to UTC-aware to prevent TypeError
+                _since = since.replace(tzinfo=timezone.utc) if since is not None and since.tzinfo is None else since
+                _until = until.replace(tzinfo=timezone.utc) if until is not None and until.tzinfo is None else until
                 try:
                     ts = datetime.fromisoformat(event.timestamp)
                     if ts.tzinfo is None:
                         ts = ts.replace(tzinfo=timezone.utc)
-                    if since is not None and ts < since:
+                    if _since is not None and ts < _since:
                         continue
-                    if until is not None and ts > until:
+                    if _until is not None and ts > _until:
                         continue
                 except (ValueError, TypeError):
-                    pass  # unparseable or tz-incompatible timestamp — include anyway
+                    pass  # unparseable timestamp — include anyway
 
             events.append(event)
 
