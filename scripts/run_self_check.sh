@@ -76,7 +76,7 @@ if [ -f "$_SECRETS" ]; then
     OPENAI_API_KEY=$(grep -A5 '^\[openai\]' "$_SECRETS" | grep '^key' | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/')
   fi
   if [ -z "${GH_TOKEN:-}" ]; then
-    GH_TOKEN=$(grep -A5 '^\[github\]' "$_SECRETS" | grep '^user_token' | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/')
+    GH_TOKEN=$(grep '^user_token' "$_SECRETS" | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/')
   fi
 fi
 
