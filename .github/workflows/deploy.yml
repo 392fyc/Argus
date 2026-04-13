@@ -36,7 +36,7 @@ jobs:
             HostName ssh.fyc-space.uk
             User 392fyc
             IdentityFile ~/.ssh/id_ed25519
-            ProxyCommand cloudflared access ssh --hostname %h
+            ProxyCommand cloudflared access ssh --hostname %h --service-token-id ${{ secrets.CF_ACCESS_CLIENT_ID }} --service-token-secret ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
             StrictHostKeyChecking no
           EOF
 
