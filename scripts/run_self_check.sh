@@ -91,8 +91,13 @@ fi
 
 # ── Verify events file ────────────────────────────────────────────────────────
 if [ ! -f "$EVENTS_HOST" ]; then
-  echo "[self-check] WARNING: events file not found at $EVENTS_HOST — skipping run."
-  echo "[self-check] Set EVENTS_HOST_PATH to the correct path and retry."
+  _events_dir="$(dirname "$EVENTS_HOST")"
+  if [ ! -d "$_events_dir" ]; then
+    echo "[self-check] WARNING: events directory not found at $_events_dir — path may be misconfigured."
+    echo "[self-check] Set EVENTS_HOST_PATH to the correct path and retry."
+  else
+    echo "[self-check] INFO: no events file yet at $EVENTS_HOST — nothing to analyze, skipping."
+  fi
   exit 0
 fi
 
