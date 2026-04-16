@@ -132,8 +132,17 @@ EXTRA_ARGS=""
 
 # ── Run self-check ────────────────────────────────────────────────────────────
 DOCKER_EXIT=0
-if [ "$DIRECT_PYTHON" = "1" ]; then
-  # Direct Python mode: bypass Codex (workaround for openai/codex#13103 WebSocket auth bug)
+if [ "$SKIP_DOCKER_WRAPPER" = "1" ] && [ "$DIRECT_PYTHON" = "1" ]; then
+  # In-container direct invocation (used by argus-selfcheck-scheduler):
+  # the script already runs inside the argus-selfcheck image, so python3 +
+  # argus_self_check.py are on disk at /workspace. No sibling docker needed.
+  # Fixes issue #22 — scheduler container had no docker binary/socket and
+  # failed exit 127 daily.
+  # shellcheck disable=SC2086
+  GH_TOKEN="${GH_TOKEN:-}" ARGUS_EVENTS_PATH="${EVENTS_CONTAINER}" \
+    python3 argus_self_check.py --days "${DAYS}" --max-issues "${MAX_ISSUES}" ${EXTRA_ARGS} || DOCKER_EXIT=$?
+elif [ "$DIRECT_PYTHON" = "1" ]; then
+  # Direct Python mode on NAS host: bypass Codex (workaround for openai/codex#13103 WebSocket auth bug)
   # shellcheck disable=SC2086
   $DOCKER_CMD run --rm \
     --name "argus-self-check-$$" \

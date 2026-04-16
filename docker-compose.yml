@@ -39,6 +39,13 @@ services:
     restart: unless-stopped
     environment:
       - USE_DIRECT_PYTHON=1
+      - DIRECT_PYTHON=1
+      # SKIP_DOCKER_WRAPPER=1 tells run_self_check.sh to invoke
+      # argus_self_check.py directly (in-container) instead of spawning a
+      # sibling docker run. The scheduler container has python3 + the script
+      # baked in and has no docker socket mounted; without this flag the
+      # script exits 127 daily. See #22.
+      - SKIP_DOCKER_WRAPPER=1
       - EVENTS_HOST_PATH=/var/log/argus/events.jsonl
       - ARGUS_STATE_FILE=/var/log/argus/self-check-state.json
     volumes:
