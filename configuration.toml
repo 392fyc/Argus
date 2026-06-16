@@ -26,7 +26,14 @@ skip_keys = []
 custom_reasoning_model = true # when true, disables system messages and temperature controls for models that don't support chat-style inputs
 response_language="zh-CN" # Language locales code for PR responses in ISO 3166 and ISO 639 format (e.g., "en-US", "it-IT", "zh-CN", ...)
 # token limits
-max_description_tokens = 500
+# Mercury #476 (Line C): raised 500 -> 3000 so PR bodies that place the
+# Closes/Fixes/Resolves/Refs #N keywords near the END of a long description
+# survive clip_tokens and reach the review prompt's {{description}}. With 500,
+# bodies >~500 tokens were head-clipped and the trailing issue refs were
+# dropped, making the ticket-compliance extra_instructions rule false-positive
+# "missing keyword" (PR #475). 3000 is well within max_model_tokens=32000; the
+# extra input tokens are modest and only apply on /describe,/review,/improve.
+max_description_tokens = 3000
 max_commits_tokens = 500
 max_model_tokens = 32000 # Limits the maximum number of tokens that can be used by any model, regardless of the model's default capabilities.
 custom_model_max_tokens=-1 # for models not in the default list
