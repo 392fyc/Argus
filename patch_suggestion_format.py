@@ -480,6 +480,115 @@ def _judge_reply_with_llm(original_finding, reply_body):
 MAX_REPLY_ROUNDS = 3
 
 
+_MATCH_STOPWORDS = frozenset({
+    "the", "and", "for", "are", "was", "has", "have", "had", "not", "but",
+    "you", "all", "any", "from", "its", "this", "that", "with", "will",
+    "can", "may", "should", "would", "could", "use", "via", "per", "out",
+    "see", "now", "new", "old", "yet", "off", "let", "get", "than", "then",
+    "their", "they", "them", "what", "when", "which", "while", "your", "here",
+})
+
+
+def _tokenize_for_match(text):
+    """Lowercase -> distinctive alnum/underscore tokens (>=3 chars, stopwords
+    removed) for conservative matching.
+
+    Markdown emphasis underscores (e.g. ``_header_``) are stripped from token
+    edges so ``_verify`` / ``writeback_`` normalise to ``verify`` /
+    ``writeback`` while internal-underscore identifiers (``verify_cache``) are
+    preserved. Common English stopwords are dropped so two findings can't
+    cross-match on filler words like "the"/"and" — the dominant false-resolve
+    risk for Strategy 4.
+
+    Pure function (no I/O) so it is unit-testable without network or LLM.
+    """
+    import re
+    if not text:
+        return set()
+    toks = set()
+    for raw in re.findall(r"[a-z0-9_]+", text.lower()):
+        t = raw.strip("_")
+        if len(t) >= 3 and t not in _MATCH_STOPWORDS:
+            toks.add(t)
+    return toks
+
+
+def _extract_thread_match_keys(first_bot_body, thread_path):
+    """Extract (header_tokens, path_source) used to match a top-level PR
+    comment to THIS thread.
+
+    header_tokens come ONLY from the finding header + content — the
+    ``_{icon} {severity}_ | _{header}_`` and ``**{content}**`` lines that
+    format_review_finding_body() emits BEFORE the ``<details>`` agent-prompt
+    block. We deliberately EXCLUDE that block because it contains the
+    ``In file `{path}` `` reference and the constant "Investigate and fix"
+    boilerplate, which would otherwise leak the file path into header_tokens
+    and collapse the two-signal AND-match into a single (path) signal.
+
+    path_tokens come from the thread's GraphQL ``path`` (authoritative file id),
+    falling back to an ``In file `...` `` reference inside the body. We then
+    SUBTRACT path_tokens from header_tokens so the path signal and the header
+    signal are genuinely INDEPENDENT.
+    """
+    import re
+    # finding signal = everything BEFORE the <details> agent-prompt block
+    finding_signal = (first_bot_body or "").split("<details>", 1)[0]
+
+    path_source = thread_path or ""
+    if not path_source and first_bot_body:
+        m = re.search(r"In file `([^`]+)`", first_bot_body)
+        if m:
+            path_source = m.group(1)
+
+    # tokenize the path on separators so 'scripts/gh-project-flow.md' ->
+    # {scripts, project, flow, ...}; keep the basename whole too.
+    path_tokens = _tokenize_for_match(re.sub(r"[/\\.]", " ", path_source))
+    basename = path_source.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if basename:
+        path_tokens.add(basename.lower())
+
+    # header/content tokens MINUS path tokens -> independent of the path signal
+    header_tokens = _tokenize_for_match(finding_signal) - path_tokens
+    return header_tokens, path_source
+
+
+def _match_toplevel_comment_to_thread(comment_body, header_tokens,
+                                      path_source, min_header_overlap=2):
+    """CONSERVATIVE match: a top-level PR comment matches a thread only when
+    BOTH the comment explicitly names the thread's file AND it shares
+    >= min_header_overlap distinctive finding-header tokens.
+
+    (1) FILE-PATH signal: the comment must contain the full path OR the file
+        basename as a literal substring. Generic path-token overlap (e.g. the
+        bare directory word "scripts") is intentionally NOT accepted — it is too
+        weak and could bind a same-topic comment to the WRONG file and
+        auto-resolve a genuine unaddressed blocker (the dominant risk).
+    (2) HEADER signal: >= min_header_overlap shared finding tokens (path tokens
+        and stopwords already excluded from header_tokens, so the two signals
+        are independent).
+
+    Pure function (no I/O).
+    """
+    if not comment_body:
+        return False
+    comment_tokens = _tokenize_for_match(comment_body)
+    body_lower = comment_body.lower()
+
+    # (1) file-path signal — explicit full-path or basename substring only
+    path_hit = False
+    if path_source and path_source.lower() in body_lower:
+        path_hit = True
+    else:
+        basename = path_source.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+        if basename and basename in body_lower:
+            path_hit = True
+    if not path_hit:
+        return False
+
+    # (2) header / finding-text signal (independent of the path signal)
+    return len(header_tokens & comment_tokens) >= min_header_overlap
+
+
 def _is_bot_author(login, bot_login):
     """Check if a login matches the bot, handling GraphQL vs REST naming.
 
@@ -577,6 +686,29 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
         resolved_count = 0
         reply_judged = 0
 
+        # Top-level PR (issue) comments — lazily fetched once for the Strategy 4
+        # fallback (author posted a DISAGREE rebuttal as a top-level comment, not
+        # as an in-thread reply). REST: GET /repos/{owner}/{repo}/issues/{pr}/comments
+        # (docs.github.com/en/rest/issues/comments). Bot-authored comments are
+        # filtered out so Argus never matches its own ✅/❓/⚠️ top-level posts.
+        _toplevel_comments_cache = {"loaded": False, "items": []}
+
+        def _get_toplevel_comments():
+            if _toplevel_comments_cache["loaded"]:
+                return _toplevel_comments_cache["items"]
+            _toplevel_comments_cache["loaded"] = True
+            try:
+                rc = _req.get(
+                    f"https://api.github.com/repos/{full_name}/issues/{pr_number}/comments?per_page=100",
+                    headers=auth_h, timeout=15)
+                if rc.status_code == 200:
+                    _toplevel_comments_cache["items"] = [
+                        c for c in rc.json()
+                        if not _is_bot_author(c.get("user", {}).get("login", ""), bot_login)]
+            except Exception as _e:
+                print(f"[Argus] Top-level comment fetch failed (non-fatal): {_e}")
+            return _toplevel_comments_cache["items"]
+
         for t in threads:
             if t["isResolved"]:
                 continue
@@ -616,6 +748,83 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
                     resolved_count += 1
                     print(f"[Argus] Outdated: {thread_path}:{thread_line} → resolved")
                 continue
+
+            # --- Strategy 4: Top-level disagree fallback ------------------
+            # The author posted a DISAGREE/cite rebuttal as a TOP-LEVEL PR
+            # comment (REST issues/{pr}/comments) rather than as an in-thread
+            # reply. Such comments never appear in this thread's `comments`, so
+            # human_authors stays [] and Strategy 3 never fires, leaving the
+            # thread permanently unresolved -> Rule 3 re-emits REQUEST_CHANGES.
+            # GitHub semantics: replying in a thread does NOT flip isResolved —
+            # only resolveReviewThread does. So we scan top-level comments,
+            # CONSERVATIVELY match one to this thread (file-path token AND
+            # finding-header token, both required + independent), and judge it
+            # like a reply via the unchanged _judge_reply_with_llm gate.
+            if not human_authors:
+                # first Argus comment body = the finding text (header + content)
+                first_bot_body = ""
+                first_comment_db_id = None
+                for c in comments["nodes"]:
+                    if _is_bot_author(c.get("author", {}).get("login", ""), bot_login):
+                        first_bot_body = c.get("body", "")
+                        first_comment_db_id = c.get("databaseId")
+                        break
+
+                # Respect MAX_REPLY_ROUNDS: count Argus judgment replies already
+                # posted in this thread by an earlier Strategy 4/3 round.
+                argus_judgment_count = sum(
+                    1 for c in comments["nodes"]
+                    if _is_bot_author(c.get("author", {}).get("login", ""), bot_login)
+                    and any(tag in c.get("body", "") for tag in ("✅ Acknowledged", "❓ Follow-up", "⚠️ Escalated")))
+                if argus_judgment_count >= MAX_REPLY_ROUNDS:
+                    continue
+
+                # Skip if a bot judgment is already the LAST comment: top-level
+                # comments don't re-trigger like in-thread replies, so the matched
+                # comment is unchanged and re-judging would just duplicate the bot
+                # reply (REJECT/ESCALATE don't resolve, so human_authors stays []
+                # and this block would otherwise re-run + re-post every cycle).
+                JUDGMENT_TAGS = ("✅ Acknowledged", "❓ Follow-up", "⚠️ Escalated")
+                last_comment = comments["nodes"][-1]
+                if _is_bot_author(last_comment.get("author", {}).get("login", ""), bot_login) \
+                        and any(tag in last_comment.get("body", "") for tag in JUDGMENT_TAGS):
+                    continue
+
+                if first_bot_body and first_comment_db_id:
+                    header_tokens, path_source = _extract_thread_match_keys(
+                        first_bot_body, thread_path)
+                    matched_body = None
+                    for tc in _get_toplevel_comments():
+                        if _match_toplevel_comment_to_thread(
+                                tc.get("body", ""), header_tokens, path_source):
+                            matched_body = tc.get("body", "")
+                            break
+                    if matched_body:
+                        verdict, reason = _judge_reply_with_llm(
+                            first_bot_body, matched_body)
+                        reply_judged += 1
+                        if verdict == "ESCALATE" and "LLM error" in reason:
+                            print(f"[Argus] Top-level reply judgment LLM failed for {thread_path}: {reason}")
+                            continue
+                        if verdict == "ACCEPT":
+                            _reply_to_thread(auth_h, full_name, pr_number,
+                                             first_comment_db_id,
+                                             f"✅ Acknowledged — {reason}")
+                            if _resolve_thread(auth_h, thread_id):
+                                resolved_count += 1
+                                print(f"[Argus] Top-level reply accepted: {thread_path} → resolved")
+                        elif verdict == "REJECT":
+                            _reply_to_thread(auth_h, full_name, pr_number,
+                                             first_comment_db_id,
+                                             f"❓ Follow-up — {reason}")
+                            print(f"[Argus] Top-level reply rejected: {thread_path} → follow-up posted")
+                        else:  # ESCALATE (genuine, not LLM error)
+                            _reply_to_thread(auth_h, full_name, pr_number,
+                                             first_comment_db_id,
+                                             f"⚠️ Escalated — {reason}\n\n"
+                                             f"*This thread requires human reviewer input.*")
+                            print(f"[Argus] Top-level reply escalated: {thread_path}")
+                        continue
 
             # --- Strategy 3: Reply-aware judging (thread has human replies) ---
             if human_authors:
