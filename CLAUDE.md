@@ -22,15 +22,15 @@ Argus reviews pull requests for Mercury and other 392fyc repos using PR-Agent (0
 
 ## Branching
 
-- **`develop`** is the integration branch. All feature PRs target `develop`.
-- **`master`** is the deploy branch. Pushing to `master` triggers `.github/workflows/deploy.yml` which SSH-deploys to the NAS via Cloudflare tunnel.
-- **Never push directly to `master`.** Merge `develop` → `master` manually after the `develop` branch is stable and smoke-tested.
+- **`master`** is the trunk and deploy branch. Feature PRs target `master`; merging a PR to `master` (a push) triggers `.github/workflows/deploy.yml`, which SSH-deploys to the NAS via the Cloudflare tunnel.
+- **Open a PR for every change** — Argus-review (this same bot) reviews it; merge to `master` after the review findings are dispositioned. Admin merge is used when the bot only COMMENTs (it casts no formal approval) and CI is green.
+- **`develop` is dormant** (currently behind `master`); the historical `develop` → `master` two-branch flow is retired. Revive it only by explicit decision (e.g. `git push origin master:develop`).
 - Feature branches: `feat/<slug>`, `fix/<slug>`, `chore/<slug>`.
 
 ## MUST
 
 - **Deploy safety**: any change that could affect container behavior (Dockerfile, docker-compose*.yml, entrypoint-guard.py, configuration.toml, .github/workflows/deploy.yml) requires explicit authorization in the TaskBundle's `allowedWriteScope`.
-- **PR to develop**: direct push to develop or master is forbidden.
+- **PR to master**: every change merges via PR; direct push to `master` (bypassing PR) is forbidden.
 - **dual-verify before commit**: every milestone must pass `/dual-verify` before committing.
 - **Web search before SDK/API code**: before referencing any PR-Agent / OpenAI / GitHub API behavior, verify against official docs. PR-Agent's API changes between minor versions — do not trust training data.
 - **Self-review awareness**: when this repo opens a PR, Argus-review (this same bot) will review its own code. Be prepared for reply-aware classification of your disagreements — see Mercury PR #186 for a prior example.

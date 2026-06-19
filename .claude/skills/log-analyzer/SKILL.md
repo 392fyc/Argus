@@ -4,8 +4,8 @@ Manual invocation of the Argus self-check analysis via Claude Code session.
 
 **This skill is for manual/ad-hoc use.** For scheduled runs, see the deployment
 options in `docs/self-check-setup.md`:
-- **Plan A (primary)**: GitHub Actions + `openai/codex-action@v1` (`.github/workflows/self-check.yml`)
-- **Plan B (fallback)**: Claude Code + ccproxy + LiteLLM (`scripts/run_self_check.sh`)
+- **Plan A (RETIRED 2026-06-20)**: GitHub Actions + `openai/codex-action@v1` — the workflow was removed; the cloud runner could not reach the NAS events sink. See Argus #33.
+- **Plan B (active)**: NAS Docker-container scheduler running `scripts/run_self_check.sh` where the events sink is local.
 
 ## When to invoke manually
 

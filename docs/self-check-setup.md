@@ -23,27 +23,18 @@ GitHub Issues (label: source:self-check)
 
 ## Deployment options
 
-### Plan A — GitHub Actions + Codex CLI (recommended)
+### Plan A — GitHub Actions + Codex CLI (RETIRED 2026-06-20)
 
-**When to use**: Argus repo has access to an OpenAI API key via repository secrets.
-
-**How it works**: `openai/codex-action@v1` runs `argus_self_check.py` inside a
-constrained Codex CLI session every 3 days.
-
-**Setup**:
-
-1. Add repository secret: `OPENAI_API_KEY`
-   - `GITHUB_TOKEN` is provided automatically by GitHub Actions (no manual secret needed)
-   - The workflow grants `issues: write` permission so `${{ secrets.GITHUB_TOKEN }}` can file Issues
-2. (Optional) Add repository variables:
-   - `SELF_CHECK_DAYS` — analysis window days (default: 3)
-   - `SELF_CHECK_MAX` — max Issues per run (default: 5)
-   - `ARGUS_EVENTS_PATH` — events sink path (default: `/var/log/argus/events.jsonl`)
-3. The workflow `.github/workflows/self-check.yml` fires automatically on schedule.
-
-**Manual trigger**: GitHub UI → Actions → "Argus self-check" → Run workflow.
-
-**Pause**: Set repository variable `SELF_CHECK_DISABLED=1`.
+> **Retired.** `.github/workflows/self-check.yml` was removed. The GitHub Actions
+> runner has no `OPENAI_API_KEY` and cannot reach the NAS events sink
+> (`/var/log/argus/events.jsonl` lives on the NAS, not on the cloud runner), so
+> every scheduled run failed daily. **Plan B (below) is the active self-check
+> mechanism** — it runs on the NAS, where the events sink is local. Verified live
+> on 2026-06-20 (`last_run` advancing, no `exit 127`). See Mercury #476 / Argus #33.
+>
+> Reviving a cloud-runner self-check would first require solving events-sink access
+> (ship events to the runner, or have the runner query a NAS-hosted API) and key
+> provisioning — neither is in place today.
 
 ---
 
@@ -195,11 +186,6 @@ script controls pacing:
 ```bash
 echo '{"interval_days": 3, "last_run": ""}' > /var/log/argus/self-check-state.json
 ```
-
-**Plan A note:** GitHub Actions cron is static YAML — adaptive scheduling is not
-available in Plan A. To change the interval, update the `schedule.cron` field in
-`.github/workflows/self-check.yml` or configure `SELF_CHECK_DAYS` and re-trigger
-manually via `workflow_dispatch`.
 
 ---
 
