@@ -848,8 +848,9 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
                         first_bot_body, thread_path)
                     matched_body = None
                     # newest-first: REST issues/comments returns oldest-first, so a
-                    # later rebuttal should win over a stale earlier one (#476 Line B).
-                    for tc in reversed(_get_toplevel_comments()):
+                    # later rebuttal should win over a stale earlier one. list() guards
+                    # reversed() against any non-sequence return (#476 Line B).
+                    for tc in reversed(list(_get_toplevel_comments())):
                         if _match_toplevel_comment_to_thread(
                                 tc.get("body", ""), header_tokens, path_source):
                             matched_body = tc.get("body", "")
