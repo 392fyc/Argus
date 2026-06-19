@@ -47,11 +47,22 @@ jobs:
         run: |
           ARGUS_DIR="/share/homes/392fyc/argus"
 
+          # Self-check runtime: the scheduler bind-mounts .:/workspace:ro and runs
+          # these live from $ARGUS_DIR. run_self_check.sh lives under scripts/; the
+          # five argus_*.py modules live at repo root. Ship all so the #22
+          # SKIP_DOCKER_WRAPPER fix and its modules actually reach the NAS. See #29.
           for f in Dockerfile entrypoint-guard.py patch_suggestion_format.py \
-                   configuration.toml docker-compose.yml docker-compose.polling.yml; do
+                   configuration.toml docker-compose.yml docker-compose.polling.yml \
+                   argus_self_check.py argus_log_analyzer.py argus_extractor.py \
+                   argus_events.py argus_issue_formatter.py \
+                   scripts/run_self_check.sh; do
             if [ -f "$f" ]; then
+              ssh nas "mkdir -p $ARGUS_DIR/$(dirname "$f")"
               cat "$f" | ssh nas "cat > $ARGUS_DIR/$f"
               echo "✓ $f"
+            else
+              echo "✗ MISSING in checkout: $f" >&2
+              exit 1
             fi
           done
 
@@ -62,10 +73,23 @@ jobs:
           DHOST="DOCKER_HOST=unix:///var/run/system-docker.sock"
 
           ssh nas "
+            # fail-fast: a failed pr-agent build/up must abort before the scheduler
+            # recreate, otherwise the SSH exit status would reflect only the LAST
+            # command (selfcheck-scheduler) and mask a failed primary rollout.
+            # set -e only (no pipefail) — the NAS remote shell may be busybox, where
+            # 'set -o pipefail' is unsupported and would itself abort under set -e.
+            set -e
             echo '${{ secrets.NAS_SUDO_PASS }}' | sudo -S $DHOST $DOCKER compose \
               -f $ARGUS_DIR/docker-compose.yml build --no-cache pr-agent 2>&1 | tail -5
             echo '${{ secrets.NAS_SUDO_PASS }}' | sudo -S $DHOST $DOCKER compose \
               -f $ARGUS_DIR/docker-compose.yml up -d --force-recreate pr-agent 2>&1
+            # Recreate the self-check scheduler too so the compose-defined
+            # SKIP_DOCKER_WRAPPER=1 env (present since #22) is applied to the running
+            # container. --force-recreate guarantees recreation even if compose sees no
+            # config delta. No rebuild: the image bakes no source; the self-check code
+            # comes from the .:/workspace:ro bind-mount refreshed in the transfer step.
+            echo '${{ secrets.NAS_SUDO_PASS }}' | sudo -S $DHOST $DOCKER compose \
+              -f $ARGUS_DIR/docker-compose.yml up -d --force-recreate selfcheck-scheduler 2>&1
           "
 
       - name: Verify deployment
