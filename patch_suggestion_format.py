@@ -584,6 +584,24 @@ def _extract_thread_match_keys(first_bot_body, thread_path):
     return header_tokens, path_source
 
 
+def _filename_mentioned(needle, haystack_lower):
+    """True if ``needle`` (a lowercased path or basename) appears in
+    ``haystack_lower`` as a BOUNDED filename token — not as the prefix of a
+    longer name.
+
+    Guards the Strategy-4 path signal against ``foo.py`` matching ``foo.py.bak``
+    or ``myfoo.py``: the chars immediately before/after the match must NOT be
+    filename-continuation chars (``[A-Za-z0-9._-]``). A path separator (``/`` or
+    ``\\``) is not such a char, so ``dir/foo.py`` still matches the basename
+    ``foo.py``. Pure function (no I/O). #476 Line B hardening.
+    """
+    import re
+    if not needle:
+        return False
+    pat = r"(?<![A-Za-z0-9._-])" + re.escape(needle) + r"(?![A-Za-z0-9._-])"
+    return re.search(pat, haystack_lower) is not None
+
+
 def _match_toplevel_comment_to_thread(comment_body, header_tokens,
                                       path_source, min_header_overlap=2):
     """CONSERVATIVE match: a top-level PR comment matches a thread only when
@@ -606,13 +624,16 @@ def _match_toplevel_comment_to_thread(comment_body, header_tokens,
     comment_tokens = _tokenize_for_match(comment_body)
     body_lower = comment_body.lower()
 
-    # (1) file-path signal — explicit full-path or basename substring only
+    # (1) file-path signal — explicit full-path OR basename as a BOUNDED filename
+    # token (#476 Line B hardening: 'foo.py' must not match 'foo.py.bak' or
+    # 'myfoo.py'). Generic path-token overlap (the bare directory word "scripts")
+    # is still intentionally NOT accepted — too weak.
     path_hit = False
-    if path_source and path_source.lower() in body_lower:
+    if path_source and _filename_mentioned(path_source.lower(), body_lower):
         path_hit = True
     else:
         basename = path_source.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
-        if basename and basename in body_lower:
+        if _filename_mentioned(basename, body_lower):
             path_hit = True
     if not path_hit:
         return False
@@ -826,7 +847,9 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
                     header_tokens, path_source = _extract_thread_match_keys(
                         first_bot_body, thread_path)
                     matched_body = None
-                    for tc in _get_toplevel_comments():
+                    # newest-first: REST issues/comments returns oldest-first, so a
+                    # later rebuttal should win over a stale earlier one (#476 Line B).
+                    for tc in reversed(_get_toplevel_comments()):
                         if _match_toplevel_comment_to_thread(
                                 tc.get("body", ""), header_tokens, path_source):
                             matched_body = tc.get("body", "")

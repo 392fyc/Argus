@@ -43,6 +43,10 @@ DAYS="${SELF_CHECK_DAYS:-3}"
 MAX_ISSUES="${SELF_CHECK_MAX_ISSUES:-5}"
 DRY_RUN="${SELF_CHECK_DRY_RUN:-0}"
 DIRECT_PYTHON="${USE_DIRECT_PYTHON:-0}"
+# Default so the bare "$SKIP_DOCKER_WRAPPER" test below is safe under `set -u`.
+# The compose scheduler sets SKIP_DOCKER_WRAPPER=1, but a host-cron invocation
+# that does not export it would otherwise abort with "unbound variable" (#476).
+SKIP_DOCKER_WRAPPER="${SKIP_DOCKER_WRAPPER:-0}"
 EVENTS_HOST="${EVENTS_HOST_PATH:-/var/log/argus/events.jsonl}"
 EVENTS_CONTAINER="${ARGUS_EVENTS_PATH:-/var/log/argus/events.jsonl}"
 IMAGE="${CODEX_IMAGE:-argus-selfcheck}"
