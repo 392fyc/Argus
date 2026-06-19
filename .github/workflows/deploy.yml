@@ -78,9 +78,17 @@ jobs:
             # command (selfcheck-scheduler) and mask a failed primary rollout.
             # set -e only (no pipefail) — the NAS remote shell may be busybox, where
             # 'set -o pipefail' is unsupported and would itself abort under set -e.
+            # The build therefore writes to a log file (no pipe) so its non-zero exit
+            # reaches set -e directly; a trailing '| tail' would otherwise mask a
+            # failed build behind tail's success exit (#476 Line D hardening).
             set -e
-            echo '${{ secrets.NAS_SUDO_PASS }}' | sudo -S $DHOST $DOCKER compose \
-              -f $ARGUS_DIR/docker-compose.yml build --no-cache pr-agent 2>&1 | tail -5
+            if ! echo '${{ secrets.NAS_SUDO_PASS }}' | sudo -S $DHOST $DOCKER compose \
+                 -f $ARGUS_DIR/docker-compose.yml build --no-cache pr-agent > /tmp/argus-build.log 2>&1; then
+              echo 'pr-agent build FAILED — last 20 lines:' >&2
+              tail -20 /tmp/argus-build.log >&2
+              exit 1
+            fi
+            tail -5 /tmp/argus-build.log
             echo '${{ secrets.NAS_SUDO_PASS }}' | sudo -S $DHOST $DOCKER compose \
               -f $ARGUS_DIR/docker-compose.yml up -d --force-recreate pr-agent 2>&1
             # Recreate the self-check scheduler too so the compose-defined

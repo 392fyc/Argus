@@ -153,3 +153,44 @@ def test_empty_comment_is_no_match():
     keys = psf._extract_thread_match_keys(FINDING_A, FILE_A)
     assert psf._match_toplevel_comment_to_thread("", *keys) is False
     assert psf._match_toplevel_comment_to_thread(None, *keys) is False
+
+
+def test_filename_mentioned_boundaries():
+    """_filename_mentioned matches a filename only as a BOUNDED token, so a name
+    is never matched as the prefix/suffix of a longer name (#476 Line B)."""
+    fm = psf._filename_mentioned
+    assert fm("foo.py", "the bug is in foo.py here") is True
+    assert fm("foo.py", "see `foo.py` for details") is True       # backtick boundary
+    assert fm("foo.py", "patched in dir/foo.py already") is True   # path-sep boundary
+    assert fm("foo.py", "foo.py.bak is the stale copy") is False   # trailing '.' extension
+    assert fm("foo.py", "myfoo.py is a different file") is False   # leading alnum
+    assert fm("foo.py", "the compiled foo.pyc is fine") is False   # trailing alnum
+    assert fm("", "anything") is False
+    assert fm("foo.py", "no mention of it") is False
+
+
+def test_sibling_backup_filename_does_not_false_match():
+    """A comment that names a CONFUSINGLY-similar sibling (the thread's file plus
+    a '.bak' suffix) must NOT satisfy the path signal, even with full header
+    overlap — the basename/full-path must match as a bounded token (#476 Line B)."""
+    keys = psf._extract_thread_match_keys(FINDING_A, FILE_A)
+    comment = ("DISAGREE — in the backup `scripts/gh-project-flow.md.bak` the "
+               "cache writeback before propagate is already guarded.")
+    assert psf._match_toplevel_comment_to_thread(comment, *keys) is False
+
+
+def test_prefixed_filename_does_not_false_match():
+    """A filename whose basename is only a SUFFIX of a longer name must not match
+    (the char before the basename is alphanumeric) (#476 Line B)."""
+    keys = psf._extract_thread_match_keys(FINDING_A, FILE_A)
+    comment = ("The cache writeback before propagate logic in "
+               "`xgh-project-flow.md` is guarded.")
+    assert psf._match_toplevel_comment_to_thread(comment, *keys) is False
+
+
+def test_none_path_source_does_not_crash():
+    """path_source=None must NOT raise (None.rsplit) — the basename branch
+    guards with (path_source or '') and returns no match (#476 Line B)."""
+    header_tokens, _ = psf._extract_thread_match_keys(FINDING_A, FILE_A)
+    assert psf._match_toplevel_comment_to_thread(
+        COMMENT_REBUTS_A, header_tokens, None) is False
