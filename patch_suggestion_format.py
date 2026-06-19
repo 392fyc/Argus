@@ -632,7 +632,9 @@ def _match_toplevel_comment_to_thread(comment_body, header_tokens,
     if path_source and _filename_mentioned(path_source.lower(), body_lower):
         path_hit = True
     else:
-        basename = path_source.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+        # (path_source or "") guards the rsplit against a None path_source —
+        # the only caller passes "" not None, but keep the helper self-safe.
+        basename = (path_source or "").rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
         if _filename_mentioned(basename, body_lower):
             path_hit = True
     if not path_hit:

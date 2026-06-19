@@ -186,3 +186,11 @@ def test_prefixed_filename_does_not_false_match():
     comment = ("The cache writeback before propagate logic in "
                "`xgh-project-flow.md` is guarded.")
     assert psf._match_toplevel_comment_to_thread(comment, *keys) is False
+
+
+def test_none_path_source_does_not_crash():
+    """path_source=None must NOT raise (None.rsplit) — the basename branch
+    guards with (path_source or '') and returns no match (#476 Line B)."""
+    header_tokens, _ = psf._extract_thread_match_keys(FINDING_A, FILE_A)
+    assert psf._match_toplevel_comment_to_thread(
+        COMMENT_REBUTS_A, header_tokens, None) is False
