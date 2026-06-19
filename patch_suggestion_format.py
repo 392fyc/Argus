@@ -215,11 +215,31 @@ def build_aggregated_agent_prompt(issues: list) -> str:
     return "\n".join(lines)
 
 
+# Config dotfiles that pr-agent's is_valid_file() drops (their final
+# split('.')[-1] token is in bad_extensions.default, e.g. 'gitignore'), so
+# they never reach diff_files and are omitted from the footer. We re-include
+# them in the '📒 Files reviewed' footer ONLY (display) — their content was
+# never sent to the model, so this restores footer VISIBILITY but does not
+# itself feed .gitignore to the reviewer. The actual [Gitignore一致性] false
+# positive is neutralized by the top-level disagree auto-resolve (Line B / #28).
+# Verified: pr-agent v0.34 language_handler.is_valid_file returns
+# filename.split('.')[-1] not in bad_extensions; 'gitignore' is in
+# bad_extensions.default. Refs Argus #27 / Mercury #476 (Line A).
+_FOOTER_REINCLUDE_DOTFILES = frozenset({
+    ".gitignore", ".gitattributes", ".dockerignore", ".editorconfig",
+})
+
+
 def build_review_body_additions(findings: list, inline_count: int,
-                                diff_files=None) -> str:
+                                diff_files=None, extra_filenames=None) -> str:
     """Build CodeRabbit-style additions to prepend/append to review body.
 
     Adds: actionable comments count, aggregated AI prompt, review info.
+
+    extra_filenames: optional iterable of filenames that pr-agent filtered out
+    of diff_files (e.g. .gitignore) but were genuinely changed in the PR;
+    merged into the 'Files reviewed' footer for display only. Default None
+    keeps the footer byte-for-byte identical for every existing caller.
     """
     parts = []
 
@@ -245,6 +265,18 @@ def build_review_body_additions(findings: list, inline_count: int,
     if diff_files:
         try:
             file_list = [getattr(f, 'filename', str(f)) for f in diff_files[:30]]
+        except Exception:
+            pass
+    # Re-include config dotfiles pr-agent's is_valid_file() dropped (footer
+    # display only — these were never sent to the model for review). Dedup +
+    # keep the same 30-file cap; appends only, never evicts a reviewed file.
+    if extra_filenames:
+        try:
+            seen = set(file_list)
+            for fn in extra_filenames:
+                if fn and fn not in seen and len(file_list) < 30:
+                    file_list.append(fn)
+                    seen.add(fn)
         except Exception:
             pass
 
@@ -1337,9 +1369,44 @@ def apply_patch():
                 no_new_code=no_new_code,
                 escalated_threads=escalated_threads)
 
+            # Collect config dotfiles pr-agent filtered out of diff_files
+            # (e.g. .gitignore — its split('.')[-1] token is in
+            # bad_extensions.default) so the footer can re-include them. Fully
+            # guarded: on any failure footer_extra stays [] and the footer is
+            # unchanged. Display only — never feeds content to the model.
+            footer_extra = []
+            try:
+                token_ff = _get_github_token(self.git_provider)
+                if token_ff and pr_number:
+                    repo_ff = self.git_provider.repo
+                    fn_ff = repo_ff.full_name if hasattr(repo_ff, 'full_name') else str(repo_ff)
+                    diff_names = set()
+                    if diff_files:
+                        for _df in diff_files:
+                            _n = getattr(_df, 'filename', None)
+                            if _n:
+                                diff_names.add(_n)
+                    import requests as _req_ff
+                    auth_ff = {"Authorization": f"Bearer {token_ff}",
+                               "Accept": "application/vnd.github+json"}
+                    r_ff = _req_ff.get(
+                        f"https://api.github.com/repos/{fn_ff}/pulls/{pr_number}/files",
+                        headers=auth_ff, params={"per_page": 100}, timeout=15)
+                    if r_ff.status_code == 200:
+                        for _f in r_ff.json():
+                            _name = _f.get("filename", "")
+                            _base = _name.rsplit("/", 1)[-1]
+                            if (_base in _FOOTER_REINCLUDE_DOTFILES
+                                    and _name not in diff_names):
+                                footer_extra.append(_name)
+            except Exception as e:
+                footer_extra = []  # strict: any failure -> footer byte-for-byte unchanged
+                print(f"[Argus] Footer dotfile re-include failed (non-fatal): {e}")
+
             # Build enhanced review body (CodeRabbit-style)
             body_additions = build_review_body_additions(
-                findings, len(inline_comments), diff_files)
+                findings, len(inline_comments), diff_files,
+                extra_filenames=footer_extra)
 
             # Strip PR Reviewer Guide from incremental reviews (iteration >= 2)
             # The full guide is only useful on the first review; subsequent reviews
