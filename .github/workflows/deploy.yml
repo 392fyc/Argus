@@ -51,7 +51,7 @@ jobs:
           # these live from $ARGUS_DIR. run_self_check.sh lives under scripts/; the
           # five argus_*.py modules live at repo root. Ship all so the #22
           # SKIP_DOCKER_WRAPPER fix and its modules actually reach the NAS. See #29.
-          for f in Dockerfile entrypoint-guard.py patch_suggestion_format.py \
+          for f in Dockerfile entrypoint-guard.py mention_rewrite.py patch_suggestion_format.py \
                    configuration.toml docker-compose.yml docker-compose.polling.yml \
                    argus_self_check.py argus_log_analyzer.py argus_extractor.py \
                    argus_events.py argus_issue_formatter.py \
