@@ -3,7 +3,7 @@ Argus Guard — User whitelist + @mention support for PR-Agent GitHub App webhoo
 
 Features:
 - User whitelist: only allowed users' events pass through
-- @mention rewrite: converts @argus-review[bot] mentions to /ask commands
+- @mention rewrite: converts @argus-review[bot] mentions to PR-Agent slash commands
 
     ARGUS_ALLOWED_USERS=392fyc,trusted-bot   (comma-separated, case-insensitive)
 
@@ -12,9 +12,9 @@ If empty or unset, ALL users are allowed.
 
 import json
 import os
-import re
 
 from argus_events import emitter, EventType
+from mention_rewrite import should_rewrite_mention, rewrite_mention
 
 _raw = os.environ.get("ARGUS_ALLOWED_USERS", "").strip()
 ALLOWED_USERS: set = set()
@@ -93,60 +93,11 @@ class ArgusGuardMiddleware:
         return await self.app(scope, replay_receive, send)
 
 
-# ── @mention → /ask rewrite ──────────────────────────────────────
-# Rewrites @argus-review[bot] mentions as /ask commands so PR-Agent
-# can process them. Must be applied AFTER HMAC verification (at the
-# handler level, not the ASGI middleware level).
-#
-# Pattern: matches @argus-review[bot] or @argus-review (with or without [bot])
-# Ref: https://docs.github.com/en/webhooks/webhook-events-and-payloads#issue_comment
-
-BOT_MENTION_RE = re.compile(
-    r'@argus-review(?:\[bot\])?\s*', re.IGNORECASE)
-
-# Patterns that indicate the mention is in a quote (not a direct request)
-QUOTE_PREFIX_RE = re.compile(r'^\s*>')
-
-
-def _should_rewrite_mention(body: str) -> bool:
-    """Check if comment body contains a direct @mention (not in a quote)."""
-    if not BOT_MENTION_RE.search(body):
-        return False
-    # Don't rewrite if the mention is only in quoted lines
-    for line in body.split('\n'):
-        if BOT_MENTION_RE.search(line) and not QUOTE_PREFIX_RE.match(line):
-            return True
-    return False
-
-
-PR_AGENT_COMMANDS = {
-    "review", "describe", "improve", "ask", "help",
-    "update_changelog", "similar_issue", "add_docs", "test",
-}
-
-
-def _rewrite_mention(body: str) -> str:
-    """Rewrite @argus-review mentions to PR-Agent slash commands.
-
-    Supports both styles:
-      @argus-review review        → /review
-      @argus-review review -i     → /review -i
-      @argus-review /review       → /review
-      @argus-review why is X bad? → /ask why is X bad?
-    """
-    cleaned = BOT_MENTION_RE.sub("", body).strip()
-    if not cleaned:
-        return ""
-    # Already a slash command — pass through
-    if cleaned.startswith("/"):
-        return cleaned
-    # Check if first word is a known PR-Agent command
-    first_word = cleaned.split()[0].lower()
-    if first_word in PR_AGENT_COMMANDS:
-        rest = cleaned[len(first_word):].strip()
-        return f"/{first_word} {rest}".rstrip()
-    # Fallback: treat as /ask
-    return f"/ask {cleaned}"
+# @mention → slash-command rewriting lives in mention_rewrite.py
+# (pure + unit-tested in tests/test_mention_rewrite.py). The intent classifier
+# keys off the verb following a mention, with the LAST explicit-command mention
+# winning so a trailing "@argus-review review" re-triggers review even when a
+# fix-summary body precedes it (Argus #23).
 
 
 def _handle_reply_to_argus(body, sender):
@@ -348,23 +299,23 @@ def _patch_mention_handler():
                     _handle_reply_to_argus(body, sender)
 
                 # Rewrite @mentions to PR-Agent commands
-                if _should_rewrite_mention(comment_body):
-                    rewritten = _rewrite_mention(comment_body)
+                if should_rewrite_mention(comment_body):
+                    rewritten, method = rewrite_mention(comment_body)
                     if rewritten:
-                        print(f"[Argus] @mention rewritten: "
+                        print(f"[Argus] @mention rewritten ({method}): "
                               f"'{comment_body[:60]}' → '{rewritten[:60]}'")
                         body["comment"]["body"] = rewritten
                         _pr_num = body.get("pull_request", {}).get("number")
                         _repo = body.get("repository", {}).get("full_name")
                         emitter.emit(EventType.MENTION_REWRITTEN, pr_number=_pr_num,
                                      repo=_repo, original=comment_body[:60],
-                                     rewritten=rewritten[:60])
+                                     rewritten=rewritten[:60], method=method)
 
             return await original_handle(body, event, sender, sender_id,
                                          action, log_context, agent)
 
         ga_mod.handle_comments_on_pr = patched_handle
-        print("[Argus] @mention → /ask rewrite patched")
+        print("[Argus] @mention rewrite patched")
     except Exception as e:
         print(f"[Argus] Failed to patch @mention handler: {e}")
 
