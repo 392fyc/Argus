@@ -28,8 +28,13 @@ PR_AGENT_COMMANDS = {
 
 
 def should_rewrite_mention(body: str) -> bool:
-    """True if body contains a direct (non-quoted) @argus-review mention."""
-    if not body or not BOT_MENTION_RE.search(body):
+    """True if body contains a direct (non-quoted) @argus-review mention.
+
+    Non-string input (a malformed webhook payload where ``comment.body`` is not
+    a string) is treated as "no mention" rather than raised, so a single bad
+    comment cannot break the whole webhook handler.
+    """
+    if not isinstance(body, str) or not BOT_MENTION_RE.search(body):
         return False
     # Don't rewrite if the mention appears only inside quoted lines.
     for line in body.split('\n'):
@@ -69,7 +74,7 @@ def rewrite_mention(body: str):
         "<fix summary>\\n@argus-review review"  -> ("/review", explicit-trailing-verb)
         "@argus-review why is X bad?"          -> ("/ask why is X bad?", freeform-ask-fallback)
     """
-    if not body:
+    if not isinstance(body, str) or not body:
         return ("", "empty")
     explicit = None  # (verb, args) from the LAST non-quoted command mention
     for m in BOT_MENTION_RE.finditer(body):

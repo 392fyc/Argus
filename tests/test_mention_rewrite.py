@@ -132,6 +132,31 @@ def test_none_and_empty_body_safe():
     assert rewrite_mention("") == ("", "empty")
 
 
+def test_non_string_body_safe():
+    # A malformed webhook where comment.body is not a string must degrade to a
+    # no-op rather than raising TypeError out of the handler (Argus #37 review).
+    for bad in ({"x": 1}, ["review"], 42, 3.14):
+        assert should_rewrite_mention(bad) is False
+        assert rewrite_mention(bad) == ("", "empty")
+
+
+def test_verb_on_next_line_kept_as_review():
+    # The mention regex's trailing whitespace spans the newline, so a verb on the
+    # line directly below the mention is still recognized — preserving the prior
+    # behavior (the old classifier also routed this to /review). Locked in so a
+    # future regex tightening is a conscious decision, not an accident.
+    assert rewrite_mention("@argus-review\nreview") == ("/review", "explicit-trailing-verb")
+
+
+def test_quoted_verb_on_next_line_is_not_a_trigger():
+    # Conversely, a quoted verb on the next line must NOT be promoted to /review.
+    # This is the harmless case behind the Minor "line-divergence" review note:
+    # the captured token is the quote marker, which is not a known command.
+    cmd, method = rewrite_mention("@argus-review\n> review")
+    assert method == "freeform-ask-fallback"
+    assert not cmd.startswith("/review")
+
+
 def test_unknown_slash_passthrough():
     cmd, method = rewrite_mention("@argus-review /custom_thing foo")
     assert cmd == "/custom_thing foo"
