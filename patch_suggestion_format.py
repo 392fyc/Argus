@@ -1151,10 +1151,15 @@ def apply_patch():
 
         original_push = pr_code_suggestions.PRCodeSuggestions.push_inline_code_suggestions
 
-        def patched_push(self, data):
+        # async: upstream push_inline_code_suggestions is `async def` (v0.34+); the
+        # caller does `await self.push_inline_code_suggestions(...)`, so the replacement
+        # must be awaitable. (The old codiumai:0.34 image shipped 0.32 code where this
+        # method was sync — hence the fork was sync and happened to work; the 0.38 rebase
+        # requires async. git_provider.publish_code_suggestions stays sync upstream.)
+        async def patched_push(self, data):
             code_suggestions = []
             if not data.get("code_suggestions"):
-                return original_push(self, data)
+                return await original_push(self, data)
 
             for d in data["code_suggestions"]:
                 try:
@@ -1200,7 +1205,7 @@ def apply_patch():
         from pr_agent.tools import pr_reviewer
         from pr_agent.algo.utils import load_yaml
         from pr_agent.git_providers import github_provider as gh_mod
-        from pr_agent.git_providers.github_provider import find_line_number_of_relevant_line_in_file
+        from pr_agent.algo.utils import find_line_number_of_relevant_line_in_file
 
         # -- Step A: Intercept publish to capture review body --
         original_publish_persistent = gh_mod.GithubProvider.publish_persistent_comment
@@ -1209,13 +1214,22 @@ def apply_patch():
         def _is_review_content(body):
             return isinstance(body, str) and ("PR Reviewer Guide" in body or "Reviewer Guide" in body)
 
-        def patched_publish_persistent(self, body, initial_header="", **kwargs):
+        def patched_publish_persistent(self, pr_comment, initial_header, update_header=True,
+                                       name="review", final_update_message=True):
+            # v0.36+ added name/final_update_message params (0.34 had neither). Mirror the
+            # upstream signature exactly (incl. required initial_header) so positional call
+            # sites bind instead of falling into a **kwargs that cannot absorb extra
+            # positional args. The known v0.38 caller (PRReviewer.run) passes keywords; this
+            # hardens against positional callers and fails fast on a bad one.
+            body = pr_comment
             if _is_review_content(body):
                 # Capture body, don't publish yet — patched_run will post unified review
                 self._argus_review_body = body
                 print(f"[Argus] Captured review body ({len(body)} chars), deferring publish")
                 return
-            return original_publish_persistent(self, body, initial_header=initial_header, **kwargs)
+            return original_publish_persistent(self, pr_comment, initial_header=initial_header,
+                                               update_header=update_header, name=name,
+                                               final_update_message=final_update_message)
 
         def patched_publish_comment(self, body, is_temporary=False):
             if not is_temporary and _is_review_content(body):

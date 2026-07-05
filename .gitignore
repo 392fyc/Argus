@@ -11,3 +11,6 @@ docker-compose.override.yml
 
 # Argus event log (bind-mounted from Docker container, not for VCS)
 logs/
+
+# pr-flow skill working files (PR-monitoring scratch state)
+.pr-flow-*
