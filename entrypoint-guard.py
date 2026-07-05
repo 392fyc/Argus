@@ -277,7 +277,7 @@ def _patch_mention_handler():
     1. Judge replies to Argus review threads via LLM
     2. Rewrite @mentions before the slash-command filter drops them
 
-    handle_comments_on_pr signature (PR-Agent 0.34):
+    handle_comments_on_pr signature (PR-Agent 0.34-0.38, unchanged):
       async def handle_comments_on_pr(body, event, sender, sender_id,
                                        action, log_context, agent)
     """
