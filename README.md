@@ -49,6 +49,8 @@ This model route was verified on the NAS webhook deployment with PR-Agent 0.38.0
 
 `configuration.toml` sets `model`, `model_turbo`, and `model_weak` to `responses/gpt-6-luna`. With `api_type="azure"`, the PR-Agent LiteLLM handler adds the `azure/` provider prefix, so the configured model value must not include that prefix. All three settings use the same Azure deployment, so `fallback_models=[]` avoids a fallback to another model; PR-Agent's normal request retries remain enabled.
 
+The webhook uses `reasoning_effort="xhigh"`. PR-Agent 0.38.0 does not include this exact Azure Responses model in its static reasoning-model registry, and LiteLLM requires `reasoning_effort` in `allowed_openai_params` to pass it through. `patch_luna_reasoning.py` applies that compatibility change only to requests for `azure/responses/gpt-6-luna`; it validates the configured effort with PR-Agent's `ReasoningEffort` and leaves other models unchanged.
+
 The webhook container sets `OPENAI__DEPLOYMENT_ID=gpt-6-luna`. This non-secret environment value takes precedence over the older `deployment_id` in `.secrets.toml`, so the secret file does not need to change. A successful NAS request through the PR-Agent handler returned `gpt-6-luna-2026-09-22` in the response's `model` field.
 
 ## Configuration

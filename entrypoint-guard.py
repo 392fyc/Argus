@@ -325,6 +325,10 @@ def _patch_mention_handler():
 from patch_suggestion_format import apply_patch
 apply_patch()
 
+# Apply the targeted Luna xhigh compatibility patch before PR-Agent app startup.
+from patch_luna_reasoning import apply_patch as apply_luna_reasoning_patch
+apply_luna_reasoning_patch()
+
 # Apply @mention support (patches handle_comments_on_pr before app routes bind)
 _patch_mention_handler()
 
