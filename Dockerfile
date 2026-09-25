@@ -12,6 +12,7 @@ FROM pragent/pr-agent:0.38.0-github_app@sha256:f07a88d52c816aef04fee53e31fa99b5f
 COPY entrypoint-guard.py /app/entrypoint-guard.py
 COPY mention_rewrite.py /app/mention_rewrite.py
 COPY patch_suggestion_format.py /app/patch_suggestion_format.py
+COPY patch_luna_reasoning.py /app/patch_luna_reasoning.py
 COPY argus_events.py /app/argus_events.py
 
 CMD ["python", "-m", "gunicorn", \
