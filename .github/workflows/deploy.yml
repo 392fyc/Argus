@@ -70,7 +70,8 @@ jobs:
         run: |
           ARGUS_DIR="/share/homes/392fyc/argus"
           DOCKER="/share/CACHEDEV1_DATA/.qpkg/container-station/bin/docker"
-          DHOST="DOCKER_HOST=unix:///var/run/system-docker.sock"
+          NAS_DOCKER_CONFIG="$ARGUS_DIR/.docker-client"
+          NAS_DOCKER_SOCKET="unix:///var/run/system-docker.sock"
 
           ssh nas "
             # fail-fast: a failed pr-agent build/up must abort before the scheduler
@@ -82,36 +83,48 @@ jobs:
             # reaches set -e directly; a trailing '| tail' would otherwise mask a
             # failed build behind tail's success exit (#476 Line D hardening).
             set -e
-            if ! echo '${{ secrets.NAS_SUDO_PASS }}' | sudo -S $DHOST $DOCKER compose \
+            # Use an Argus-owned client config so QNAP's default config path cannot
+            # block discovery of the globally installed Compose plugin.
+            mkdir -p $NAS_DOCKER_CONFIG
+            if ! $DOCKER --config $NAS_DOCKER_CONFIG -H $NAS_DOCKER_SOCKET compose \
                  -f $ARGUS_DIR/docker-compose.yml build --no-cache pr-agent > /tmp/argus-build.log 2>&1; then
               echo 'pr-agent build FAILED — last 20 lines:' >&2
               tail -20 /tmp/argus-build.log >&2
               exit 1
             fi
             tail -5 /tmp/argus-build.log
-            echo '${{ secrets.NAS_SUDO_PASS }}' | sudo -S $DHOST $DOCKER compose \
+            $DOCKER --config $NAS_DOCKER_CONFIG -H $NAS_DOCKER_SOCKET compose \
               -f $ARGUS_DIR/docker-compose.yml up -d --force-recreate pr-agent 2>&1
             # Recreate the self-check scheduler too so the compose-defined
             # SKIP_DOCKER_WRAPPER=1 env (present since #22) is applied to the running
             # container. --force-recreate guarantees recreation even if compose sees no
             # config delta. No rebuild: the image bakes no source; the self-check code
             # comes from the .:/workspace:ro bind-mount refreshed in the transfer step.
-            echo '${{ secrets.NAS_SUDO_PASS }}' | sudo -S $DHOST $DOCKER compose \
+            $DOCKER --config $NAS_DOCKER_CONFIG -H $NAS_DOCKER_SOCKET compose \
               -f $ARGUS_DIR/docker-compose.yml up -d --force-recreate selfcheck-scheduler 2>&1
           "
 
       - name: Verify deployment
         run: |
-          sleep 15
+          ARGUS_DIR="/share/homes/392fyc/argus"
           DOCKER="/share/CACHEDEV1_DATA/.qpkg/container-station/bin/docker"
-          DHOST="DOCKER_HOST=unix:///var/run/system-docker.sock"
+          NAS_DOCKER_CONFIG="$ARGUS_DIR/.docker-client"
+          NAS_DOCKER_SOCKET="unix:///var/run/system-docker.sock"
 
-          STATUS=$(ssh nas \
-            "echo '${{ secrets.NAS_SUDO_PASS }}' | sudo -S $DHOST $DOCKER ps --filter name=argus --format '{{.Status}}' 2>/dev/null | head -1")
-          echo "Container status: $STATUS"
-          if echo "$STATUS" | grep -q "Up"; then
-            echo "✅ Argus deployed successfully"
-          else
-            echo "❌ Deployment failed"
-            exit 1
-          fi
+          # Inspect the exact main container; docker ps's substring name filter can match the scheduler.
+          # Reserve 10 seconds for a bounded SSH probe within the 2-minute wait.
+          deadline=$((SECONDS + 110))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            STATUS=$(timeout 10s ssh nas \
+              "$DOCKER --config $NAS_DOCKER_CONFIG -H $NAS_DOCKER_SOCKET inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' argus" \
+              2>/dev/null || true)
+            echo "Argus container state: ${STATUS:-not found}"
+            if [ "$STATUS" = "running healthy" ]; then
+              echo "✅ Argus deployed successfully"
+              exit 0
+            fi
+            [ "$SECONDS" -lt "$deadline" ] || break
+            sleep 5
+          done
+          echo "❌ Argus did not become running and healthy within 2 minutes"
+          exit 1
