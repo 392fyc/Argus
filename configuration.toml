@@ -3,11 +3,11 @@
 
 [config]
 # models
-model="azure/responses/gpt-5.3-codex"
-model_turbo="azure/responses/gpt-5.3-codex"
-fallback_models=["azure/gpt-5.4"]
+model="responses/gpt-6-luna"
+model_turbo="responses/gpt-6-luna"
+fallback_models=[]
 #model_reasoning="o4-mini" # dedicated reasoning model for self-reflection
-model_weak="azure/gpt-5.4-mini" # fast/light flows (user-allocated 2026-07-03); main review stays gpt-5.3-codex
+model_weak="responses/gpt-6-luna"
 # CLI
 git_provider="github"
 publish_output=true
