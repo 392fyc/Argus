@@ -2,7 +2,7 @@
 
 > *Named after the hundred-eyed giant Argus Panoptes — the all-seeing watchman.*
 
-Self-hosted AI code review for [Mercury](https://github.com/392fyc/Mercury), powered by [Qodo PR-Agent](https://github.com/qodo-ai/pr-agent) + GPT-5.3-Codex.
+Self-hosted AI code review for [Mercury](https://github.com/392fyc/Mercury), powered by [Qodo PR-Agent](https://github.com/qodo-ai/pr-agent) and GPT-6 Luna through Azure OpenAI.
 
 Replaces CodeRabbit SaaS with a self-hosted Docker deployment on QNAP NAS.
 
@@ -28,9 +28,9 @@ docker compose -f docker-compose.polling.yml up -d
 GitHub PR Event
     |
     v (webhook via Cloudflare Tunnel)
-Argus: pr-agent + GPT-5.3-Codex (Docker)
+Argus: PR-Agent + gpt-6-luna (Docker)
     |-- Fetch PR diff
-    |-- Send to GPT-5.3-Codex
+    |-- Send to gpt-6-luna through Azure Responses
     |-- Submit formal GitHub review
     v
 GitHub PR: APPROVED / CHANGES_REQUESTED
@@ -40,8 +40,16 @@ GitHub PR: APPROVED / CHANGES_REQUESTED
 
 | Mode | Image Tag | Tunnel Required | Latency |
 |------|-----------|-----------------|---------|
-| **Webhook** (recommended) | `0.34-github_app` | Yes (Cloudflare Tunnel) | Instant |
+| **Webhook** (recommended) | `0.38.0-github_app` | Yes (Cloudflare Tunnel) | Instant |
 | **Polling** | `0.34-github_polling` | No | Minutes |
+
+## Model Routing (NAS Webhook)
+
+This model route was verified on the NAS webhook deployment with PR-Agent 0.38.0 and LiteLLM 1.84.0. It describes the webhook service in `docker-compose.yml`; the separate polling deployment has its own older compose file.
+
+`configuration.toml` sets `model`, `model_turbo`, and `model_weak` to `responses/gpt-6-luna`. With `api_type="azure"`, the PR-Agent LiteLLM handler adds the `azure/` provider prefix, so the configured model value must not include that prefix. All three settings use the same Azure deployment, so `fallback_models=[]` avoids a fallback to another model; PR-Agent's normal request retries remain enabled.
+
+The webhook container sets `OPENAI__DEPLOYMENT_ID=gpt-6-luna`. This non-secret environment value takes precedence over the older `deployment_id` in `.secrets.toml`, so the secret file does not need to change. A successful NAS request through the PR-Agent handler returned `gpt-6-luna-2026-09-22` in the response's `model` field.
 
 ## Configuration
 
@@ -82,7 +90,7 @@ Leave empty to allow all users. The guard logs all allow/block decisions.
 
 ## Cost
 
-~$0.08-0.25 per review with GPT-5.3-Codex API ($1.75/MTok input, $14/MTok output).
+Cost depends on Azure's current price for the deployed model and the actual token usage. Check current Azure pricing and request usage records before estimating a per-review cost.
 
 ## Related
 
