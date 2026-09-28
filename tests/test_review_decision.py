@@ -198,3 +198,31 @@ def test_has_more_pages_flags_possible_unread_pages():
     assert psf._has_more_pages(_FakeResponse([{}] * 100)) is True
     assert psf._has_more_pages(_FakeResponse([{}], link='<https://x?page=2>; rel="next"')) is True
     assert psf._has_more_pages(_FakeResponse([], broken=True)) is True
+
+
+def test_security_concern_withholds_approval_and_quotes_it():
+    event, reason = decide([], security_concern="Repo write protection can be bypassed")
+    assert event == "COMMENT"
+    assert "security concern reported" in reason
+    assert "Repo write protection can be bypassed" in reason
+    event, reason = decide([], iteration=2, no_new_code=True, security_concern="x")
+    assert event == "COMMENT" and "security concern" in reason
+
+
+def test_withheld_reason_names_the_failing_input():
+    assert "thread state could not be read" in decide([], trusted=False)[1]
+    assert "could not be parsed" in decide([], valid=False)[1]
+    assert "could not be parsed" in decide([], iteration=2, valid=False)[1]
+
+
+def test_withheld_reason_truncates_long_security_text():
+    reason = psf._withheld_reason(True, True, "a " * 400)
+    assert reason.endswith("…")
+    assert len(reason) < 400
+
+
+def test_security_reason_takes_precedence_and_is_added_to_comment_paths():
+    assert psf._withheld_reason(False, False, "x").startswith("security concern")
+    assert "security concern" in decide([MINOR], has_inline_comments=True, security_concern="x")[1]
+    assert "security concern" in decide([MINOR], iteration=2, has_inline_comments=True,
+                                        security_concern="x")[1]
