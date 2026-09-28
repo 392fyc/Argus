@@ -1237,12 +1237,32 @@ def _classify_finding_severity(issue_header: str) -> str:
     return "Minor"
 
 
+_SECURITY_EXCERPT_CHARS = 300
+
+
+def _withheld_reason(thread_state_trusted, findings_valid, security_concern):
+    """Explain precisely why approval is withheld (first failing input wins)."""
+    if security_concern:
+        text = " ".join(str(security_concern).split())
+        if len(text) > _SECURITY_EXCERPT_CHARS:
+            text = text[:_SECURITY_EXCERPT_CHARS].rstrip() + "…"
+        return f"security concern reported by the review — approval withheld: {text}"
+    if not thread_state_trusted:
+        return ("thread state could not be read reliably from GitHub "
+                "(failed request, GraphQL errors or unread pages) — approval withheld.")
+    if not findings_valid:
+        return ("review output was incomplete or could not be parsed into an "
+                "explicit no-issues result — approval withheld.")
+    return "approval withheld."
+
+
 def _decide_review_event(findings, unresolved_threads, iteration,
                          has_inline_comments=False,
                          no_new_code=False,
                          escalated_threads=None,
                          thread_state_trusted=False,
-                         findings_valid=False):
+                         findings_valid=False,
+                         security_concern=None):
     """
     Returns (event, reason):
       "REQUEST_CHANGES" — blocking issues found
@@ -1260,10 +1280,13 @@ def _decide_review_event(findings, unresolved_threads, iteration,
     thread_state_trusted: True only if the thread/iteration read fully
     succeeded. A degraded read can hide prior reviews and unresolved threads,
     so every APPROVE path requires a trusted read.
-    findings_valid: True only if the model output was parsed, its
-    key_issues_to_review had a recognized shape, and security_concerns
-    explicitly reported none. An empty findings list from a failed parse,
-    or one accompanied by a security concern, must not read as "no issues".
+    findings_valid: True only if the model output was parsed and its
+    key_issues_to_review had a recognized shape. An empty findings list from a
+    failed parse must not read as "no issues".
+    security_concern: the model's security_concerns text when the security
+    review is enabled and the model reported a concern; it withholds approval
+    and the reason quotes it. A missing or blank field is treated as invalid
+    output (findings_valid=False) instead.
     """
     escalated_threads = escalated_threads or []
     # PR-Agent may emit key_issues_to_review as a "No"/"none" string or null
@@ -1273,6 +1296,8 @@ def _decide_review_event(findings, unresolved_threads, iteration,
     findings = [f for f in findings if isinstance(f, dict)]
     critical_major = [f for f in findings
                       if _classify_finding_severity(f.get("issue_header", "")) in BLOCKING_SEVERITIES]
+    inputs_ok = thread_state_trusted and findings_valid and not security_concern
+    withheld = _withheld_reason(thread_state_trusted, findings_valid, security_concern)
 
     # Rule 1: Critical/Major findings always block (regardless of iteration)
     # But only on actual new code — re-analyzing unchanged code is noise.
@@ -1304,20 +1329,19 @@ def _decide_review_event(findings, unresolved_threads, iteration,
     # the findings before any approval.
     if iteration <= 1:
         if not findings and not has_inline_comments:
-            if thread_state_trusted and findings_valid:
+            if inputs_ok:
                 return ("APPROVE",
                         f"✅ Initial review — no findings. "
                         f"Iteration {iteration}/{MAX_ITERATIONS}.")
-            return ("COMMENT",
-                    "Initial review — thread state or review output could not be "
-                    "read reliably; approval withheld.")
+            return ("COMMENT", f"Initial review — {withheld}")
+        note = f" Also: {withheld}" if security_concern else ""
         return ("COMMENT",
                 "Initial review — no blocking issues. "
-                "Minor findings posted as inline threads.")
+                f"Minor findings posted as inline threads.{note}")
 
     # Rule 5: No new code + all threads resolved → APPROVE immediately
     # Threads were resolved via replies, no new commit to review.
-    if thread_state_trusted and findings_valid and no_new_code and not unresolved_threads:
+    if inputs_ok and no_new_code and not unresolved_threads:
         return ("APPROVE",
                 f"✅ All threads resolved, no new code to review. "
                 f"Iteration {iteration}/{MAX_ITERATIONS}.")
@@ -1330,14 +1354,13 @@ def _decide_review_event(findings, unresolved_threads, iteration,
         return ("COMMENT",
                 f"💬 {minor_count} new finding(s) posted. "
                 f"Approval deferred until next review. "
-                f"Iteration {iteration}/{MAX_ITERATIONS}.")
+                f"Iteration {iteration}/{MAX_ITERATIONS}."
+                + (f" Also: {withheld}" if security_concern else ""))
 
     # Rule 7: No new comments, no blocking issues, all threads resolved → APPROVE
     # (only when the thread read was trusted; otherwise stay a COMMENT).
-    if not (thread_state_trusted and findings_valid):
-        return ("COMMENT",
-                f"Thread state or review output could not be read reliably — approval withheld. "
-                f"Iteration {iteration}/{MAX_ITERATIONS}.")
+    if not inputs_ok:
+        return ("COMMENT", f"{withheld} Iteration {iteration}/{MAX_ITERATIONS}.")
     return ("APPROVE",
             f"✅ No issues found, all threads resolved. "
             f"Iteration {iteration}/{MAX_ITERATIONS}.")
@@ -1594,6 +1617,7 @@ def apply_patch():
             # Parse findings from prediction
             findings = []
             findings_valid = False
+            security_concern = None
             inline_comments = []
             diff_files = None
             try:
@@ -1612,8 +1636,17 @@ def apply_patch():
                         # A clean review also needs an explicit "no security
                         # concerns"; otherwise approval stays withheld.
                         if _security_review_required():
-                            findings_valid = findings_valid and _security_review_clear(
-                                data['review'].get('security_concerns', _MISSING))
+                            raw_security = data['review'].get('security_concerns', _MISSING)
+                            if not _security_review_clear(raw_security):
+                                text = ("" if raw_security is _MISSING or raw_security is None
+                                        else str(raw_security).strip())
+                                if text:
+                                    # The model reported an actual concern.
+                                    security_concern = text
+                                else:
+                                    # A missing or blank field is incomplete
+                                    # output, not a reported concern.
+                                    findings_valid = False
                         diff_files = self.git_provider.diff_files or self.git_provider.get_diff_files()
 
                         for issue in findings:
@@ -1759,7 +1792,8 @@ def apply_patch():
                 no_new_code=no_new_code,
                 escalated_threads=escalated_threads,
                 thread_state_trusted=thread_state_trusted,
-                findings_valid=findings_valid)
+                findings_valid=findings_valid,
+                security_concern=security_concern)
 
             # Collect config dotfiles pr-agent filtered out of diff_files
             # (e.g. .gitignore — its split('.')[-1] token is in
