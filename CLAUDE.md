@@ -9,7 +9,7 @@ Role definitions: `.claude/agents/*.md` (dev + acceptance — copied out of Merc
 
 ## Role positioning
 
-Argus reviews pull requests for Mercury and other 392fyc repos using PR-Agent (0.34) + Argus patches on `gpt-5.3-codex`. It runs as a Docker container on a QNAP NAS behind a Cloudflare tunnel (`argus.fyc-space.uk`). The GitHub App is `Argus-review`.
+Argus reviews pull requests for Mercury and other 392fyc repos using PR-Agent (0.38, `pragent/pr-agent` base image) + Argus patches on the model configured in `configuration.toml` (currently `responses/gpt-6-luna`). It runs as a Docker container on a QNAP NAS behind a Cloudflare tunnel (`argus.fyc-space.uk`). The GitHub App is `Argus-review`.
 
 > **Operator-only facts** (not verifiable from this repo alone — sourced from the Mercury operator's notes, subject to operator confirmation before acting):
 > - App ID: `3279157`
@@ -23,7 +23,7 @@ Argus reviews pull requests for Mercury and other 392fyc repos using PR-Agent (0
 ## Branching
 
 - **`master`** is the trunk and deploy branch. Feature PRs target `master`; merging a PR to `master` (a push) triggers `.github/workflows/deploy.yml`, which SSH-deploys to the NAS via the Cloudflare tunnel.
-- **Open a PR for every change** — Argus-review (this same bot) reviews it; merge to `master` after the review findings are dispositioned. Admin merge is used when the bot only COMMENTs (it casts no formal approval) and CI is green.
+- **Open a PR for every change** — Argus-review (this same bot) reviews it; merge to `master` after the review findings are dispositioned. The bot approves a clean review (a first pass with no findings, or a later pass with nothing blocking or unresolved); otherwise it COMMENTs or requests changes. Admin merge is used only when the bot has escalated to a human and CI is green.
 - **`develop` is dormant** (currently behind `master`); the historical `develop` → `master` two-branch flow is retired. Revive it only by explicit decision (e.g. `git push origin master:develop`).
 - Feature branches: `feat/<slug>`, `fix/<slug>`, `chore/<slug>`.
 
