@@ -230,6 +230,25 @@ _FOOTER_REINCLUDE_DOTFILES = frozenset({
 })
 
 
+def _runtime_engine_info():
+    """Return (pr-agent version, configured model) for the review banner.
+
+    Read at runtime so the banner cannot drift from the deployed engine and
+    configuration.toml; falls back to "unknown" outside the container.
+    """
+    try:
+        from importlib.metadata import version
+        engine_version = version("pr-agent")
+    except Exception:
+        engine_version = "unknown"
+    try:
+        from pr_agent.config_loader import get_settings
+        model_name = str(get_settings().config.model) or "unknown"
+    except Exception:
+        model_name = "unknown"
+    return engine_version, model_name
+
+
 def build_review_body_additions(findings: list, inline_count: int,
                                 diff_files=None, extra_filenames=None) -> str:
     """Build CodeRabbit-style additions to prepend/append to review body.
@@ -288,8 +307,9 @@ def build_review_body_additions(findings: list, inline_count: int,
     parts.append("<details>")
     parts.append("<summary>⚙️ Configuration</summary>")
     parts.append("")
-    parts.append("**Engine**: PR-Agent 0.34 + Argus patches")
-    parts.append("**Model**: gpt-5.3-codex")
+    engine_version, model_name = _runtime_engine_info()
+    parts.append(f"**Engine**: PR-Agent {engine_version} + Argus patches")
+    parts.append(f"**Model**: {model_name}")
     parts.append("**Mode**: CodeRabbit-compatible")
     parts.append("")
     parts.append("</details>")
@@ -1142,6 +1162,187 @@ def format_walkthrough_comment(data: dict, diagram: str = "") -> str:
 
 # ── Apply patches ─────────────────────────────────────────────────
 
+# Review-decision policy (module level so it can be unit tested).
+BLOCKING_SEVERITIES = {"Critical", "Major"}
+MAX_ITERATIONS = 10
+
+
+_MISSING = object()
+# Blank strings are excluded: a truncated block scalar parses to "".
+_NO_FINDINGS_STRINGS = frozenset({"no", "none", "false", "n/a"})
+
+
+def _normalize_findings(raw):
+    """Return (findings, valid) for PR-Agent's key_issues_to_review value.
+
+    valid is True only for an explicit "no issues" value (empty list, False,
+    or a "no"/"none" string) or a list whose entries are all dicts. A missing
+    or blank (null) key may come from truncated output and is not valid. A missing
+    key or any other shape is treated as unparsed so it can never approve.
+    """
+    if raw is _MISSING:
+        return [], False
+    if raw is False:
+        # YAML parses an unquoted "No"/"false" as the boolean False. A bare
+        # key (None) may be truncated output, so it is not an explicit "no".
+        return [], True
+    if isinstance(raw, str):
+        return [], raw.strip().lower() in _NO_FINDINGS_STRINGS
+    if isinstance(raw, list):
+        findings = [f for f in raw if isinstance(f, dict)]
+        return findings, len(findings) == len(raw)
+    return [], False
+
+
+def _has_more_pages(response, page_size=100):
+    """True if a GitHub list response may have unread pages."""
+    try:
+        if 'rel="next"' in (response.headers.get("Link") or ""):
+            return True
+        return len(response.json()) >= page_size
+    except Exception:
+        return True
+
+
+def _security_review_clear(raw):
+    """True only if PR-Agent's security_concerns explicitly reports none.
+
+    With require_security_review enabled the model answers "No" when there
+    are no concerns; a missing field or any explanatory text is not clear.
+    """
+    if raw is _MISSING:
+        return False
+    if raw is False:
+        return True
+    return isinstance(raw, str) and raw.strip().lower() in _NO_FINDINGS_STRINGS
+
+
+def _security_review_required():
+    """Whether the review prompt asked for security_concerns (default True)."""
+    try:
+        from pr_agent.config_loader import get_settings
+        return bool(get_settings().pr_reviewer.get("require_security_review", True))
+    except Exception:
+        return True
+
+
+def _classify_finding_severity(issue_header: str) -> str:
+    h = issue_header.lower()
+    if any(k in h for k in ("critical", "bug", "security")):
+        return "Critical"
+    if any(k in h for k in ("possible", "error", "major")):
+        return "Major"
+    if any(k in h for k in ("performance", "issue", "medium")):
+        return "Medium"
+    return "Minor"
+
+
+def _decide_review_event(findings, unresolved_threads, iteration,
+                         has_inline_comments=False,
+                         no_new_code=False,
+                         escalated_threads=None,
+                         thread_state_trusted=False,
+                         findings_valid=False):
+    """
+    Returns (event, reason):
+      "REQUEST_CHANGES" — blocking issues found
+      "APPROVE"         — all clear: a first review with no findings, or a
+                          later review with nothing blocking or unresolved
+      "COMMENT"         — non-blocking findings / escalation
+
+    has_inline_comments: True if this review will post new inline
+    comments. Approval is deferred when new comments are posted,
+    regardless of severity, because the author hasn't seen them yet.
+    no_new_code: True if HEAD == last review commit (no new push).
+    When set, new findings are noise and should not block approval.
+    escalated_threads: threads that hit MAX_REPLY_ROUNDS; not counted
+    as blocking (they are already flagged for human review).
+    thread_state_trusted: True only if the thread/iteration read fully
+    succeeded. A degraded read can hide prior reviews and unresolved threads,
+    so every APPROVE path requires a trusted read.
+    findings_valid: True only if the model output was parsed, its
+    key_issues_to_review had a recognized shape, and security_concerns
+    explicitly reported none. An empty findings list from a failed parse,
+    or one accompanied by a security concern, must not read as "no issues".
+    """
+    escalated_threads = escalated_threads or []
+    # PR-Agent may emit key_issues_to_review as a "No"/"none" string or null
+    # instead of an empty list; only dict entries are real findings.
+    if not isinstance(findings, list):
+        findings = []
+    findings = [f for f in findings if isinstance(f, dict)]
+    critical_major = [f for f in findings
+                      if _classify_finding_severity(f.get("issue_header", "")) in BLOCKING_SEVERITIES]
+
+    # Rule 1: Critical/Major findings always block (regardless of iteration)
+    # But only on actual new code — re-analyzing unchanged code is noise.
+    if critical_major and not no_new_code:
+        return ("REQUEST_CHANGES",
+                f"🔴 {len(critical_major)} critical/major issue(s) — changes requested.")
+
+    # Rule 2: Max iterations → COMMENT (escalate to human; do NOT REQUEST_CHANGES).
+    # This must fire before the unresolved-thread check so that a bot stuck in a
+    # disagree loop doesn't keep emitting REQUEST_CHANGES past the iteration cap.
+    if iteration >= MAX_ITERATIONS:
+        parts = []
+        if unresolved_threads:
+            parts.append(f"{len(unresolved_threads)} thread(s) unresolved")
+        if escalated_threads:
+            parts.append(f"{len(escalated_threads)} escalated to human")
+        detail = " (" + ", ".join(parts) + ")" if parts else ""
+        return ("COMMENT",
+                f"⚠️ Review iteration {iteration}/{MAX_ITERATIONS} reached{detail}. "
+                f"Escalating to human reviewer — no further bot blocking.")
+
+    # Rule 3: Unresolved threads from previous reviews (only before max iterations)
+    if unresolved_threads:
+        return ("REQUEST_CHANGES",
+                f"🔴 {len(unresolved_threads)} unresolved thread(s) from previous review.")
+
+    # Rule 4: First review → APPROVE only when it is fully clean (no findings
+    # at all and nothing posted inline); otherwise COMMENT so the author sees
+    # the findings before any approval.
+    if iteration <= 1:
+        if not findings and not has_inline_comments:
+            if thread_state_trusted and findings_valid:
+                return ("APPROVE",
+                        f"✅ Initial review — no findings. "
+                        f"Iteration {iteration}/{MAX_ITERATIONS}.")
+            return ("COMMENT",
+                    "Initial review — thread state or review output could not be "
+                    "read reliably; approval withheld.")
+        return ("COMMENT",
+                "Initial review — no blocking issues. "
+                "Minor findings posted as inline threads.")
+
+    # Rule 5: No new code + all threads resolved → APPROVE immediately
+    # Threads were resolved via replies, no new commit to review.
+    if thread_state_trusted and findings_valid and no_new_code and not unresolved_threads:
+        return ("APPROVE",
+                f"✅ All threads resolved, no new code to review. "
+                f"Iteration {iteration}/{MAX_ITERATIONS}.")
+
+    # Rule 6: New inline comments being posted → COMMENT (defer approval)
+    # Cannot APPROVE in the same API call that posts new comments,
+    # because the author hasn't had a chance to see/address them.
+    if has_inline_comments:
+        minor_count = len(findings) - len(critical_major)
+        return ("COMMENT",
+                f"💬 {minor_count} new finding(s) posted. "
+                f"Approval deferred until next review. "
+                f"Iteration {iteration}/{MAX_ITERATIONS}.")
+
+    # Rule 7: No new comments, no blocking issues, all threads resolved → APPROVE
+    # (only when the thread read was trusted; otherwise stay a COMMENT).
+    if not (thread_state_trusted and findings_valid):
+        return ("COMMENT",
+                f"Thread state or review output could not be read reliably — approval withheld. "
+                f"Iteration {iteration}/{MAX_ITERATIONS}.")
+    return ("APPROVE",
+            f"✅ No issues found, all threads resolved. "
+            f"Iteration {iteration}/{MAX_ITERATIONS}.")
+
+
 def apply_patch():
     """Monkey-patch PR-Agent for CodeRabbit-style output."""
 
@@ -1250,8 +1451,6 @@ def apply_patch():
         original_run = pr_reviewer.PRReviewer.run
 
         # Approval config
-        BLOCKING_SEVERITIES = {"Critical", "Major"}
-        MAX_ITERATIONS = 10
         BOT_LOGIN = "argus-review[bot]"
 
         # Doc PR config: suppress Minor findings after this many iterations
@@ -1271,18 +1470,11 @@ def apply_patch():
             )
             return doc_count / total >= 0.7
 
-        def _classify_finding_severity(issue_header: str) -> str:
-            h = issue_header.lower()
-            if any(k in h for k in ("critical", "bug", "security")):
-                return "Critical"
-            if any(k in h for k in ("possible", "error", "major")):
-                return "Major"
-            if any(k in h for k in ("performance", "issue", "medium")):
-                return "Medium"
-            return "Minor"
-
         def _get_thread_state(provider, pr_number):
             """Query unresolved Argus threads + past review count.
+            Returns (unresolved, past_review_count, escalated, trusted); trusted
+            is True only when every REST and GraphQL query succeeded, so a
+            degraded read never looks like a clean first review.
             Uses REST API for reviews (reliable) + GraphQL for thread resolution.
             REST: GET /repos/{owner}/{repo}/pulls/{number}/reviews
             GraphQL: reviewThreads.isResolved (REST doesn't expose this)
@@ -1293,14 +1485,14 @@ def apply_patch():
             try:
                 repo = provider.repo
                 if not repo:
-                    return [], 0, []
+                    return [], 0, [], False
                 full_name = repo.full_name if hasattr(repo, 'full_name') else str(repo)
                 owner, name = full_name.split("/", 1)
 
                 token = _get_github_token(provider)
                 if not token:
                     print("[Argus] No token — skipping thread check")
-                    return [], 0, []
+                    return [], 0, [], False
 
                 auth_h = {"Authorization": f"Bearer {token}",
                           "Accept": "application/vnd.github+json"}
@@ -1309,9 +1501,12 @@ def apply_patch():
                 # Check both review objects AND issue comments, because earlier
                 # reviews may have fallen back to issue comments due to API errors.
                 argus_review_count = 0
+                trusted = True
                 # Source 1: review objects
-                r = _req.get(f"https://api.github.com/repos/{full_name}/pulls/{pr_number}/reviews",
+                r = _req.get(f"https://api.github.com/repos/{full_name}/pulls/{pr_number}/reviews?per_page=100",
                              headers=auth_h, timeout=15)
+                if r.status_code != 200 or _has_more_pages(r):
+                    trusted = False
                 if r.status_code == 200:
                     argus_review_count += sum(
                         1 for rv in r.json()
@@ -1320,6 +1515,8 @@ def apply_patch():
                 # Source 2: issue comments (fallback path)
                 r2 = _req.get(f"https://api.github.com/repos/{full_name}/issues/{pr_number}/comments?per_page=100",
                               headers=auth_h, timeout=15)
+                if r2.status_code != 200 or _has_more_pages(r2):
+                    trusted = False
                 if r2.status_code == 200:
                     argus_review_count += sum(
                         1 for c in r2.json()
@@ -1330,9 +1527,20 @@ def apply_patch():
                 # Fetch up to 10 comments to reliably detect judgment round count.
                 argus_unresolved = []
                 argus_escalated = []
-                query = '{repository(owner:"%s",name:"%s"){pullRequest(number:%d){reviewThreads(first:100){nodes{isResolved isOutdated comments(first:10){nodes{author{login} body}}}}}}}' % (owner, name, pr_number)
+                query = '{repository(owner:"%s",name:"%s"){pullRequest(number:%d){reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved isOutdated comments(first:10){nodes{author{login} body}}}}}}}' % (owner, name, pr_number)
                 g = _req.post("https://api.github.com/graphql",
                               json={"query": query}, headers=auth_h, timeout=15)
+                g_json = g.json() if g.status_code == 200 else {}
+                if not ("data" in g_json and g_json.get("data")) or g_json.get("errors"):
+                    trusted = False
+                else:
+                    try:
+                        page_info = (g_json["data"]["repository"]["pullRequest"]
+                                     ["reviewThreads"]["pageInfo"])
+                        if page_info.get("hasNextPage"):
+                            trusted = False
+                    except (KeyError, TypeError):
+                        trusted = False
                 if g.status_code == 200 and "data" in g.json():
                     threads = g.json()["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
                     for t in threads:
@@ -1354,86 +1562,12 @@ def apply_patch():
                             argus_unresolved.append(t)
 
                 print(f"[Argus] Thread state: {len(argus_unresolved)} unresolved, "
-                      f"{len(argus_escalated)} escalated, {argus_review_count} past reviews")
-                return argus_unresolved, argus_review_count, argus_escalated
+                      f"{len(argus_escalated)} escalated, {argus_review_count} past reviews"
+                      f"{'' if trusted else ' (degraded read)'}")
+                return argus_unresolved, argus_review_count, argus_escalated, trusted
             except Exception as e:
                 print(f"[Argus] Thread check failed: {e}")
-                return [], 0, []
-
-        def _decide_review_event(findings, unresolved_threads, iteration,
-                                 has_inline_comments=False,
-                                 no_new_code=False,
-                                 escalated_threads=None):
-            """
-            Returns (event, reason):
-              "REQUEST_CHANGES" — blocking issues found
-              "APPROVE"         — all clear after at least 2 iterations
-              "COMMENT"         — non-blocking / first review / escalation
-
-            has_inline_comments: True if this review will post new inline
-            comments. Approval is deferred when new comments are posted,
-            regardless of severity, because the author hasn't seen them yet.
-            no_new_code: True if HEAD == last review commit (no new push).
-            When set, new findings are noise and should not block approval.
-            escalated_threads: threads that hit MAX_REPLY_ROUNDS; not counted
-            as blocking (they are already flagged for human review).
-            """
-            escalated_threads = escalated_threads or []
-            critical_major = [f for f in findings
-                              if _classify_finding_severity(f.get("issue_header", "")) in BLOCKING_SEVERITIES]
-
-            # Rule 1: Critical/Major findings always block (regardless of iteration)
-            # But only on actual new code — re-analyzing unchanged code is noise.
-            if critical_major and not no_new_code:
-                return ("REQUEST_CHANGES",
-                        f"🔴 {len(critical_major)} critical/major issue(s) — changes requested.")
-
-            # Rule 2: Max iterations → COMMENT (escalate to human; do NOT REQUEST_CHANGES).
-            # This must fire before the unresolved-thread check so that a bot stuck in a
-            # disagree loop doesn't keep emitting REQUEST_CHANGES past the iteration cap.
-            if iteration >= MAX_ITERATIONS:
-                parts = []
-                if unresolved_threads:
-                    parts.append(f"{len(unresolved_threads)} thread(s) unresolved")
-                if escalated_threads:
-                    parts.append(f"{len(escalated_threads)} escalated to human")
-                detail = " (" + ", ".join(parts) + ")" if parts else ""
-                return ("COMMENT",
-                        f"⚠️ Review iteration {iteration}/{MAX_ITERATIONS} reached{detail}. "
-                        f"Escalating to human reviewer — no further bot blocking.")
-
-            # Rule 3: Unresolved threads from previous reviews (only before max iterations)
-            if unresolved_threads:
-                return ("REQUEST_CHANGES",
-                        f"🔴 {len(unresolved_threads)} unresolved thread(s) from previous review.")
-
-            # Rule 4: First review → COMMENT (never approve on first pass)
-            if iteration <= 1:
-                return ("COMMENT",
-                        "Initial review — no blocking issues. "
-                        "Minor findings posted as inline threads.")
-
-            # Rule 5: No new code + all threads resolved → APPROVE immediately
-            # Threads were resolved via replies, no new commit to review.
-            if no_new_code and not unresolved_threads:
-                return ("APPROVE",
-                        f"✅ All threads resolved, no new code to review. "
-                        f"Iteration {iteration}/{MAX_ITERATIONS}.")
-
-            # Rule 6: New inline comments being posted → COMMENT (defer approval)
-            # Cannot APPROVE in the same API call that posts new comments,
-            # because the author hasn't had a chance to see/address them.
-            if has_inline_comments:
-                minor_count = len(findings) - len(critical_major)
-                return ("COMMENT",
-                        f"💬 {minor_count} new finding(s) posted. "
-                        f"Approval deferred until next review. "
-                        f"Iteration {iteration}/{MAX_ITERATIONS}.")
-
-            # Rule 7: No new comments, no blocking issues, all threads resolved → APPROVE
-            return ("APPROVE",
-                    f"✅ No issues found, all threads resolved. "
-                    f"Iteration {iteration}/{MAX_ITERATIONS}.")
+                return [], 0, [], False
 
         async def patched_run(self):
             """Run /review with conditional approval + auto-resolve + format enhancements."""
@@ -1459,6 +1593,7 @@ def apply_patch():
 
             # Parse findings from prediction
             findings = []
+            findings_valid = False
             inline_comments = []
             diff_files = None
             try:
@@ -1472,7 +1607,13 @@ def apply_patch():
                                      first_key="review", last_key="key_issues_to_review")
 
                     if data and 'review' in data:
-                        findings = data['review'].get('key_issues_to_review', [])
+                        raw_findings = data['review'].get('key_issues_to_review', _MISSING)
+                        findings, findings_valid = _normalize_findings(raw_findings)
+                        # A clean review also needs an explicit "no security
+                        # concerns"; otherwise approval stays withheld.
+                        if _security_review_required():
+                            findings_valid = findings_valid and _security_review_clear(
+                                data['review'].get('security_concerns', _MISSING))
                         diff_files = self.git_provider.diff_files or self.git_provider.get_diff_files()
 
                         for issue in findings:
@@ -1498,7 +1639,7 @@ def apply_patch():
                 print(f"[Argus] Failed to parse key_issues: {e}")
 
             # Get thread state + iteration count (after auto-resolve)
-            unresolved_threads, past_reviews, escalated_threads = _get_thread_state(
+            unresolved_threads, past_reviews, escalated_threads, thread_state_trusted = _get_thread_state(
                 self.git_provider, pr_number)
             iteration = past_reviews + 1
 
@@ -1616,7 +1757,9 @@ def apply_patch():
                 findings, unresolved_threads, iteration,
                 has_inline_comments=bool(inline_comments),
                 no_new_code=no_new_code,
-                escalated_threads=escalated_threads)
+                escalated_threads=escalated_threads,
+                thread_state_trusted=thread_state_trusted,
+                findings_valid=findings_valid)
 
             # Collect config dotfiles pr-agent filtered out of diff_files
             # (e.g. .gitignore — its split('.')[-1] token is in
