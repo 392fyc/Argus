@@ -14,7 +14,7 @@ Argus gives advice. It never blocks a merge and never approves one: every review
 | **On request only** | Argus reviews only when someone comments `@argus-review review` (or `/review`); opening a PR or pushing to it starts nothing (`handle_pr_actions = []`, `handle_push_trigger = false`), because every run costs money. A reviewed repository could turn push reviews back on in its own `.pr_agent.toml` (`[github_app] handle_push_trigger = true`, read through `use_repo_settings_file`); none of the five repositories has one. |
 | **Knows the project** | A repository can describe itself in `.argus/review.toml` on the PR's target branch: what to focus on, which architecture/rule documents to read, which paths to ignore. See [Project modules](#project-modules-argusreviewtoml). |
 | **Advice only** | Reviews are always `COMMENT`. Findings are suggestions; the footer says "advice only" (仅供参考), and a `CHANGES_REQUESTED` review left by an earlier Argus version is dismissed at the start of the next review. There is no `REQUEST_CHANGES` and no `APPROVE` anywhere in the code, and PR-Agent's own auto-approve is disabled. |
-| **No repeats** | A finding that matches an existing Argus thread on the same file is not posted again when a person resolved that thread, a person replied in it, Argus judged a reply in it (accepted, "Follow-up" or escalated), or it is still open. A thread that Argus itself closed (its fix-detection and outdated rules do that whenever lines change) does not count: that only says the lines were edited, so a problem that is still there can be reported again. |
+| **No repeats** | A finding that matches an existing Argus thread on the same file is not posted again when a person resolved that thread, a person replied in it, Argus judged a reply in it (accepted, "Follow-up" or escalated), or it is still open. A thread that Argus itself closed (its fix-detection and outdated rules do that whenever lines change) does not count: that only says the lines were edited, so a problem that is still there can be reported again. A finding is a repeat only when it says the same thing (same file and shared distinctive words); a different problem next to an old thread is posted. A review a person asks for on an unchanged head still reports what it found; only an automatic run on an unchanged head is cut short (Argus #58). |
 | **Threshold** | Only findings of medium severity or higher are posted (`[argus_review] min_severity`, default `Medium`). Style, naming, typos and wording are dropped. A finding whose severity cannot be recognised counts as Medium and is kept, never silently dropped. |
 | **Spend cap** | Monthly budget of 10 USD, resetting on the 15th (Asia/Tokyo). When it is used up Argus stops, says so once, and resumes at the next reset. See [Budget](#budget). |
 
@@ -42,7 +42,7 @@ GitHub PR event
 Argus: PR-Agent 0.38.0 + patches (Docker, QNAP NAS)
     |-- budget check (argus_budget.py): stop if this month's cap is used up
     |-- read .argus/review.toml + context files from the PR's target branch (argus_context.py)
-    |-- fetch the whole PR diff (30 lines of context before each change, 10 after)
+    |-- fetch the whole PR diff (30 lines of context before each change, 10 after) — `.gitignore` included, which PR-Agent's default extension filter drops (Argus #58)
     |-- gpt-6.1-sol through OpenAI Responses, reasoning effort "high"
     |-- drop findings: skip_paths, below the severity threshold, repeats of existing threads
     |-- submit one GitHub review (COMMENT) with inline suggestions
