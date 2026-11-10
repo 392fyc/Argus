@@ -923,3 +923,22 @@ def test_placeholder_removal_reports_a_failed_listing(monkeypatch):
                         SimpleNamespace(_get_app_installation_token=lambda: "t"))
     with pytest.raises(RuntimeError):
         ab._remove_temporary_comments("a", "b", 7, "review")
+
+
+def test_aliases_clean_the_same_placeholder_and_get_a_working_hint(monkeypatch):
+    import sys as _sys
+    bot = {"type": "Bot", "login": "argus-review[bot]"}
+    deleted = []
+    monkeypatch.setitem(_sys.modules, "requests", SimpleNamespace(
+        get=lambda *a, **k: FakeResponse(200, [{"id": 1, "user": bot, "body": "Preparing review..."}]),
+        delete=lambda url, **k: deleted.append(url) or FakeResponse(204)))
+    monkeypatch.setitem(_sys.modules, "patch_suggestion_format",
+                        SimpleNamespace(_get_app_installation_token=lambda: "t"))
+    assert ab._remove_temporary_comments("a", "b", 7, "review_pr") == 1
+    body = ab.failure_comment("review_pr", LiteTimeout("t"))
+    assert "`/review_pr`" in body and "`@argus-review review`" in body
+
+
+def test_commands_without_a_mention_verb_get_a_slash_hint():
+    body = ab.failure_comment("answer", ConnectionError("x"))
+    assert "@argus-review" not in body and "重新发送 `/answer`" in body

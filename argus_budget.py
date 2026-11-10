@@ -802,10 +802,16 @@ def failure_comment(command, error):
         reason = f"模型调用超时（超过 {limit} 秒）" if limit else "模型调用超时"
     else:
         reason = f"模型调用失败（{type(error).__name__}）"
+    command = command or "review"
+    canonical = _ALIASES.get(command, command)
+    if canonical in _PLACEHOLDERS:      # the verbs an @mention can start
+        hint = f"需要时评论 `@argus-review {canonical}` 重新运行。"
+    else:
+        hint = f"需要时重新发送 `/{command}`。"
     return (
-        f"⚠️ **Argus 未完成 `/{command or 'review'}`**\n\n"
+        f"⚠️ **Argus 未完成 `/{command}`**\n\n"
         f"原因：{reason}。Argus 没有重试。\n\n"
-        f"需要时评论 `@argus-review {command or 'review'}` 重新运行。"
+        + hint
     )
 
 
@@ -816,6 +822,14 @@ _PLACEHOLDERS = {
     "improve": "Preparing suggestions...",
 }
 
+# PR-Agent 0.38.0 command aliases that run the same tool (pr_agent/agent/pr_agent.py).
+_ALIASES = {
+    "review_pr": "review",
+    "auto_review": "review",
+    "describe_pr": "describe",
+    "improve_code": "improve",
+}
+
 
 def _remove_temporary_comments(owner, repo, number, command="review"):
     """Delete Argus's own placeholder for ``command`` left by a failed run.
@@ -823,7 +837,7 @@ def _remove_temporary_comments(owner, repo, number, command="review"):
     Only the exact placeholder of that command is removed, so a placeholder of
     another command still running on the same PR stays.
     """
-    placeholder = _PLACEHOLDERS.get(command)
+    placeholder = _PLACEHOLDERS.get(_ALIASES.get(command, command))
     if not placeholder:
         return 0
     import requests
