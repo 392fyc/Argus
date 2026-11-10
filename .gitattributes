@@ -1,0 +1,10 @@
+# Shell scripts must stay LF so the shebang runs even with core.autocrlf=true.
+*.sh text eol=lf
+
+# Mercury-installed files stay byte-identical to the lock after a Windows checkout,
+# so `python tools/mercury.py check` sees them in sync (Argus #53).
+/.mercury/** text eol=lf
+/.claude/agents/mercury-*.md text eol=lf
+/.claude/skills/mercury-*/** text eol=lf
+/.agents/skills/mercury-*/** text eol=lf
+/.codex/** text eol=lf

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "name": "core",
+  "skills": {
+    "image-api": {
+      "hosts": [
+        "codex",
+        "claude"
+      ]
+    },
+    "test-file-delivery": {
+      "hosts": [
+        "codex",
+        "claude"
+      ]
+    },
+    "web-research": {
+      "hosts": [
+        "codex"
+      ]
+    }
+  }
+}

@@ -1,3 +1,16 @@
+<!-- MERCURY:BEGIN managed by tools/mercury.py from the packs in .mercury/config.json; edits here stop the installer, change the pack and run apply -->
+@AGENTS.md
+
+## Claude Code with Mercury
+
+The AGENTS.md above holds the shared project rules, including the Mercury-managed section. Its assignments of the Codex host, Codex tools and Codex models apply to Codex only; do not infer Claude Code tool, permission or model capabilities from them.
+
+- Mercury installs the roles `mercury-dev` and `mercury-research` on Sonnet (alias `sonnet`), and `mercury-reviewer`, `mercury-acceptance` and `mercury-design` on Opus (alias `opus`), in `.claude/agents/`. They set no `effort`; the default applies.
+- Read-only roles disable Edit, Write and NotebookEdit through the native `disallowedTools` and run the write guard described in AGENTS.md. Neither is operating-system isolation; Bash remains subject to the current host permissions. Role descriptions are behavioral guidance and grant no extra permissions.
+- Without workspace trust, project agent frontmatter hooks do not run, so the guard is inactive; sessions started with `-p` are never trusted. Accept the trust dialog for the folder before relying on the guard.
+- When the parent session runs in bypassPermissions, acceptEdits or auto mode, a subagent's `permissionMode` is ignored, so `disallowedTools` plus the guard are what enforce read-only. A user-level `PreToolUse` hook that keys on the agent type in the hook payload can back the guard up where project hooks do not run.
+<!-- MERCURY:END -->
+
 # Argus — Claude Code
 
 ## Identity
@@ -5,7 +18,7 @@
 Argus is Mercury's self-hosted PR review bot. This CLAUDE.md governs Claude Code sessions operating on **this repo** (the Argus codebase), not Mercury itself.
 
 Agent: Claude Code
-Role definitions: `.claude/agents/*.md` (dev + acceptance — copied out of Mercury Phase 1)
+Role definitions: `.claude/agents/*.md` — Argus's own `dev` and `acceptance`, plus the `mercury-*` roles Mercury installs (see `.mercury/packs/core/docs/mercury-harness-ownership.md`)
 
 ## Role positioning
 
@@ -24,8 +37,9 @@ Argus reviews pull requests for Mercury and other 392fyc repos using PR-Agent (0
 
 - **`master`** is the trunk and deploy branch. Feature PRs target `master`; merging a PR to `master` (a push) triggers `.github/workflows/deploy.yml`, which SSH-deploys to the NAS via the Cloudflare tunnel.
 - **Open a PR for every change** — Argus-review (this same bot) reviews it; merge to `master` after the review findings are dispositioned. The bot only gives advice: its review is always a COMMENT and never blocks or approves a merge, so the merge decision rests with the human reviewer and CI.
-- **`develop` is dormant** (currently behind `master`); the historical `develop` → `master` two-branch flow is retired. Revive it only by explicit decision (e.g. `git push origin master:develop`).
-- Feature branches: `feat/<slug>`, `fix/<slug>`, `chore/<slug>`.
+- **`develop` is dormant** (currently behind `master`); the historical `develop` → `master` two-branch flow is retired. Revive it only by the user's explicit decision, carried out by the user; agents cannot push to it.
+- Feature branches: `<type>/<purpose>[-<lane>]-<agent>`, for example `fix/review-timeout-claude`; the agent and the lane are suffixes, never prefixes. `master`, `main` and `develop` are protected.
+- **Git writes go through Mercury's git-safe pack** (Argus #53): `powershell -ExecutionPolicy Bypass -File .mercury/packs/git-safe/scripts/git-safe.ps1 add <files>` (explicit files only), `commit -Message "<message>"` and `push -u origin <branch>`; before `commit`, stage, inspect the staged diff, finish review, then run `.mercury/packs/git-safe/scripts/guard.ps1 mark-review`. Call the copy inside the task worktree you are working in. Raw `git add/commit/push/merge` are not this repository's route.
 
 ## MUST
 
@@ -53,4 +67,4 @@ When a Mercury-driven session works on an Argus Issue, it uses:
 - `/pr-flow` — PR lifecycle with Argus fix-detection resolve (`.claude/skills/pr-flow/SKILL.md`)
 - `/dual-verify` — pre-commit gate (`.claude/skills/dual-verify/SKILL.md`)
 
-No Mercury-specific skills (like `gh-project-flow`) live in this repo — they are Mercury self-development only.
+Mercury installs its shared `mercury-*` skills here (`.claude/skills/mercury-*`, `.agents/skills/mercury-*`); Mercury's self-development skills (like `gh-project-flow`) do not live in this repo.
