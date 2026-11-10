@@ -40,11 +40,7 @@ PR_URL=<url>
 OWNER=$(gh repo view --json owner --jq '.owner.login')
 REPO_NAME=$(gh repo view --json name --jq '.name')
 BASE_BRANCH=$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name')
-# Mercury convention override: if a "develop" branch exists, prefer it over the default branch
-# so feature PRs land on develop first and the default branch stays deploy-clean.
-if gh api "repos/${OWNER}/${REPO_NAME}/branches/develop" --silent 2>/dev/null; then
-  BASE_BRANCH=develop
-fi
+# Argus PRs target the default branch (master); the dormant develop branch is never a base.
 ITERATION=0
 MAX_ITERATIONS=5
 ```
@@ -55,7 +51,8 @@ MAX_ITERATIONS=5
 
 ```bash
 BRANCH=$(git branch --show-current)
-git push -u origin "$BRANCH"
+# Git writes go through Mercury's git-safe pack (see CLAUDE.md, Branching).
+powershell -ExecutionPolicy Bypass -File .mercury/packs/git-safe/scripts/git-safe.ps1 push -u origin "$BRANCH"
 
 # Assignee: prefer the authenticated user so this works in any repo, not just 392fyc's.
 # Fall back to @me if the API call fails.
@@ -198,9 +195,12 @@ Argus will LLM-classify the reply:
 ### Step 5a: Commit and push
 
 ```bash
-git add <changed-files>
-git commit -m "fix: address review feedback — <summary> (#issue)"
-git push
+GS=.mercury/packs/git-safe/scripts
+powershell -ExecutionPolicy Bypass -File $GS/git-safe.ps1 add <changed-files>
+git diff --cached          # inspect what is staged; run /dual-verify and act on its result
+powershell -ExecutionPolicy Bypass -File $GS/guard.ps1 mark-review
+powershell -ExecutionPolicy Bypass -File $GS/git-safe.ps1 commit -Message "fix: address review feedback — <summary> (#issue)"
+powershell -ExecutionPolicy Bypass -File $GS/git-safe.ps1 push origin "$(git branch --show-current)"
 ```
 
 ### Step 5b: Look at the new review (once)
@@ -284,8 +284,7 @@ if [ "$WT_FAIL" -eq 0 ]; then
 fi
 
 # Switch off branch (must happen before branch deletion).
-# Reuse BASE_BRANCH computed at the start of the skill — do NOT hardcode "develop",
-# because repos without a develop branch (master-only) would fail here.
+# Reuse BASE_BRANCH computed at the start of the skill (the default branch, master).
 if [ "$(git rev-parse --abbrev-ref HEAD)" = "$BRANCH" ]; then
   if ! git switch "$BASE_BRANCH" 2>/dev/null && ! git checkout "$BASE_BRANCH" 2>/dev/null; then
     echo "WARNING: failed to switch off branch $BRANCH to $BASE_BRANCH — skipping cleanup"

@@ -19,7 +19,7 @@ Read task description, implement within allowed scope, commit code, report compl
 - Write/modify files within specified scope
 - Run tests relevant to the task
 - Fill implementation receipt (summary, changed files, evidence, risks)
-- `git add <specific-files>`, `git commit`, `git push` on current branch
+- Git writes through Mercury's git-safe pack on the current branch (see CLAUDE.md, Branching): `.mercury/packs/git-safe/scripts/git-safe.ps1 add <specific-files>`, then `.mercury/packs/git-safe/scripts/guard.ps1 mark-review` once the staged diff has been reviewed, then `git-safe.ps1 commit -Message "<message>"` and `git-safe.ps1 push origin <branch>`
 - `git diff`, `git status`, `git log` (read-only)
 - Create Issues when discovering bugs (report only — do not self-fix)
 
@@ -44,7 +44,7 @@ Argus deploys to a production NAS via GitHub Actions (`deploy.yml` triggers on p
 - **NEVER touch** `configuration.toml` without the Issue body calling out pr-agent config changes as a goal — this file controls pr-agent behavior in production
 - **NEVER commit** secrets, `.env` files, or any file containing `GITHUB_APP_PRIVATE_KEY` / `WEBHOOK_SECRET` / `OPENAI_API_KEY`
 - **NEVER modify** the GitHub App Installation ID, App ID, or webhook URL
-- Deploy-affecting changes MUST go to develop first (never directly to master) — Argus's `deploy.yml` triggers on master push, and develop isolates WIP from production
+- Deploy-affecting changes reach master only through a PR that a human reviewer confirms before merging — Argus's `deploy.yml` deploys on every push to master; `develop` is dormant and never a target
 
 ## Conventions
 
