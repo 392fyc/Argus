@@ -853,11 +853,15 @@ def _remove_temporary_comments(owner, repo, number, command="review", started_at
     if not token:
         raise RuntimeError("no GitHub token to remove the placeholder")
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-    # 5 seconds of slack for clock skew between this host and GitHub. Too little
-    # skips this run's own placeholder; too much lets in a run that started
-    # just before this one.
-    floor = (started_at - timedelta(seconds=5)) if started_at else None
-    since = (floor or datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Candidates are placeholders created at or after this run started: one posted
+    # earlier belongs to a run that started before this one and is never removed.
+    # The listing reaches 5 seconds further back only so that GitHub's `since`
+    # (by update time, second precision) cannot cut off a candidate. If this host's
+    # clock runs ahead of GitHub's, this run's own placeholder can look older than
+    # the start and stay; removing another run's placeholder is the worse mistake.
+    floor = started_at
+    since = ((started_at - timedelta(seconds=5)) if started_at
+             else datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
     base = f"https://api.github.com/repos/{owner}/{repo}/issues"
     r = requests.get(f"{base}/{number}/comments", params={"since": since, "per_page": 100},
                      headers=headers, timeout=15)

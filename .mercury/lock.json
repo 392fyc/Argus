@@ -22,7 +22,7 @@
     ".mercury/packs/core/claude.md": "a41db75ae5f575cf43e7f98e25b7bd9eb3488a248005bf9d78895e91476de95c",
     ".mercury/packs/core/docs/mercury-harness-ownership.md": "fda876a559a41118bd662cfbbab525a51352b422ff5b7b2afed6ade317542226",
     ".mercury/packs/core/docs/mercury-task-contract.md": "dd26def2fcaf6106d4beba92a18ca0aa368faf7cdfa2cda863f759e385fdb8e1",
-    ".mercury/packs/core/hooks/readonly_guard.py": "463953aabbb7e630ce0a55f34ff058d4e3bbcb7c39963702a9e1bfba3cbfd603",
+    ".mercury/packs/core/hooks/readonly_guard.py": "54baec615b515bd5277565492dfaaab72d3cb2d94c5fb0af10c01601f8eaab0f",
     ".mercury/packs/core/hooks/readonly_guard.sh": "f7823f1ea505f3d7c08847a72d00249b45dd476b426fc8e3adffbd9dc5cde1b3",
     ".mercury/packs/core/hooks/wait_guard.py": "dd2460862ea736f8ad1969e076a916b7b8de8cbae8546d1f9a0587526063b675",
     ".mercury/packs/core/hooks/wait_guard.sh": "5fd3b2ffb6b5ee053f75b6ba0636f353e098f9467989c07daf0628138a2788c5",
@@ -40,18 +40,19 @@
     ".mercury/packs/core/skills/test-file-delivery/references/transfer.md": "58ecc6f9a47805686ee5f5533d3364cb6c4433662a80b767fe9cb06a9816e00c",
     ".mercury/packs/core/skills/test-file-delivery/scripts/transfer.py": "b88eac7ee15bc3d7152850d0eafff01235ca9943fd79fbce32d8061ac4398178",
     ".mercury/packs/core/skills/web-research/SKILL.md": "21cf0851379c5eb18445f39d0598bea1fedadbab461d7c9a196cf127fd3efd38",
-    ".mercury/packs/git-safe/agents.md": "554b76a3682e935542aab3b86bd9d52b597505de53ae5690d1c93bec780513c3",
+    ".mercury/packs/git-safe/agents.md": "56cc5e309aeb10e3f0c2d756e0e082e64b045e9b2135e3748a68475b7b0aca97",
+    ".mercury/packs/git-safe/docs/pr-procedure.md": "3cceb232200f2112986c4246e94796e281f3006803f08234b617473fbdffebc9",
     ".mercury/packs/git-safe/pack.json": "4ff3e788fde0727baa7d6f09d9286ac7ebe18ff5839313be35c5c1ef60108f11",
-    ".mercury/packs/git-safe/scripts/git-safe.ps1": "336f7c10d2138f732ca1e62ce510afe4cbedbeed712471a6fe8bf6859bb2261e",
-    ".mercury/packs/git-safe/scripts/guard.ps1": "e703abb812408d6400e726a7cbdf8935d2c2026056daecf4ee87c914bafd9d76"
+    ".mercury/packs/git-safe/scripts/git-safe.ps1": "e02b03f10ef0270d4258e9f5646673896b8d6aa493e2444b657d844d587d65b5",
+    ".mercury/packs/git-safe/scripts/guard.ps1": "15ba2b79b2a744d5275dacd0b15d430558cf9d88456f9d24343b154fc049e5f5"
   },
   "mercury_json_sha256": "03e73b8e2f043108012eb3ce864710d9dc0d3f370103b86952f42bbe367ddc99",
   "schema_version": 1,
   "sections": {
-    "AGENTS.md": "134465a2845cc8465461ca30fad309b0a0b86bf11e8d129f437c0909d1237e93",
+    "AGENTS.md": "0002940e18666002b27f1411e4b4fac115c0b00dea700b62cdfd8d5bfe777afd",
     "CLAUDE.md": "b4d4b612c77319b4538ee98217cfe3081c059f349baac9d3965cfedae75a0c59"
   },
-  "source": "mercury@d962f5742bf2d32958dfa22e157fbd078b8c7422",
-  "source_commit": "d962f5742bf2d32958dfa22e157fbd078b8c7422",
+  "source": "mercury@43108d18e2e4ab8fdb655b147ff26e43eeb5bf9c",
+  "source_commit": "43108d18e2e4ab8fdb655b147ff26e43eeb5bf9c",
   "source_repo": "392fyc/Mercury"
 }

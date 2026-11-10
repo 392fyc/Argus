@@ -902,6 +902,7 @@ def test_placeholder_removal_deletes_only_this_runs_own_placeholder(monkeypatch)
         {"id": 5, "user": bot, "body": "Preparing review... and a real review", "created_at": at(0, 1)},
         {"id": 6, "user": bot, "body": "Preparing review...", "created_at": at(3)},     # a later run's
         {"id": 7, "user": bot, "body": "Preparing review...", "created_at": "2026-11-10T04:50:00Z"},  # earlier run
+        {"id": 8, "user": bot, "body": "Preparing review...", "created_at": "2026-11-10T04:59:58Z"},  # run started 2 s earlier
     ]
     deleted = []
     seen = {}
