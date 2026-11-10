@@ -1,9 +1,9 @@
 ---
 name: pr-flow
 description: |
-  Automate the full PR lifecycle with the Argus review bot: create PR, poll for review, read findings, fix issues, push and wait for Argus fix-detection resolve + incremental review, merge after approval. Use this skill when the user says "PR", "pull request", "create PR", "merge PR", "提PR", "合并", "PR流程", "开PR", "check PR status", "review comments", "标准PR流程". Use this skill after dev work reaches implementation-complete and the branch is pushed. Works in any GitHub repo that has Argus review bot wired up.
+  Automate the PR lifecycle with the Argus review bot, which only gives advice: create PR, read Argus's suggestions, fix or answer each one, push, and merge under the repository's current merge rules (Argus never approves and never blocks). Use this skill when the user says "PR", "pull request", "create PR", "merge PR", "提PR", "合并", "PR流程", "开PR", "check PR status", "review comments", "标准PR流程". Use this skill after dev work reaches implementation-complete and the branch is pushed. Works in any GitHub repo that has Argus review bot wired up.
 user-invocable: true
-allowed-tools: Bash, Read, Grep, Glob, Edit, Write, WebSearch, WebFetch, Agent, TodoWrite, CronCreate, CronDelete
+allowed-tools: Bash, Read, Grep, Glob, Edit, Write, WebSearch, WebFetch, Agent, TodoWrite
 ---
 
 # PR Flow — Argus-Compatible Sequential Protocol
@@ -14,19 +14,22 @@ Every phase has a **GATE** that MUST pass before proceeding. Do NOT skip gates.
 
 Understand these Argus capabilities before executing:
 
-- **Fix-detection resolve (B-1)**: Argus compares new commit diff against open threads by file+line. If code at the thread location changed, Argus auto-resolves the thread.
-- **New findings block APPROVE (A)**: If the current review iteration produces ANY new findings, Argus returns COMMENT, not APPROVE. APPROVE only happens when: zero new findings AND all threads resolved.
-- **Reply-aware resolution (C)**: When a thread has a human/agent reply, Argus uses LLM to classify: ACCEPT (resolve + ack), REJECT (keep open + follow-up), ESCALATE (mark for human). Max 3 reply rounds per thread.
+- **Advice only**: every Argus review is a GitHub COMMENT. Argus never requests changes and never approves, so it neither blocks nor unblocks a merge. There is no APPROVED state to wait for.
+- **Whole-PR review**: every review, including the one triggered by a push, reads the whole PR diff, not just the newest commit. A new push produces a fresh review of the whole PR.
+- **Fewer, firmer findings**: only medium-or-higher findings are posted, and a finding that repeats an existing thread (resolved by a person, answered, or still open) is not posted again.
+- **Fix-detection resolve**: Argus compares a new commit against open threads by file+line and resolves threads whose lines changed. This says the lines were edited, not that the problem is fixed; a still-unfixed problem may come back as a new finding.
+- **Reply-aware resolution**: when a thread has a human/agent reply, Argus uses an LLM to classify it: ACCEPT (resolve + ack), REJECT (keep open + follow-up), ESCALATE (mark for human). Max 3 reply rounds per thread.
+- **Spend cap**: when the monthly budget is used up Argus comments once and stops reviewing until the next reset; that is not a failure of the PR.
 
 **Agent behavioral rules:**
 
 | Rule | Detail |
 |------|--------|
-| **禁止手动 resolve thread** | All resolve by Argus fix-detection or reply-aware resolution |
-| **禁止回复 fix comments** | Don't reply "Fixed in xxx" — diff is the explanation |
-| **Push 后必须等待** | Wait for Argus incremental review before next action |
+| **禁止手动 resolve thread** | Threads are resolved by Argus fix-detection or reply-aware resolution |
+| **禁止回复 fix comments** | Don't reply "Fixed in xxx" — the diff is the explanation |
+| **不轮询、不睡眠等待** | Argus reviews arrive on their own after a push. Check once with a single `gh` call when you need the result (for example when the user asks); do not create cron jobs or sleep loops |
 | **只在 disagree 时回复** | Reply only when NOT fixing — Argus LLM will classify the reply |
-| **以 Argus review 结果为准** | Don't guess whether something is resolved |
+| **建议不是门槛** | Treat Argus findings as input to decide on, not as a gate; the merge follows the repository's own rules |
 
 ## Variables
 
@@ -85,29 +88,17 @@ BODY
 
 **GATE 1**: PR created. Extract and store `PR_NUMBER` and `PR_URL`.
 
-## Phase 2: Poll for Initial Review
+## Phase 2: Read the Initial Review
 
-**MANDATORY**: Create a CronCreate job to poll. Do NOT use sleep loops.
+Argus reviews a new PR on its own. **Do not poll and do not sleep.** Check once:
 
-```
-CronCreate:
-  cron: "*/10 * * * *"
-  prompt: |
-    Check PR #<PR_NUMBER> review status.
-    1. Run: gh pr view <PR_NUMBER> --json reviews,reviewDecision
-    2. If reviewDecision is APPROVED → report to user, delete this cron
-    3. If new inline comments from argus-review[bot] exist → report to user for Phase 3
-    4. Track no-activity count in .pr-flow-check-count-<PR_NUMBER>
-    5. After 3 quiet checks, post "@argus-review review" (max 3 total triggers per cron_safety rule)
-  recurring: true
+```bash
+gh pr view <PR_NUMBER> --json reviews,comments
 ```
 
-**GATE 2**: Reviews have arrived (Argus has posted inline comments or review body).
+If Argus has not reviewed yet, tell the user the PR is open and that the review will appear; come back when asked. If the only Argus message says the monthly budget is used up, there is no review this period: report that to the user and continue under the repository's merge rules without it.
 
-When cron reports reviews arrived:
-1. `CronDelete` the polling job
-2. Clean up: `rm -f .pr-flow-check-count-*`
-3. Proceed to Phase 3
+**GATE 2**: Argus's review is in, or the user has been told it is pending or unavailable.
 
 ## Phase 3: Read + Triage ALL Findings
 
@@ -212,31 +203,25 @@ git commit -m "fix: address review feedback — <summary> (#issue)"
 git push
 ```
 
-### Step 5b: Wait for Argus incremental review
+### Step 5b: Look at the new review (once)
 
-**MANDATORY**: Do NOT resolve threads. Do NOT post re-review triggers. Just wait.
+**MANDATORY**: Do NOT resolve threads. Do NOT post re-review triggers. Do NOT poll or sleep.
 
-Argus receives the push event and will automatically run incremental review. Create a CronCreate job to poll for the response:
+After a push Argus re-reviews the whole PR by itself. When the user asks for the result (or at your next natural step), look once:
 
-```
-CronCreate:
-  cron: "*/10 * * * *"
-  prompt: |
-    Check PR #<PR_NUMBER> for Argus incremental review after fix push.
-    1. Run: gh pr view <PR_NUMBER> --json reviews,reviewDecision
-    2. Check for new reviews from argus-review[bot] after the fix commit
-    3. If APPROVED → report to user, delete this cron
-    4. If new COMMENT review with findings → report findings to user
-    5. After 6 quiet checks (1 hour), report timeout to user for manual intervention
-  recurring: true
+```bash
+gh pr view <PR_NUMBER> --json reviews,comments
+MSYS_NO_PATHCONV=1 gh api "repos/${OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/reviews" \
+  --jq '.[] | select(.user.login == "argus-review[bot]") | {id, state, submitted_at, commit_id}'
 ```
 
-### Step 5c: Process incremental review result
+If no review for the pushed commit exists yet, report that it is still pending.
 
-When Argus responds:
-- **APPROVED** (no new findings, all threads resolved) → Proceed to Phase 6
-- **COMMENT** (new findings) → Increment ITERATION, return to Phase 3
-- **REQUEST_CHANGES** (critical/major blocking) → Increment ITERATION, return to Phase 3
+### Step 5c: Process the review
+
+Argus reviews are always `COMMENTED`; read the findings instead of a state:
+- **New findings** → Increment ITERATION, return to Phase 3.
+- **No new findings** → Proceed to Phase 6.
 
 ```bash
 ITERATION=$((ITERATION + 1))
@@ -247,48 +232,29 @@ if [ "$ITERATION" -ge "$MAX_ITERATIONS" ]; then
 fi
 ```
 
-**GATE 5**: Argus has posted incremental review result. Action determined.
+**GATE 5**: The review for the pushed commit has been read (or reported pending), and the action is decided.
 
 ## Phase 6: Merge
 
-**MANDATORY pre-merge checks** (all must pass):
+Merge follows the repository's current rules (see its CLAUDE.md/AGENTS.md): the PR goes to the trunk by pull request, and the human reviewer decides. Argus does not approve, so there is no `reviewDecision == APPROVED` to check. Check:
 
 ```bash
 # 1. CI passes
 gh pr checks "$PR_NUMBER"
 
-# 2. reviewDecision == APPROVED
-DECISION=$(gh pr view "$PR_NUMBER" --json reviewDecision --jq '.reviewDecision')
-[ "$DECISION" = "APPROVED" ] || echo "BLOCKED: decision=$DECISION"
-
-# 3. Zero unresolved threads (paginated query)
-UNRESOLVED=0
-CURSOR=""
-while true; do
-  AFTER_ARG=""
-  [ -n "$CURSOR" ] && AFTER_ARG=", after: \"$CURSOR\""
-  RESULT=$(MSYS_NO_PATHCONV=1 gh api graphql -f query="
-  query {
-    repository(owner: \"${OWNER}\", name: \"${REPO_NAME}\") {
-      pullRequest(number: ${PR_NUMBER}) {
-        reviewThreads(first: 100${AFTER_ARG}) {
-          pageInfo { hasNextPage endCursor }
-          nodes { isResolved }
-        }
-      }
+# 2. Every Argus finding is dealt with (fixed, or answered), and the threads still open
+#    are listed for the user to disposition
+MSYS_NO_PATHCONV=1 gh api graphql -f query="
+query {
+  repository(owner: \"${OWNER}\", name: \"${REPO_NAME}\") {
+    pullRequest(number: ${PR_NUMBER}) {
+      reviewThreads(first: 100) { nodes { isResolved path comments(first: 1) { nodes { author { login } body } } } }
     }
-  }")
-  COUNT=$(echo "$RESULT" | jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved==false)] | length')
-  UNRESOLVED=$((UNRESOLVED + COUNT))
-  HAS_NEXT=$(echo "$RESULT" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage')
-  [ "$HAS_NEXT" != "true" ] && break
-  CURSOR=$(echo "$RESULT" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor')
-done
-echo "Unresolved threads: $UNRESOLVED"
-[ "$UNRESOLVED" -eq 0 ] || echo "BLOCKED: $UNRESOLVED unresolved threads"
+  }
+}" --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved==false) | {path, body: .comments.nodes[0].body[0:120]}'
 ```
 
-**GATE 6**: All checks pass. Then merge:
+**GATE 6**: CI is green and the open threads were reported to the user. Ask the user to confirm the merge; then:
 
 ```bash
 gh pr merge "$PR_NUMBER" --squash --delete-branch
@@ -366,7 +332,7 @@ After each phase, report status:
 
 ```text
 PR: #<number> (<url>)
-Review: approved | changes_requested | pending
+Review: argus commented | pending | budget used up (advice only, never a gate)
 Threads: <total> total, <resolved> resolved, <open> open
 Iteration: <N>/<MAX>
 Merge: merged | waiting | blocked (<reason>)
