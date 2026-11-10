@@ -334,6 +334,11 @@ apply_reasoning_patch()
 from argus_budget import apply_patch as apply_budget_patch
 apply_budget_patch()
 
+# Let the review see .gitignore changes, which PR-Agent filters out by default (Argus #58).
+from argus_context import keep_reviewed_extensions
+_removed = keep_reviewed_extensions()
+print(f"[Argus] review sees these file types again: {_removed}" if _removed else "[Argus] no file types to re-include")
+
 # Apply @mention support (patches handle_comments_on_pr before app routes bind)
 _patch_mention_handler()
 

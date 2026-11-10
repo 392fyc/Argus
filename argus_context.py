@@ -374,6 +374,32 @@ def load_review_context(provider, token_getter, max_tokens=None, count_tokens=No
         return ContextResult()
 
 
+# ── File types the review must see ────────────────────────────────
+
+# PR-Agent drops files whose extension is in [bad_extensions] (its
+# settings/language_extensions.toml) before the model sees the diff. That list
+# includes "gitignore", so a review never saw a .gitignore change and reported
+# the ignore rules as missing (Argus #58, Mercury #476). These are taken out.
+REVIEWED_EXTENSIONS = ("gitignore",)
+
+
+def keep_reviewed_extensions(settings=None):
+    """Remove REVIEWED_EXTENSIONS from PR-Agent's bad-extension lists; return what was removed."""
+    if settings is None:
+        from pr_agent.config_loader import get_settings
+        settings = get_settings()
+    removed = []
+    for key in ("bad_extensions.default", "bad_extensions.extra"):
+        current = settings.get(key, None)
+        if not current:
+            continue
+        kept = [e for e in current if str(e).lower() not in REVIEWED_EXTENSIONS]
+        if len(kept) != len(current):
+            removed += [e for e in current if str(e).lower() in REVIEWED_EXTENSIONS]
+            settings.set(key, kept)
+    return removed
+
+
 def build_extra_instructions(existing, result: ContextResult) -> str:
     """Append the Argus rules and any project context to the existing extra instructions."""
     block = REVIEW_RULES + (("\n\n" + result.text) if result.text else "")

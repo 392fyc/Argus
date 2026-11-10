@@ -265,12 +265,13 @@ def build_aggregated_agent_prompt(issues: list) -> str:
 
 
 # Config dotfiles that pr-agent's is_valid_file() drops (their final
-# split('.')[-1] token is in bad_extensions.default, e.g. 'gitignore'), so
-# they never reach diff_files and are omitted from the footer. We re-include
-# them in the '📒 Files reviewed' footer ONLY (display) — their content was
-# never sent to the model, so this restores footer VISIBILITY but does not
-# itself feed .gitignore to the reviewer. The actual [Gitignore一致性] false
-# positive is neutralized by the top-level disagree auto-resolve (Line B / #28).
+# split('.')[-1] token is in bad_extensions.default), so they never reach
+# diff_files and are omitted from the footer. We re-include them in the
+# '📒 Files reviewed' footer for display. Since Argus #58,
+# argus_context.keep_reviewed_extensions takes 'gitignore' out of that list at
+# startup, so a .gitignore change does reach the model (and diff_files, which
+# keeps it from being listed twice); the other dotfiles here, such as
+# .gitattributes, are still filtered and only shown.
 # Verified: pr-agent v0.34 language_handler.is_valid_file returns
 # filename.split('.')[-1] not in bad_extensions; 'gitignore' is in
 # bad_extensions.default. Refs Argus #27 / Mercury #476 (Line A).
@@ -1351,6 +1352,21 @@ def finding_matches_thread(issue, thread, min_overlap=3, min_ratio=0.4):
     return overlap >= min_overlap and overlap / min(len(a), len(b)) >= min_ratio
 
 
+def _is_auto_command():
+    """True when PR-Agent runs this command on its own (PR opened or pushed),
+    False when a person asked for it with a comment."""
+    try:
+        from pr_agent.config_loader import get_settings
+        return bool(get_settings().config.get("is_auto_command", False))
+    except Exception:
+        return False
+
+
+def should_drop_for_no_new_code(no_new_code, auto_command):
+    """Drop all findings on an unchanged head only for an automatic run."""
+    return bool(no_new_code and auto_command)
+
+
 def filter_findings(findings, min_severity=DEFAULT_MIN_SEVERITY, skip_patterns=(),
                     threads=None, suppress_repeats=True):
     """Split findings into (kept, dropped) where dropped is [(finding, reason)].
@@ -2110,38 +2126,20 @@ def apply_patch():
             # only findings on lines changed since the last review, which is a
             # latest-commit-only review again. Repeats are now removed up front by
             # filter_findings, which compares findings with every existing thread.)
+            # Only an automatic run is cut short here. A review a person asked for
+            # (a comment) reports what it found even on an unchanged head; repeats
+            # of existing threads are already gone (Argus #58).
+            # The verdict below uses the same rule, so a requested review that posts
+            # findings never also says "no new code to review".
+            no_new_code = should_drop_for_no_new_code(no_new_code, _is_auto_command())
             if no_new_code and inline_comments:
                 print(f"[Argus] No new code: dropping all {len(inline_comments)} findings")
                 inline_comments = []
 
-            # --- Fix C: Deduplicate against existing open threads ---
-            # Skip findings if an open thread already exists on same path within +-5 lines.
-            if inline_comments and unresolved_threads:
-                try:
-                    existing = set()
-                    for t in unresolved_threads:
-                        tp = t.get("path", "")
-                        if not tp:
-                            continue
-                        tl = t.get("line")
-                        if tl:
-                            for off in range(-5, 6):
-                                existing.add((tp, tl + off))
-                        else:
-                            existing.add((tp, None))
-
-                    before = len(inline_comments)
-                    inline_comments = [
-                        c for c in inline_comments
-                        if (c['path'], None) not in existing
-                        and not any((c['path'], c['_end_line'] + off) in existing
-                                    for off in range(-2, 3))
-                    ]
-                    dropped = before - len(inline_comments)
-                    if dropped:
-                        print(f"[Argus] Dedup: dropped {dropped}/{before} findings near existing threads")
-                except Exception as e:
-                    print(f"[Argus] Dedup failed (non-fatal): {e}")
+            # (The former "Fix C" dropped any finding within a few lines of an open
+            # thread, whatever it said, which hid a different problem next to an old
+            # one. filter_findings already drops a finding that repeats a thread by
+            # file and content, so position alone no longer decides (Argus #58).)
 
             # --- Fix D: Doc PR Minor suppression ---
             # For documentation-only PRs, suppress Minor findings after
@@ -2180,7 +2178,8 @@ def apply_patch():
             # (e.g. .gitignore — its split('.')[-1] token is in
             # bad_extensions.default) so the footer can re-include them. Fully
             # guarded: on any failure footer_extra stays [] and the footer is
-            # unchanged. Display only — never feeds content to the model.
+            # unchanged. Display only; .gitignore itself is no longer filtered
+            # (Argus #58), so it is already in diff_files and is not added here.
             footer_extra = []
             try:
                 token_ff = _get_github_token(self.git_provider)
