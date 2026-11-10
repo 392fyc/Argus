@@ -7,7 +7,10 @@ function so that:
 
 * before a call, a spent-up budget stops the call (``BudgetExhausted``);
 * after a call, the returned token usage is priced and added to a ledger;
-* a provider "quota used up" error marks the period as used up and is not retried.
+* a provider "quota used up" error marks the period as used up and is not retried;
+* a call that runs past ``ai_timeout`` is not retried either: it is charged an
+  estimate (the provider may still bill it) and the command posts one short
+  failure note instead of leaving "Preparing review..." behind (Argus #52).
 
 It also wraps ``PRAgent._handle_request`` so that, once the budget is used up,
 a command is skipped and the PR gets exactly one comment per period saying so.
@@ -26,6 +29,7 @@ check passed (one call when requests run one after another).
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import json
 import math
 import os
@@ -45,6 +49,10 @@ LEDGER_VERSION = 1
 _PATCH_MARKER = "_argus_budget_patch"
 MAX_NOTICE_ATTEMPTS = 3      # tries to post the "used up" comment per period
 NOTICE_RETRY_SECONDS = 120   # wait before another try after one that did not finish
+# Output tokens charged for a call that timed out (its usage never comes back):
+# about the largest review output seen, reasoning included (Argus #52).
+TIMEOUT_OUTPUT_TOKENS = 16000
+
 # Commands that never call the model; they stay available when the budget is spent.
 _FREE_COMMANDS = frozenset({"help", "config", "settings"})
 # Provider error texts that mean "the account has no quota/credit left", as
@@ -72,6 +80,15 @@ class BudgetExhausted(Exception):
         self.reason = reason
         self.spent_usd = spent_usd
         self.next_reset = next_reset
+
+
+class ModelTimeout(Exception):
+    """Raised in place of a provider timeout.
+
+    PR-Agent retries ``openai.APIError`` and wraps other exceptions in it, so the
+    type alone does not stop a retry; the guard also refuses every later call in
+    the same command once one call timed out (see ``make_guarded_acompletion``).
+    """
 
 
 # ── Configuration ─────────────────────────────────────────────────
@@ -583,8 +600,65 @@ class BudgetLedger:
             print(f"[Argus Budget] no usage returned for {model!r}; charging ${cost:.2f}")
         return self.record_cost(cost)
 
+    def record_timeout(self, model, prompt_tokens):
+        """Charge a call that timed out on the client side.
+
+        The provider may still have run and billed it, and its usage is never
+        returned. Charge the prompt at the input price plus TIMEOUT_OUTPUT_TOKENS
+        at the output price. A rough estimate: a long high-effort call can
+        produce more output than that, so it may still be low.
+        """
+        price = find_price(model, self.config)
+        cost = (_count(prompt_tokens) * price.input
+                + TIMEOUT_OUTPUT_TOKENS * price.output) / 1_000_000
+        print(f"[Argus Budget] call to {model!r} timed out; charging an estimated ${cost:.2f}")
+        return self.record_cost(cost)
+
 
 # ── LiteLLM wrapper ───────────────────────────────────────────────
+
+# Model outcomes of the command being handled: {"error": last exception or None,
+# "succeeded": number of calls that returned, "timed_out": a call timed out}.
+# A dict, so a call made in a child task (which copies the context) still
+# reports to the command that started it.
+# A command counts as failed only when no call succeeded, so a later side call
+# (for example the reply judge) failing after the review was posted is not
+# reported as a failed review.
+_run_state = contextvars.ContextVar("argus_model_run_state", default=None)
+
+
+def _note_outcome(error):
+    state = _run_state.get()
+    if state is None:
+        return
+    if error is None:
+        state["succeeded"] += 1
+    else:
+        state["error"] = error
+
+
+def is_timeout_error(exc) -> bool:
+    """True for LiteLLM/OpenAI/httpx timeouts and the built-in TimeoutError."""
+    if isinstance(exc, (TimeoutError, ModelTimeout)):
+        return True
+    names = {"Timeout", "APITimeoutError", "ReadTimeout", "TimeoutException"}
+    return any(cls.__name__ in names for cls in type(exc).__mro__)
+
+
+def estimate_prompt_tokens(kwargs) -> int:
+    """Tokens in the request messages; one per character if LiteLLM cannot count
+    (about right for Chinese text, an overestimate for English)."""
+    messages = kwargs.get("messages") or []
+    try:
+        import litellm
+        return int(litellm.token_counter(model=kwargs.get("model"), messages=messages))
+    except Exception:
+        total = 0
+        for m in messages:
+            content = m.get("content", "") if isinstance(m, dict) else m
+            total += len(str(content))
+        return total
+
 
 def make_guarded_acompletion(original, ledger_getter):
     """Wrap an ``acompletion`` coroutine function with the budget rules."""
@@ -593,16 +667,26 @@ def make_guarded_acompletion(original, ledger_getter):
     async def guarded(*args, **kwargs):
         ledger = ledger_getter()
         ledger.check()
+        state = _run_state.get()
+        if state is not None and state["timed_out"]:
+            raise ModelTimeout("an earlier call in this command timed out; not calling again")
         model = kwargs.get("model", args[0] if args else None)
         try:
             response = await original(*args, **kwargs)
         except BudgetExhausted:
             raise
         except Exception as exc:
+            _note_outcome(exc)
             if is_quota_error(exc):
                 ledger.mark_exhausted()
                 print(f"[Argus Budget] provider reported the quota used up: {str(exc)[:200]}")
+            elif is_timeout_error(exc):
+                if state is not None:
+                    state["timed_out"] = True
+                ledger.record_timeout(model, estimate_prompt_tokens(kwargs))
+                raise ModelTimeout(f"model call timed out: {str(exc)[:200]}") from exc
             raise
+        _note_outcome(None)
         ledger.record_response(model, response)
         return response
 
@@ -699,6 +783,118 @@ def notify_once(ledger: BudgetLedger, pr_url, reason=""):
     return True
 
 
+# ── Model failure note (Argus #52) ────────────────────────────────
+
+_BOT_LOGIN = "argus-review[bot]"
+
+
+def _ai_timeout():
+    try:
+        from pr_agent.config_loader import get_settings
+        return get_settings().config.ai_timeout
+    except Exception:
+        return None
+
+
+def failure_comment(command, error):
+    if is_timeout_error(error):
+        limit = _ai_timeout()
+        reason = f"模型调用超时（超过 {limit} 秒）" if limit else "模型调用超时"
+    else:
+        reason = f"模型调用失败（{type(error).__name__}）"
+    command = command or "review"
+    canonical = _ALIASES.get(command, command)
+    if canonical in _PLACEHOLDERS:      # the verbs an @mention can start
+        hint = f"需要时评论 `@argus-review {canonical}` 重新运行。"
+    else:
+        hint = f"需要时重新发送 `/{command}`。"
+    return (
+        f"⚠️ **Argus 未完成 `/{command}`**\n\n"
+        f"原因：{reason}。Argus 没有重试。\n\n"
+        + hint
+    )
+
+
+# The placeholder PR-Agent 0.38.0 posts for each command (pr_agent/tools/*.py).
+_PLACEHOLDERS = {
+    "review": "Preparing review...",
+    "describe": "Preparing PR description...",
+    "improve": "Preparing suggestions...",
+}
+
+# PR-Agent 0.38.0 command aliases that run the same tool (pr_agent/agent/pr_agent.py).
+_ALIASES = {
+    "review_pr": "review",
+    "auto_review": "review",
+    "describe_pr": "describe",
+    "improve_code": "improve",
+}
+
+
+def _remove_temporary_comments(owner, repo, number, command="review"):
+    """Delete Argus's own placeholder for ``command`` left by a failed run.
+
+    Only the exact placeholder of that command is removed, so a placeholder of
+    another command still running on the same PR stays.
+    """
+    placeholder = _PLACEHOLDERS.get(_ALIASES.get(command, command))
+    if not placeholder:
+        return 0
+    import requests
+    from patch_suggestion_format import _get_app_installation_token
+    token = _get_app_installation_token()
+    if not token:
+        raise RuntimeError("no GitHub token to remove the placeholder")
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    since = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    base = f"https://api.github.com/repos/{owner}/{repo}/issues"
+    r = requests.get(f"{base}/{number}/comments", params={"since": since, "per_page": 100},
+                     headers=headers, timeout=15)
+    if r.status_code != 200:
+        raise RuntimeError(f"GitHub returned {r.status_code}")
+    removed = 0
+    for c in r.json():
+        user = c.get("user") or {}
+        body = (c.get("body") or "").strip()
+        if (user.get("type") == "Bot" and user.get("login") == _BOT_LOGIN
+                and body == placeholder):
+            d = requests.delete(f"{base}/comments/{c['id']}", headers=headers, timeout=15)
+            removed += d.status_code == 204
+    return removed
+
+
+_cleaner = _remove_temporary_comments
+
+
+def set_cleaner(fn):
+    """Replace the placeholder remover (tests)."""
+    global _cleaner
+    _cleaner = fn if fn is not None else _remove_temporary_comments
+
+
+def notify_model_failure(pr_url, request, error):
+    """Remove the placeholder and post one failure note; never retried, never raises."""
+    parsed = parse_pr_url(pr_url)
+    command = _command_name(request)
+    owner_repo = f"{parsed[0]}/{parsed[1]}" if parsed else None
+    number = parsed[2] if parsed else None
+    print(f"[Argus] /{command} on {pr_url} gave up: {type(error).__name__}: {str(error)[:200]}")
+    emitter.emit(EventType.ERROR, pr_number=number, repo=owner_repo,
+                 message=f"/{command} gave up after a model error: {type(error).__name__}")
+    if not parsed:
+        return False
+    try:
+        _cleaner(parsed[0], parsed[1], parsed[2], command)
+    except Exception as e:
+        print(f"[Argus] could not remove the placeholder comment: {e}")
+    try:
+        _poster(parsed[0], parsed[1], parsed[2], failure_comment(command, error))
+    except Exception as e:
+        print(f"[Argus] could not post the failure note: {e}")
+        return False
+    return True
+
+
 # ── Patching ──────────────────────────────────────────────────────
 
 _ledger = None
@@ -750,11 +946,18 @@ def apply_patch(ledger_getter=None):
             notify_once(ledger, pr_url, e.reason)
             print(f"[Argus Budget] skipped {request!r} on {pr_url}: {e.reason}")
             return False
-        result = await original_handle(self, pr_url, request, notify)
-        # PR-Agent swallows errors inside a command, so a quota error that hit
-        # during this run is only visible in the ledger afterwards.
+        state = {"error": None, "succeeded": 0, "timed_out": False}
+        token = _run_state.set(state)
+        try:
+            result = await original_handle(self, pr_url, request, notify)
+        finally:
+            _run_state.reset(token)
+        # PR-Agent swallows errors inside a command, so a quota error or a model
+        # failure during this run is only visible afterwards.
         if ledger.is_exhausted():
             notify_once(ledger, pr_url, "budget used up during this run")
+        elif state["error"] is not None and state["succeeded"] == 0:
+            notify_model_failure(pr_url, request, state["error"])
         return result
 
     setattr(guarded_handle, _PATCH_MARKER, True)
