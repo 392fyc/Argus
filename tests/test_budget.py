@@ -926,6 +926,20 @@ def test_placeholder_removal_deletes_only_this_runs_own_placeholder(monkeypatch)
     assert ab._remove_temporary_comments("a", "b", 7, "ask", started) == 0     # no known placeholder
 
 
+def test_a_placeholder_posted_in_the_same_second_as_the_start_is_removed(monkeypatch):
+    import sys as _sys
+    bot = {"type": "Bot", "login": "argus-review[bot]"}
+    started = datetime(2026, 11, 10, 5, 0, 0, 700000, tzinfo=timezone.utc)   # GitHub stamps 05:00:00
+    deleted = []
+    monkeypatch.setitem(_sys.modules, "requests", SimpleNamespace(
+        get=lambda *a, **k: FakeResponse(200, [
+            {"id": 1, "user": bot, "body": "Preparing review...", "created_at": "2026-11-10T05:00:00Z"}]),
+        delete=lambda url, **k: deleted.append(url) or FakeResponse(204)))
+    monkeypatch.setitem(_sys.modules, "patch_suggestion_format",
+                        SimpleNamespace(_get_app_installation_token=lambda: "t"))
+    assert ab._remove_temporary_comments("a", "b", 7, "review", started) == 1
+
+
 def test_placeholder_removal_counts_only_a_successful_delete(monkeypatch):
     import sys as _sys
     bot = {"type": "Bot", "login": "argus-review[bot]"}

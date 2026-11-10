@@ -859,7 +859,10 @@ def _remove_temporary_comments(owner, repo, number, command="review", started_at
     # (by update time, second precision) cannot cut off a candidate. If this host's
     # clock runs ahead of GitHub's, this run's own placeholder can look older than
     # the start and stay; removing another run's placeholder is the worse mistake.
-    floor = started_at
+    # GitHub stamps comments to the second, so the start is cut to the second as well: a placeholder posted in the
+    # same second as the start would otherwise look older than the run (a run started earlier in that same second
+    # is let in too; min() below then picks the earliest).
+    floor = started_at.replace(microsecond=0) if started_at else None
     since = ((started_at - timedelta(seconds=5)) if started_at
              else datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
     base = f"https://api.github.com/repos/{owner}/{repo}/issues"
