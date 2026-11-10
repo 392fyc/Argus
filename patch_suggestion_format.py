@@ -9,6 +9,9 @@ Thread auto-resolve: resolve outdated threads after push
 Reference: CodeRabbit PR review format (2026)
 """
 
+import re
+
+from argus_context import path_matches_skip
 from argus_events import emitter, EventType
 
 # ── Severity mapping ──────────────────────────────────────────────
@@ -50,12 +53,58 @@ def _detect_lang(filepath: str) -> str:
     return ""
 
 
+# Headers PR-Agent's model may write in the response language (zh-CN is
+# configured, and PR-Agent adds that language instruction to every tool), so the
+# map also has Chinese words. Checked in tiers: high first, then known nits, then
+# medium. A header that matches nothing is Medium, NOT Minor: an unrecognised
+# title must never make a real problem fall below the posting threshold.
+_HIGH_KEYWORDS = (
+    ("致命", ("🔴", "Critical")), ("严重", ("🔴", "Critical")),
+    ("漏洞", ("🔴", "Critical")), ("安全", ("🔴", "Critical")),
+    ("崩溃", ("🔴", "Critical")),
+    ("重要", ("🟠", "Major")), ("错误", ("🟠", "Major")),
+    ("缺陷", ("🟠", "Major")), ("可能的", ("🟠", "Major")),
+    ("高风险", ("🟠", "Major")),
+)
+_MINOR_KEYWORDS = (
+    ("拼写", ("⚪", "Trivial")), ("typo", ("⚪", "Trivial")),
+    ("次要", ("🔵", "Minor")), ("风格", ("🔵", "Minor")),
+    ("细节", ("🔵", "Minor")), ("命名", ("🔵", "Minor")), ("低风险", ("🔵", "Minor")),
+    ("style", ("🔵", "Minor")), ("naming", ("🔵", "Minor")),
+    ("readability", ("🔵", "Minor")), ("maintainability", ("🔵", "Minor")),
+    ("enhancement", ("🔵", "Minor")), ("best practice", ("🔵", "Minor")),
+    ("documentation", ("🔵", "Minor")), ("wording", ("🔵", "Minor")),
+    ("formatting", ("🔵", "Minor")), ("cosmetic", ("🔵", "Minor")),
+)
+_MEDIUM_KEYWORDS = (("性能", ("🟡", "Medium")), ("问题", ("🟡", "Medium")),
+                    ("隐患", ("🟡", "Medium")))
+
+
 def _get_review_severity(header: str):
-    header_lower = header.lower()
+    header_lower = (header or "").lower()
+    if re.search(r"(?<![a-z])nits?(?![a-z])", header_lower):
+        return ("🔵", "Minor")
+    # Words that mark a nit outright win over the high-severity words that may
+    # share the title (a "spelling error" is not a Major "error").
+    for key, val in _MINOR_KEYWORDS[:3]:
+        if key in header_lower:
+            return val
+    for key, val in REVIEW_SEVERITY_MAP.items():
+        if key in header_lower and val[1] in ("Critical", "Major"):
+            return val
+    for key, val in _HIGH_KEYWORDS:
+        if key in header_lower:
+            return val
+    for key, val in _MINOR_KEYWORDS:
+        if key in header_lower:
+            return val
     for key, val in REVIEW_SEVERITY_MAP.items():
         if key in header_lower:
             return val
-    return ("🔵", "Minor")
+    for key, val in _MEDIUM_KEYWORDS:
+        if key in header_lower:
+            return val
+    return ("🟡", "Medium")
 
 
 # ── /improve inline thread format ─────────────────────────────────
@@ -337,6 +386,10 @@ def _get_changed_files_lines(auth_h, full_name, pr_number, since_sha=None):
     since the last Argus review).  Otherwise falls back to comparing the last
     two PR commits (single-commit delta).
     Falls back to empty set on failure (disables fix-detection, keeps isOutdated path).
+
+    This only decides whether an OLD thread was addressed by a newer commit, so
+    that thread can be resolved. It has nothing to do with what a review covers:
+    every review looks at the whole PR diff (Argus #49).
     """
     import requests as _req
 
@@ -674,6 +727,56 @@ def _is_bot_author(login, bot_login):
     return login == bot_login or login == bot_login.replace("[bot]", "")
 
 
+DISMISS_MESSAGE = ("Argus now only gives advice and no longer requests changes, "
+                   "so this earlier change request no longer applies.")
+
+
+def _dismiss_stale_change_requests(provider, pr_number, bot_login="argus-review[bot]"):
+    """Dismiss CHANGES_REQUESTED reviews that Argus itself left on this PR.
+
+    Earlier versions requested changes, and GitHub keeps such a review blocking
+    until it is dismissed or replaced by an approval, which Argus no longer
+    gives. Only Argus's own reviews are touched. Returns how many were
+    dismissed; every failure is logged and skipped.
+    PUT /repos/{o}/{r}/pulls/{n}/reviews/{id}/dismissals
+    """
+    import requests as _req
+    repo = provider.repo
+    full_name = repo.full_name if hasattr(repo, "full_name") else str(repo)
+    token = _get_github_token(provider)
+    if not token:
+        return 0
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    base = f"https://api.github.com/repos/{full_name}/pulls/{pr_number}/reviews"
+    dismissed = 0
+    for page in range(1, 6):
+        r = _req.get(base, headers=headers, params={"per_page": 100, "page": page}, timeout=15)
+        if r.status_code != 200:
+            print(f"[Argus] Could not list reviews to dismiss old change requests: {r.status_code}")
+            break
+        reviews = r.json()
+        for rv in reviews:
+            if rv.get("state") != "CHANGES_REQUESTED":
+                continue
+            user = rv.get("user") or {}
+            # REST reports the App as "<name>[bot]" with type "Bot"; never touch a human's review.
+            if user.get("type") != "Bot" or user.get("login", "") != bot_login:
+                continue
+            try:
+                d = _req.put(f"{base}/{rv['id']}/dismissals", headers=headers,
+                             json={"message": DISMISS_MESSAGE}, timeout=15)
+            except Exception as e:
+                print(f"[Argus] Dismissing review {rv.get('id')} failed: {e}")
+                continue
+            if d.status_code == 200:
+                dismissed += 1
+            else:
+                print(f"[Argus] Dismissing review {rv.get('id')} failed: {d.status_code}")
+        if len(reviews) < 100:
+            break
+    return dismissed
+
+
 def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[bot]"):
     """Resolve Argus review threads using fix-detection + reply-aware judging.
 
@@ -721,7 +824,9 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
         if last_review_sha:
             print(f"[Argus] Fix-detection base: last review commit {last_review_sha[:7]}")
 
-        # Build set of (file, line) changed since last review for fix-detection
+        # Build set of (file, line) changed since last review for fix-detection.
+        # since_sha is used ONLY to resolve threads whose lines were edited; the
+        # review scope is the whole PR regardless (Argus #49).
         changed_lines = _get_changed_files_lines(auth_h, full_name, pr_number,
                                                   since_sha=last_review_sha)
 
@@ -829,7 +934,7 @@ def auto_resolve_outdated_threads(provider, pr_number, bot_login="argus-review[b
             # comment (REST issues/{pr}/comments) rather than as an in-thread
             # reply. Such comments never appear in this thread's `comments`, so
             # human_authors stays [] and Strategy 3 never fires, leaving the
-            # thread permanently unresolved -> Rule 3 re-emits REQUEST_CHANGES.
+            # thread permanently unresolved -> it stays open and is listed in the review footer.
             # GitHub semantics: replying in a thread does NOT flip isResolved —
             # only resolveReviewThread does. So we scan top-level comments,
             # CONSERVATIVELY match one to this thread (file-path token AND
@@ -1160,6 +1265,200 @@ def format_walkthrough_comment(data: dict, diagram: str = "") -> str:
     return "\n".join(parts)
 
 
+# ── Finding filters (Argus #49) ───────────────────────────────────
+#
+# Applied to PR-Agent's key_issues_to_review before the review is rendered, so
+# the review body, the inline threads and the footer counts all agree.
+#   1. skip_paths from the project's .argus/review.toml
+#   2. severity threshold ([argus_review] min_severity, default Medium)
+#   3. findings that repeat an existing Argus thread (resolved, answered, or open)
+
+_SEVERITY_RANK = {"Trivial": 0, "Minor": 1, "Medium": 2, "Major": 3, "Critical": 4}
+DEFAULT_MIN_SEVERITY = "Medium"
+_BOT_LOGIN = "argus-review[bot]"
+_JUDGMENT_TAGS = ("✅ Acknowledged", "❓ Follow-up", "⚠️ Escalated")
+# Words every finding of a kind shares (the issue_header vocabulary and the
+# severity badge); they must not count as evidence that two findings are the same.
+_GENERIC_MATCH_WORDS = frozenset({
+    "possible", "bug", "issue", "critical", "security", "performance", "error",
+    "major", "medium", "minor", "trivial", "problem", "potential",
+})
+_REVIEW_YAML_FIX_KEYS = ["ticket_compliance_check", "estimated_effort_to_review_[1-5]:",
+                         "security_concerns:", "key_issues_to_review:",
+                         "relevant_file:", "relevant_line:", "suggestion:"]
+
+
+def _min_severity_name(value):
+    """Canonical severity name for a configured threshold; unknown -> Medium."""
+    if isinstance(value, str):
+        for name in _SEVERITY_RANK:
+            if name.lower() == value.strip().lower():
+                return name
+    return DEFAULT_MIN_SEVERITY
+
+
+def _argus_review_setting(name, default):
+    """Read one key of the [argus_review] table in configuration.toml."""
+    try:
+        from pr_agent.config_loader import get_settings
+        table = get_settings().get("argus_review")
+        if table:
+            return {str(k).lower(): v for k, v in dict(table).items()}.get(name, default)
+    except Exception:
+        pass
+    return default
+
+
+def _finding_severity(issue):
+    """Severity label (Trivial..Critical) shown on the finding's badge."""
+    return _get_review_severity(str(issue.get("issue_header") or ""))[1]
+
+
+def _norm_path(path):
+    path = str(path or "").strip().strip("`")
+    return path[2:] if path.startswith("./") else path
+
+
+def _finding_tokens(issue):
+    path = _norm_path(issue.get("relevant_file"))
+    path_tokens = _tokenize_for_match(path.replace("/", " ").replace(".", " "))
+    text = f"{issue.get('issue_header', '')} {issue.get('issue_content', '')}"
+    return _tokenize_for_match(text) - path_tokens - _GENERIC_MATCH_WORDS
+
+
+def _thread_tokens(thread):
+    header_tokens, _ = _extract_thread_match_keys(
+        thread.get("first_bot_body", ""), thread.get("path", ""))
+    return header_tokens - _GENERIC_MATCH_WORDS
+
+
+def finding_matches_thread(issue, thread, min_overlap=3, min_ratio=0.4):
+    """True when a new finding is the same complaint as an existing Argus thread.
+
+    Conservative on purpose: the finding must be on the thread's file AND share
+    at least ``min_overlap`` distinctive words with it, covering at least
+    ``min_ratio`` of the shorter text. Two different findings in one file differ
+    in their words, so they do not match. Reuses the tokenizer and thread key
+    extraction that the top-level-reply matching already relies on.
+    """
+    path = _norm_path(issue.get("relevant_file"))
+    if not path or path != _norm_path(thread.get("path")):
+        return False
+    a, b = _finding_tokens(issue), _thread_tokens(thread)
+    if not a or not b:
+        return False
+    overlap = len(a & b)
+    return overlap >= min_overlap and overlap / min(len(a), len(b)) >= min_ratio
+
+
+def filter_findings(findings, min_severity=DEFAULT_MIN_SEVERITY, skip_patterns=(),
+                    threads=None, suppress_repeats=True):
+    """Split findings into (kept, dropped) where dropped is [(finding, reason)].
+
+    threads: Argus's own review threads on this PR, as dicts with path,
+    first_bot_body, resolved, resolved_by_human, replied (a human answered) and
+    judged (Argus posted a verdict reply in it). A finding matching one of them
+    is a repeat: a thread a person resolved or answered, or that Argus judged,
+    means the author already dealt with it; an open one is already on the PR.
+    A thread Argus itself closed (its fix-detection or outdated rules do that
+    whenever lines change) says nothing about whether the problem was fixed, so
+    it takes no part unless a person replied or Argus judged a reply in it.
+    """
+    floor = _SEVERITY_RANK[_min_severity_name(min_severity)]
+    threads = [t for t in (threads or [])
+               if not t.get("resolved") or t.get("resolved_by_human")
+               or t.get("replied") or t.get("judged")]
+    kept, dropped = [], []
+    for issue in findings:
+        if path_matches_skip(issue.get("relevant_file", ""), skip_patterns):
+            dropped.append((issue, "skip_paths"))
+            continue
+        severity = _finding_severity(issue)
+        if _SEVERITY_RANK[severity] < floor:
+            dropped.append((issue, f"severity {severity} below {_min_severity_name(min_severity)}"))
+            continue
+        if suppress_repeats:
+            hit = next((t for t in threads if finding_matches_thread(issue, t)), None)
+            if hit is not None:
+                closed = hit.get("resolved_by_human") or hit.get("replied") or hit.get("judged")
+                dropped.append((issue, "repeats a closed thread" if closed else "repeats an open thread"))
+                continue
+        kept.append(issue)
+    return kept, dropped
+
+
+def _fetch_argus_threads(provider, pr_number):
+    """Argus-authored review threads of the PR (resolved or not), or None on failure.
+
+    Each item: path, resolved, resolved_by_human, replied, judged, first_bot_body. Only the first
+    100 threads are read; a longer PR is filtered against those 100.
+    """
+    import requests as _req
+    try:
+        repo = provider.repo
+        full_name = repo.full_name if hasattr(repo, "full_name") else str(repo)
+        owner, name = full_name.split("/", 1)
+        token = _get_github_token(provider)
+        if not token:
+            return None
+        query = ('{repository(owner:"%s",name:"%s"){pullRequest(number:%d){reviewThreads(first:100)'
+                 '{nodes{isResolved resolvedBy{login} path comments(first:30){nodes{author{login} body}}}}}}}'
+                 % (owner, name, pr_number))
+        g = _req.post("https://api.github.com/graphql", json={"query": query},
+                      headers={"Authorization": f"Bearer {token}",
+                               "Accept": "application/vnd.github+json"}, timeout=15)
+        body = g.json() if g.status_code == 200 else {}
+        if body.get("errors") or not body.get("data"):
+            return None
+        nodes = body["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+        threads = []
+        for t in nodes:
+            comments = t["comments"]["nodes"]
+            bot_bodies = [c.get("body", "") for c in comments
+                          if c.get("author") and _is_bot_author(c["author"]["login"], _BOT_LOGIN)]
+            if not bot_bodies:
+                continue
+            resolver = (t.get("resolvedBy") or {}).get("login")
+            threads.append({
+                "path": t.get("path") or "",
+                "resolved": bool(t.get("isResolved")),
+                # Only a resolver that is known and is not Argus counts as a person.
+                "resolved_by_human": bool(t.get("isResolved") and resolver
+                                          and not _is_bot_author(resolver, _BOT_LOGIN)),
+                "replied": any(c.get("author") and not _is_bot_author(c["author"]["login"], _BOT_LOGIN)
+                               for c in comments),
+                "judged": any(tag in b for b in bot_bodies for tag in _JUDGMENT_TAGS),
+                "first_bot_body": bot_bodies[0],
+            })
+        return threads
+    except Exception as e:
+        print(f"[Argus] Could not read existing threads for de-duplication: {e}")
+        return None
+
+
+def _filter_prediction(prediction, load_yaml, filter_fn):
+    """Apply ``filter_fn`` to the key issues in PR-Agent's YAML prediction.
+
+    Returns (prediction, dropped). The text is returned unchanged (byte for
+    byte) unless something was dropped; otherwise it is re-serialised with the
+    kept issues so every later reader of self.prediction sees the same list.
+    """
+    data = load_yaml(prediction.strip(), keys_fix_yaml=_REVIEW_YAML_FIX_KEYS,
+                     first_key="review", last_key="security_concerns")
+    review = data.get("review") if isinstance(data, dict) else None
+    if not isinstance(review, dict):
+        return prediction, []
+    findings, valid = _normalize_findings(review.get("key_issues_to_review", _MISSING))
+    if not valid or not findings:
+        return prediction, []
+    kept, dropped = filter_fn(findings)
+    if not dropped:
+        return prediction, []
+    review["key_issues_to_review"] = kept
+    import yaml
+    return yaml.safe_dump(data, sort_keys=False, allow_unicode=True, width=10 ** 6), dropped
+
+
 # ── Apply patches ─────────────────────────────────────────────────
 
 # Review-decision policy (module level so it can be unit tested).
@@ -1227,33 +1526,44 @@ def _security_review_required():
 
 
 def _classify_finding_severity(issue_header: str) -> str:
-    h = issue_header.lower()
-    if any(k in h for k in ("critical", "bug", "security")):
-        return "Critical"
-    if any(k in h for k in ("possible", "error", "major")):
+    """Severity label of a finding; same rules as the badge (see _get_review_severity)."""
+    h = (issue_header or "").lower()
+    if "major" in h:
         return "Major"
-    if any(k in h for k in ("performance", "issue", "medium")):
-        return "Medium"
-    return "Minor"
+    return _get_review_severity(issue_header)[1]
 
 
 _SECURITY_EXCERPT_CHARS = 300
 
 
+ADVISORY_EVENT = "COMMENT"
+
+
+def _advisory_event(event=None):
+    """The GitHub review event Argus may submit: always COMMENT.
+
+    Argus gives advice and never blocks or approves a merge (Argus #49), so
+    whatever event a code path asks for, the review is submitted as a COMMENT.
+    Every call that submits a review goes through this function.
+    """
+    return ADVISORY_EVENT
+
+
 def _withheld_reason(thread_state_trusted, findings_valid, security_concern):
-    """Explain precisely why approval is withheld (first failing input wins)."""
+    """Name the first input that makes this review's result less complete."""
     if security_concern:
         text = " ".join(str(security_concern).split())
         if len(text) > _SECURITY_EXCERPT_CHARS:
             text = text[:_SECURITY_EXCERPT_CHARS].rstrip() + "…"
-        return f"security concern reported by the review — approval withheld: {text}"
+        return f"security concern reported by the review: {text}"
     if not thread_state_trusted:
         return ("thread state could not be read reliably from GitHub "
-                "(failed request, GraphQL errors or unread pages) — approval withheld.")
+                "(failed request, GraphQL errors or unread pages), so earlier "
+                "threads may not have been taken into account.")
     if not findings_valid:
         return ("review output was incomplete or could not be parsed into an "
-                "explicit no-issues result — approval withheld.")
-    return "approval withheld."
+                "explicit no-issues result.")
+    return "no further notes."
 
 
 def _decide_review_event(findings, unresolved_threads, iteration,
@@ -1264,29 +1574,22 @@ def _decide_review_event(findings, unresolved_threads, iteration,
                          findings_valid=False,
                          security_concern=None):
     """
-    Returns (event, reason):
-      "REQUEST_CHANGES" — blocking issues found
-      "APPROVE"         — all clear: a first review with no findings, or a
-                          later review with nothing blocking or unresolved
-      "COMMENT"         — non-blocking findings / escalation
+    Returns (event, reason). The event is always "COMMENT": Argus only gives
+    advice and never requests changes or approves (Argus #49). The reason is the
+    text shown in the review footer; it says what Argus suggests and why.
 
-    has_inline_comments: True if this review will post new inline
-    comments. Approval is deferred when new comments are posted,
-    regardless of severity, because the author hasn't seen them yet.
-    no_new_code: True if HEAD == last review commit (no new push).
-    When set, new findings are noise and should not block approval.
-    escalated_threads: threads that hit MAX_REPLY_ROUNDS; not counted
-    as blocking (they are already flagged for human review).
+    has_inline_comments: True if this review will post new inline comments.
+    no_new_code: True if HEAD == last review commit (no new push); new findings
+    are then noise and are not described as needing action.
+    escalated_threads: threads that hit MAX_REPLY_ROUNDS; already flagged for
+    a human, so only mentioned at the iteration cap.
     thread_state_trusted: True only if the thread/iteration read fully
-    succeeded. A degraded read can hide prior reviews and unresolved threads,
-    so every APPROVE path requires a trusted read.
+    succeeded. When it is not, the reason says earlier threads may be missing.
     findings_valid: True only if the model output was parsed and its
     key_issues_to_review had a recognized shape. An empty findings list from a
     failed parse must not read as "no issues".
     security_concern: the model's security_concerns text when the security
-    review is enabled and the model reported a concern; it withholds approval
-    and the reason quotes it. A missing or blank field is treated as invalid
-    output (findings_valid=False) instead.
+    review is enabled and the model reported a concern; the reason quotes it.
     """
     escalated_threads = escalated_threads or []
     # PR-Agent may emit key_issues_to_review as a "No"/"none" string or null
@@ -1297,17 +1600,16 @@ def _decide_review_event(findings, unresolved_threads, iteration,
     critical_major = [f for f in findings
                       if _classify_finding_severity(f.get("issue_header", "")) in BLOCKING_SEVERITIES]
     inputs_ok = thread_state_trusted and findings_valid and not security_concern
-    withheld = _withheld_reason(thread_state_trusted, findings_valid, security_concern)
+    note = _withheld_reason(thread_state_trusted, findings_valid, security_concern)
+    advice = "This review is advice only (仅供参考) and does not block the merge."
 
-    # Rule 1: Critical/Major findings always block (regardless of iteration)
-    # But only on actual new code — re-analyzing unchanged code is noise.
+    # Critical/Major findings on new code: suggest fixing them before merging.
     if critical_major and not no_new_code:
-        return ("REQUEST_CHANGES",
-                f"🔴 {len(critical_major)} critical/major issue(s) — changes requested.")
+        return (ADVISORY_EVENT,
+                f"🔴 {len(critical_major)} critical/major issue(s) found — worth "
+                f"fixing before merging. {advice}")
 
-    # Rule 2: Max iterations → COMMENT (escalate to human; do NOT REQUEST_CHANGES).
-    # This must fire before the unresolved-thread check so that a bot stuck in a
-    # disagree loop doesn't keep emitting REQUEST_CHANGES past the iteration cap.
+    # Iteration cap: hand over to the human reviewer.
     if iteration >= MAX_ITERATIONS:
         parts = []
         if unresolved_threads:
@@ -1315,53 +1617,46 @@ def _decide_review_event(findings, unresolved_threads, iteration,
         if escalated_threads:
             parts.append(f"{len(escalated_threads)} escalated to human")
         detail = " (" + ", ".join(parts) + ")" if parts else ""
-        return ("COMMENT",
+        return (ADVISORY_EVENT,
                 f"⚠️ Review iteration {iteration}/{MAX_ITERATIONS} reached{detail}. "
-                f"Escalating to human reviewer — no further bot blocking.")
+                f"Whether to merge is up to the human reviewer.")
 
-    # Rule 3: Unresolved threads from previous reviews (only before max iterations)
+    # Threads from earlier reviews that are still open.
     if unresolved_threads:
-        return ("REQUEST_CHANGES",
-                f"🔴 {len(unresolved_threads)} unresolved thread(s) from previous review.")
+        return (ADVISORY_EVENT,
+                f"💬 {len(unresolved_threads)} thread(s) from a previous review are "
+                f"still open — worth a look. {advice}")
 
-    # Rule 4: First review → APPROVE only when it is fully clean (no findings
-    # at all and nothing posted inline); otherwise COMMENT so the author sees
-    # the findings before any approval.
+    # First review.
     if iteration <= 1:
         if not findings and not has_inline_comments:
             if inputs_ok:
-                return ("APPROVE",
+                return (ADVISORY_EVENT,
                         f"✅ Initial review — no findings. "
                         f"Iteration {iteration}/{MAX_ITERATIONS}.")
-            return ("COMMENT", f"Initial review — {withheld}")
-        note = f" Also: {withheld}" if security_concern else ""
-        return ("COMMENT",
-                "Initial review — no blocking issues. "
-                f"Minor findings posted as inline threads.{note}")
+            return (ADVISORY_EVENT, f"Initial review — {note}")
+        extra = f" Also: {note}" if security_concern else ""
+        return (ADVISORY_EVENT,
+                "Initial review — suggestions posted as inline threads; "
+                f"none is a blocker.{extra}")
 
-    # Rule 5: No new code + all threads resolved → APPROVE immediately
-    # Threads were resolved via replies, no new commit to review.
+    # Later review on the same commit with every thread resolved.
     if inputs_ok and no_new_code and not unresolved_threads:
-        return ("APPROVE",
+        return (ADVISORY_EVENT,
                 f"✅ All threads resolved, no new code to review. "
                 f"Iteration {iteration}/{MAX_ITERATIONS}.")
 
-    # Rule 6: New inline comments being posted → COMMENT (defer approval)
-    # Cannot APPROVE in the same API call that posts new comments,
-    # because the author hasn't had a chance to see/address them.
+    # New inline suggestions in a later review.
     if has_inline_comments:
         minor_count = len(findings) - len(critical_major)
-        return ("COMMENT",
-                f"💬 {minor_count} new finding(s) posted. "
-                f"Approval deferred until next review. "
+        return (ADVISORY_EVENT,
+                f"💬 {minor_count} new suggestion(s) posted. "
                 f"Iteration {iteration}/{MAX_ITERATIONS}."
-                + (f" Also: {withheld}" if security_concern else ""))
+                + (f" Also: {note}" if security_concern else ""))
 
-    # Rule 7: No new comments, no blocking issues, all threads resolved → APPROVE
-    # (only when the thread read was trusted; otherwise stay a COMMENT).
     if not inputs_ok:
-        return ("COMMENT", f"{withheld} Iteration {iteration}/{MAX_ITERATIONS}.")
-    return ("APPROVE",
+        return (ADVISORY_EVENT, f"{note} Iteration {iteration}/{MAX_ITERATIONS}.")
+    return (ADVISORY_EVENT,
             f"✅ No issues found, all threads resolved. "
             f"Iteration {iteration}/{MAX_ITERATIONS}.")
 
@@ -1415,6 +1710,22 @@ def apply_patch():
         print("[Argus] /improve format patched")
     except Exception as e:
         print(f"[Argus] Failed to patch /improve: {e}")
+
+    # ── Patch 1b: never approve (Argus #49) ──
+    # PR-Agent's own approval helper would submit an APPROVE review
+    # (github_provider.py: auto_approve -> create_review). Its own try block, so
+    # this guard is installed even if a later review patch fails to apply.
+    try:
+        from pr_agent.git_providers import github_provider as _gh_approve
+
+        def patched_auto_approve(self):
+            print("[Argus] auto-approve refused: Argus only gives advice")
+            return False
+
+        _gh_approve.GithubProvider.auto_approve = patched_auto_approve
+        print("[Argus] auto-approve disabled")
+    except Exception as e:
+        print(f"[Argus] Failed to disable auto-approve: {e}")
 
     # ── Patch 2+3: /review → single unified GitHub Review (body + inline threads) ──
     #
@@ -1472,6 +1783,87 @@ def apply_patch():
         # -- Step B: After original run, combine body + inline → one Review --
         # -- with conditional approval algorithm --
         original_run = pr_reviewer.PRReviewer.run
+
+        # -- Argus #49: whole-PR review, project context, filters, advice only --
+
+        # (1) Always review the whole PR diff. PR-Agent's "/review -i" reviews only
+        # commits since the last review (pr_reviewer.py: parse_incremental ->
+        # IncrementalPR), which is what produced false positives from partial
+        # diffs. A user can still type "/review -i" or "@argus-review review -i",
+        # so the flag is ignored here, not only removed from push_commands.
+        from pr_agent.git_providers.git_provider import IncrementalPR
+
+        def patched_parse_incremental(self, args):
+            if args and args[0] == "-i":
+                print("[Argus] '-i' ignored: Argus always reviews the whole PR")
+            return IncrementalPR(False)
+
+        pr_reviewer.PRReviewer.parse_incremental = patched_parse_incremental
+
+        # (2) Project context. PRReviewer.__init__ builds self.vars (including
+        # "extra_instructions") and then a TokenHandler that counts the prompt's
+        # fixed tokens from those vars; the diff is sized to what is left. After
+        # appending context the handler is rebuilt so the diff budget accounts for it.
+        original_init = pr_reviewer.PRReviewer.__init__
+
+        def patched_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            self._argus_ctx = None
+            try:
+                from argus_context import load_review_context, build_extra_instructions
+                from pr_agent.algo.token_handler import TokenHandler
+                from pr_agent.config_loader import get_settings
+                settings = get_settings()
+                encoder = self.token_handler.encoder
+                ratio = _argus_review_setting("context_token_ratio", 0.25)
+                if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not 0 < ratio <= 0.9:
+                    ratio = 0.25
+                max_prompt = settings.config.get("max_model_tokens", 0) or 0
+                ctx = load_review_context(
+                    self.git_provider, _get_github_token,
+                    max_tokens=int(max_prompt * ratio) or None,
+                    count_tokens=lambda text: len(encoder.encode(text)))
+                self._argus_ctx = ctx
+                self.vars["extra_instructions"] = build_extra_instructions(
+                    self.vars.get("extra_instructions"), ctx)
+                self.token_handler = TokenHandler(
+                    self.git_provider.pr, self.vars,
+                    get_settings().pr_review_prompt.system,
+                    get_settings().pr_review_prompt.user)
+            except Exception as e:
+                print(f"[Argus] Project context not applied: {e}")
+
+        pr_reviewer.PRReviewer.__init__ = patched_init
+
+        # (3) Filters on the parsed findings, before PR-Agent renders them.
+        original_prepare = pr_reviewer.PRReviewer._prepare_pr_review
+
+        def patched_prepare(self):
+            try:
+                ctx = getattr(self, "_argus_ctx", None)
+                skip = ctx.config.skip_paths if ctx else ()
+                threads = None
+                if _argus_review_setting("suppress_repeated_findings", True):
+                    pr_num = getattr(self.git_provider, "pr_num", 0)
+                    threads = _fetch_argus_threads(self.git_provider, pr_num) if pr_num else None
+
+                def apply_filters(findings):
+                    return filter_findings(
+                        findings,
+                        min_severity=_argus_review_setting("min_severity", DEFAULT_MIN_SEVERITY),
+                        skip_patterns=skip, threads=threads,
+                        suppress_repeats=threads is not None)
+
+                self.prediction, dropped = _filter_prediction(
+                    self.prediction, load_yaml, apply_filters)
+                for issue, reason in dropped:
+                    print(f"[Argus] Dropped finding on {issue.get('relevant_file', '?')} "
+                          f"({str(issue.get('issue_header', ''))[:40]}): {reason}")
+            except Exception as e:
+                print(f"[Argus] Finding filters not applied: {e}")
+            return original_prepare(self)
+
+        pr_reviewer.PRReviewer._prepare_pr_review = patched_prepare
 
         # Approval config
         BOT_LOGIN = "argus-review[bot]"
@@ -1599,6 +1991,15 @@ def apply_patch():
             # Phase 1: Auto-resolve outdated threads before running review
             pr_number = self.git_provider.pr_num if hasattr(self.git_provider, 'pr_num') else 0
             if pr_number:
+                # Older Argus versions could request changes; that can no longer be
+                # cleared by a later approval, so dismiss it (failure is only logged).
+                try:
+                    n_dismissed = _dismiss_stale_change_requests(self.git_provider, pr_number)
+                    if n_dismissed:
+                        print(f"[Argus] Dismissed {n_dismissed} old change request(s)")
+                except Exception as e:
+                    print(f"[Argus] Could not dismiss old change requests: {e}")
+            if pr_number:
                 resolved = auto_resolve_outdated_threads(
                     self.git_provider, pr_number, BOT_LOGIN)
                 if resolved:
@@ -1704,34 +2105,14 @@ def apply_patch():
             except Exception as e:
                 print(f"[Argus] New-code detection failed (non-fatal): {e}")
 
-            # --- Fix B: Incremental diff filter ---
-            # After iteration 1, drop findings on lines NOT changed since last review.
-            # Skip entirely if no new code (all findings would be noise).
+            # --- Same commit as the last review: nothing new to say ---
+            # (Argus #49: the former "Fix B" incremental filter is gone. It kept
+            # only findings on lines changed since the last review, which is a
+            # latest-commit-only review again. Repeats are now removed up front by
+            # filter_findings, which compares findings with every existing thread.)
             if no_new_code and inline_comments:
                 print(f"[Argus] No new code: dropping all {len(inline_comments)} findings")
                 inline_comments = []
-            elif iteration >= 2 and inline_comments and pr_number and last_review_sha:
-                try:
-                    if token_inc:
-                        changed = _get_changed_files_lines(auth_inc, fn_inc,
-                                                            pr_number, since_sha=last_review_sha)
-                        if changed:
-                            def _line_in_changed(path, end_line, changed_set):
-                                if (path, None) in changed_set:
-                                    return True
-                                return any((path, ln) in changed_set
-                                           for ln in range(end_line - 5, end_line + 6))
-
-                            before = len(inline_comments)
-                            inline_comments = [
-                                c for c in inline_comments
-                                if _line_in_changed(c['path'], c['_end_line'], changed)
-                            ]
-                            dropped = before - len(inline_comments)
-                            if dropped:
-                                print(f"[Argus] Incremental filter: dropped {dropped}/{before} findings on unchanged lines")
-                except Exception as e:
-                    print(f"[Argus] Incremental filter failed (non-fatal): {e}")
 
             # --- Fix C: Deduplicate against existing open threads ---
             # Skip findings if an open thread already exists on same path within +-5 lines.
@@ -1785,7 +2166,7 @@ def apply_patch():
                     print(f"[Argus] Doc PR: suppressed {dropped} minor finding(s) "
                           f"(iteration {iteration} > {_DOC_NITS_SUPPRESS_AFTER})")
 
-            # Decide review event
+            # Decide the review text; the event is always COMMENT (advice only)
             event, reason = _decide_review_event(
                 findings, unresolved_threads, iteration,
                 has_inline_comments=bool(inline_comments),
@@ -1834,9 +2215,9 @@ def apply_patch():
                 findings, len(inline_comments), diff_files,
                 extra_filenames=footer_extra)
 
-            # Strip PR Reviewer Guide from incremental reviews (iteration >= 2)
-            # The full guide is only useful on the first review; subsequent reviews
-            # should focus on incremental findings only.
+            # Strip PR Reviewer Guide from repeat reviews (iteration >= 2: Argus has
+            # already posted a review on this PR). This is about not repeating the
+            # guide text; the review itself still covers the whole PR diff.
             if iteration >= 2 and "PR Reviewer Guide" in review_body:
                 import re
                 # Remove the guide section (## PR Reviewer Guide ... up to next ## or end)
@@ -1847,7 +2228,7 @@ def apply_patch():
             review_body = body_additions + "\n\n" + review_body
 
             # Append decision footer
-            review_body += f"\n\n---\n**Review Decision**: {reason}\n"
+            review_body += f"\n\n---\n**Review Decision** (仅供参考): {reason}\n"
             review_body += f"*Iteration {iteration}/{MAX_ITERATIONS} | "
             review_body += f"{len(findings)} findings | "
             review_body += f"{len(unresolved_threads)} unresolved"
@@ -1861,6 +2242,7 @@ def apply_patch():
             # Strip internal keys before passing to PyGithub (GitHub API rejects unknown fields)
             api_comments = [{k: v for k, v in c.items() if not k.startswith('_')}
                             for c in inline_comments]
+            event = _advisory_event(event)
             try:
                 self.git_provider.pr.create_review(
                     commit=self.git_provider.last_commit_id,
@@ -1891,8 +2273,7 @@ def apply_patch():
                     for c in getattr(self.git_provider.pr, 'comments_list', []):
                         if getattr(c, 'is_temporary', False):
                             n = len(inline_comments)
-                            status = "✅" if event == "APPROVE" else "🔴" if event == "REQUEST_CHANGES" else "💬"
-                            c.edit(f"{status} Review complete — **{n} findings** | {reason}")
+                            c.edit(f"💬 Review complete — **{n} findings** | {reason}")
                             break
             except Exception:
                 try:

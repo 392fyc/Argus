@@ -2,12 +2,22 @@
 # Your repository configuration should only include options you wish to override from the defaults.
 
 [config]
-# models
-model="responses/gpt-6-luna"
-model_turbo="responses/gpt-6-luna"
+# models: gpt-6.1-sol through OpenAI's Responses API, called directly (no Azure).
+# "openai/" names the LiteLLM provider and "responses/" routes the request through
+# LiteLLM's Chat-Completions-to-Responses bridge. The provider prefix is required:
+# LiteLLM (litellm_core_utils/get_llm_provider_logic.py, v1.84.0) cannot infer a
+# provider from a bare "responses/gpt-6.1-sol", while "openai/responses/<model>"
+# is resolved to provider "openai" and the bridge then strips "responses/"
+# (litellm/main.py responses_api_bridge_check). Not yet exercised against the real
+# OpenAI API: confirm on first deployment (see README "First deployment").
+# The model must NOT be combined with any [openai] api_type/api_base/deployment_id
+# in .secrets.toml: a deployment_id makes LiteLLM switch to Azure (litellm/main.py,
+# "if deployment_id is not None").
+model="openai/responses/gpt-6.1-sol"
+model_turbo="openai/responses/gpt-6.1-sol"
 fallback_models=[]
 #model_reasoning="o4-mini" # dedicated reasoning model for self-reflection
-model_weak="responses/gpt-6-luna"
+model_weak="openai/responses/gpt-6.1-sol"
 # CLI
 git_provider="github"
 publish_output=true
@@ -35,15 +45,24 @@ response_language="zh-CN" # Language locales code for PR responses in ISO 3166 a
 # extra input tokens are modest and only apply on /describe,/review,/improve.
 max_description_tokens = 3000
 max_commits_tokens = 500
-max_model_tokens = 32000 # Limits the maximum number of tokens that can be used by any model, regardless of the model's default capabilities.
+# Argus #49: 32000 -> 80000. The budget for one /review prompt is now roughly
+#   fixed prompt (~4k) + project context (.argus/review.toml, up to 60000 chars,
+#   about 15-20k tokens for English/code, more for CJK text) + the diff.
+# The old 32000 left ~28k tokens for the diff; with 30 lines of context before and
+# 10 after every hunk (below) a diff is commonly 1.5-2.5x larger, so the diff
+# share is raised to ~56k. Otherwise PR-Agent's large_patch_policy="clip" would
+# cut files out of the diff, which is what this setting must prevent. Sizes are
+# estimates, not measurements; check the "tokens" in the first real runs.
+# Worst case input is 80k tokens (about $0.16 at $2.00 per 1M input tokens).
+max_model_tokens = 80000 # Limits the maximum number of tokens that can be used by any model, regardless of the model's default capabilities.
 custom_model_max_tokens=272000 # for models not in the default list
 model_token_count_estimate_factor=0.3 # factor to increase the token count estimate, in order to reduce likelihood of model failure due to too many tokens - applicable only when requesting an accurate estimate.
 # patch extension logic
 patch_extension_skip_types =[".md",".txt"]
 allow_dynamic_context=true
-max_extra_lines_before_dynamic_context = 10 # will try to include up to 10 extra lines before the hunk in the patch, until we reach an enclosing function or class
-patch_extra_lines_before = 5 # Number of extra lines (+3 default ones) to include before each hunk in the patch
-patch_extra_lines_after = 1 # Number of extra lines (+3 default ones) to include after each hunk in the patch
+max_extra_lines_before_dynamic_context = 30 # will try to include up to 30 extra lines before the hunk in the patch, until we reach an enclosing function or class
+patch_extra_lines_before = 30 # Number of extra lines (+3 default ones) to include before each hunk in the patch (Argus #49: 5 -> 30, so the model sees the code around a change)
+patch_extra_lines_after = 10 # Number of extra lines (+3 default ones) to include after each hunk in the patch (Argus #49: 1 -> 10)
 secret_provider="" # "" (disabled), "google_cloud_storage", or "aws_secrets_manager" for secure secret management
 cli_mode=false
 output_relevant_configurations=false
@@ -63,7 +82,7 @@ ignore_language_framework = [] # a list of code-generation languages or framewor
 #
 is_auto_command = false # will be auto-set to true if the command is triggered by an automation
 enable_ai_metadata = false # will enable adding ai metadata
-reasoning_effort = "xhigh" # PR-Agent ReasoningEffort: none, minimal, low, medium, high, xhigh
+reasoning_effort = "high" # PR-Agent ReasoningEffort: none, minimal, low, medium, high, xhigh. Sent to the configured model by patch_reasoning.py
 # extended thinking for Claude reasoning models
 enable_claude_extended_thinking = false # Set to true to enable extended thinking feature
 extended_thinking_budget_tokens = 2048
@@ -89,7 +108,9 @@ final_update_message = true
 # review labels
 enable_review_labels_security=true
 enable_review_labels_effort=false
-# specific configurations for incremental review (/review -i)
+# Argus always reviews the whole PR (patch_suggestion_format.py ignores "-i"), so the
+# three incremental-review settings below have no effect; they stay only because
+# PR-Agent's configuration schema defines them.
 require_all_thresholds_for_incremental_review=false
 minimal_commits_for_incremental_review=0
 minimal_minutes_for_incremental_review=0
@@ -246,9 +267,13 @@ push_trigger_ignore_merge_commits = true
 push_trigger_wait_for_initial_review = true
 push_trigger_pending_tasks_backlog = true
 push_trigger_pending_tasks_ttl = 300
+# Argus #49: a new push re-reviews the WHOLE PR ("/review"), not just the new
+# commits ("/review -i"). The auto-resolve of old threads still compares against the
+# last reviewed commit (since_sha), but that only decides which old threads a new
+# commit has fixed; it does not narrow what a review looks at.
 push_commands = [
     "/describe",
-    "/review -i",
+    "/review",
 ]
 
 [gitlab]
@@ -371,3 +396,38 @@ pr_commands = [
     "/review",
     "/improve",
 ]
+
+# ── Argus-specific settings (Argus #49) ───────────────────────────
+# These tables are read by Argus's own modules, not by PR-Agent.
+
+[argus_review]
+# Findings below this severity are dropped before the review is posted.
+# Order: Trivial < Minor < Medium < Major < Critical. The severity comes from the
+# finding's issue_header (see _get_review_severity); the review prompt asks the
+# model to use headers that map to Medium or higher.
+min_severity = "Medium"
+# Drop a finding that repeats an existing Argus thread on the same file (resolved,
+# answered by the author, or still open).
+suppress_repeated_findings = true
+# The project context from .argus/review.toml may use at most this share of
+# max_model_tokens (counted with the model tokenizer); beyond that it is cut and
+# the cut is stated in the prompt. This keeps context from squeezing out the diff.
+context_token_ratio = 0.25
+
+[argus_budget]
+# Monthly spend cap (argus_budget.py). A period starts at 00:00 on reset_day in
+# the given timezone and ends at the same moment of the next month.
+monthly_usd = 10
+reset_day = 15           # 1-28
+timezone = "Asia/Tokyo"
+# Charged when a successful call returns no token usage, so a call is never free.
+missing_usage_usd = 0.10
+
+# Prices in USD per 1,000,000 tokens. gpt-6.1-sol: input 2.00, cached input 0.10,
+# output 10.00 (OpenAI pricing page). An unlisted model is billed at the highest
+# price in this table. Output includes reasoning tokens.
+[[argus_budget.prices]]
+model = "gpt-6.1-sol"
+input = 2.00
+cached_input = 0.10
+output = 10.00

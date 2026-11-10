@@ -40,7 +40,7 @@ class TestArgusEventSchema:
     def test_all_event_types_defined(self):
         expected = {
             "review_started", "finding_posted", "reply_classified",
-            "thread_resolved", "error", "mention_rewritten", "request_blocked",
+            "thread_resolved", "error", "mention_rewritten", "request_blocked", "budget_exhausted",
         }
         assert {e.value for e in EventType} == expected
 

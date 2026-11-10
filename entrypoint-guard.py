@@ -325,9 +325,14 @@ def _patch_mention_handler():
 from patch_suggestion_format import apply_patch
 apply_patch()
 
-# Apply the targeted Luna xhigh compatibility patch before PR-Agent app startup.
-from patch_luna_reasoning import apply_patch as apply_luna_reasoning_patch
-apply_luna_reasoning_patch()
+# Pass the configured reasoning effort through for the configured model.
+from patch_reasoning import apply_patch as apply_reasoning_patch
+apply_reasoning_patch()
+
+# Monthly spend cap. Applied after the reasoning patch so it wraps outermost:
+# it checks the budget before any model call and prices the response after it.
+from argus_budget import apply_patch as apply_budget_patch
+apply_budget_patch()
 
 # Apply @mention support (patches handle_comments_on_pr before app routes bind)
 _patch_mention_handler()

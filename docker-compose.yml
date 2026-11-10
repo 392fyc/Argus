@@ -10,8 +10,8 @@ services:
       - .env
     environment:
       - ARGUS_ALLOWED_USERS=${ARGUS_ALLOWED_USERS:-}
-      # Override the older deployment_id from .secrets.toml for this Azure route.
-      - OPENAI__DEPLOYMENT_ID=gpt-6-luna
+      # Spend ledger (monthly cap, see README "Budget"); lives on the ./logs volume.
+      - ARGUS_BUDGET_PATH=/var/log/argus/budget.json
     volumes:
       - ./configuration.toml:/app/pr_agent/settings/configuration.toml:ro
       - ./.secrets.toml:/app/pr_agent/settings/.secrets.toml:ro

@@ -5,7 +5,7 @@
 Agent: Codex CLI
 Repo: 392fyc/Argus
 Purpose: Self-hosted PR review bot running on QNAP NAS via Docker.
-Stack: Python 3 · PR-Agent 0.34 · GitHub App webhook · ASGI (gunicorn)
+Stack: Python 3 · PR-Agent 0.38 · GitHub App webhook · ASGI (gunicorn)
 
 ## Navigation
 

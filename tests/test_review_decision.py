@@ -1,9 +1,9 @@
 """Unit tests for the review-decision policy in patch_suggestion_format.py.
 
-_decide_review_event is pure: it maps findings, thread state and iteration to
-a GitHub review event. The first-pass rule is the one most likely to regress:
-a clean first review must approve, while any finding on the first pass must
-stay a COMMENT so the author sees it before approval.
+Argus only gives advice (Argus #49): whatever the findings and thread state,
+the GitHub review event is COMMENT, never REQUEST_CHANGES and never APPROVE.
+_decide_review_event is pure; it still returns a reason, and those reasons are
+what these tests keep honest (an advisory tone, the right cause named).
 """
 
 import sys
@@ -26,10 +26,13 @@ def decide(findings, unresolved=None, iteration=1, trusted=True, valid=True, **k
                                     findings_valid=valid, **kw)
 
 
-def test_unparsed_review_output_never_approves():
+def test_unparsed_review_output_is_not_reported_as_no_issues():
     # A failed or malformed parse leaves findings empty; that is not "no issues".
-    assert decide([], valid=False)[0] == "COMMENT"
-    assert decide([], iteration=2, valid=False)[0] == "COMMENT"
+    for it in (1, 2):
+        event, reason = decide([], iteration=it, valid=False)
+        assert event == "COMMENT"
+        assert "could not be parsed" in reason
+        assert "no findings" not in reason and "No issues" not in reason
 
 
 def test_normalize_findings_accepts_only_recognized_shapes():
@@ -44,15 +47,15 @@ def test_normalize_findings_accepts_only_recognized_shapes():
     assert psf._normalize_findings({"a": 1}) == ([], False)
 
 
-def test_clean_first_pass_approves():
+def test_clean_first_pass_comments_without_approving():
     event, reason = decide([], has_inline_comments=False)
-    assert event == "APPROVE"
-    assert "Initial review" in reason
+    assert event == "COMMENT"
+    assert "Initial review" in reason and "no findings" in reason
 
 
 def test_first_pass_treats_no_string_and_none_as_no_findings():
-    assert decide("No")[0] == "APPROVE"
-    assert decide(None)[0] == "APPROVE"
+    assert "no findings" in decide("No")[1]
+    assert "no findings" in decide(None)[1]
 
 
 def test_clean_first_pass_with_degraded_thread_read_only_comments():
@@ -65,12 +68,16 @@ def test_decision_defaults_to_untrusted_inputs():
     assert psf._decide_review_event([], [], 1)[0] == "COMMENT"
 
 
-def test_first_pass_with_unresolved_threads_requests_changes():
-    assert decide([], unresolved=[{"path": "a.py"}], iteration=1)[0] == "REQUEST_CHANGES"
+def test_first_pass_with_unresolved_threads_only_suggests():
+    event, reason = decide([], unresolved=[{"path": "a.py"}], iteration=1)
+    assert event == "COMMENT"
+    assert "advice only" in reason
 
 
 def test_first_pass_keeps_dict_findings_when_mixed_with_strings():
-    assert decide([MAJOR, "x"], has_inline_comments=True)[0] == "REQUEST_CHANGES"
+    event, reason = decide([MAJOR, "x"], has_inline_comments=True)
+    assert event == "COMMENT"
+    assert "1 critical/major" in reason
 
 
 def test_first_pass_with_minor_inline_findings_comments():
@@ -81,21 +88,26 @@ def test_first_pass_with_minor_findings_not_posted_inline_still_comments():
     assert decide([MINOR], has_inline_comments=False)[0] == "COMMENT"
 
 
-def test_first_pass_with_major_finding_requests_changes():
-    assert decide([MAJOR], has_inline_comments=True)[0] == "REQUEST_CHANGES"
+def test_major_finding_never_requests_changes():
+    event, reason = decide([MAJOR], has_inline_comments=True)
+    assert event == "COMMENT"
+    assert "advice only" in reason and "does not block the merge" in reason
+    assert "changes requested" not in reason.lower()
 
 
-def test_unresolved_threads_request_changes_before_approval():
-    assert decide([], unresolved=[{"path": "a.py"}], iteration=2)[0] == "REQUEST_CHANGES"
+def test_unresolved_threads_never_request_changes():
+    event, reason = decide([], unresolved=[{"path": "a.py"}], iteration=2)
+    assert event == "COMMENT"
+    assert "still open" in reason
 
 
 def test_later_pass_with_new_inline_comments_defers_approval():
     assert decide([MINOR], iteration=2, has_inline_comments=True)[0] == "COMMENT"
 
 
-def test_later_pass_without_new_code_approves_when_threads_resolved():
+def test_later_pass_without_new_code_only_comments_when_threads_resolved():
     event, reason = decide([MINOR], iteration=2, no_new_code=True, has_inline_comments=False)
-    assert event == "APPROVE"
+    assert event == "COMMENT"
     assert "no new code" in reason
 
 
@@ -103,8 +115,10 @@ def test_first_pass_without_new_code_and_major_finding_does_not_approve():
     assert decide([MAJOR], no_new_code=True)[0] == "COMMENT"
 
 
-def test_later_clean_pass_approves():
-    assert decide([], iteration=2)[0] == "APPROVE"
+def test_later_clean_pass_comments_without_approving():
+    event, reason = decide([], iteration=2)
+    assert event == "COMMENT"
+    assert "No issues found" in reason
 
 
 def test_max_iterations_escalates_instead_of_blocking():
@@ -140,9 +154,11 @@ def test_runtime_engine_info_falls_back_when_lookups_fail(monkeypatch):
     assert psf._runtime_engine_info() == ("unknown", "unknown")
 
 
-def test_later_passes_withhold_approval_on_degraded_thread_read():
-    assert decide([], iteration=2, trusted=False)[0] == "COMMENT"
-    assert decide([], iteration=2, no_new_code=True, trusted=False)[0] == "COMMENT"
+def test_later_passes_name_a_degraded_thread_read():
+    for kw in ({}, {"no_new_code": True}):
+        event, reason = decide([], iteration=2, trusted=False, **kw)
+        assert event == "COMMENT"
+        assert "thread state could not be read" in reason
 
 
 def test_normalize_findings_accepts_yaml_parsed_no_values():
@@ -157,8 +173,9 @@ def test_normalize_findings_accepts_yaml_parsed_no_values():
     assert psf._normalize_findings(True) == ([], False)
 
 
-def test_no_new_code_pass_withholds_approval_when_output_unparsed():
-    assert decide([], iteration=2, no_new_code=True, valid=False)[0] == "COMMENT"
+def test_no_new_code_pass_names_unparsed_output():
+    event, reason = decide([], iteration=2, no_new_code=True, valid=False)
+    assert event == "COMMENT" and "could not be parsed" in reason
 
 
 def test_security_review_clear_only_for_explicit_no():
@@ -200,7 +217,7 @@ def test_has_more_pages_flags_possible_unread_pages():
     assert psf._has_more_pages(_FakeResponse([], broken=True)) is True
 
 
-def test_security_concern_withholds_approval_and_quotes_it():
+def test_security_concern_is_quoted_in_the_reason():
     event, reason = decide([], security_concern="Repo write protection can be bypassed")
     assert event == "COMMENT"
     assert "security concern reported" in reason
@@ -226,3 +243,32 @@ def test_security_reason_takes_precedence_and_is_added_to_comment_paths():
     assert "security concern" in decide([MINOR], has_inline_comments=True, security_concern="x")[1]
     assert "security concern" in decide([MINOR], iteration=2, has_inline_comments=True,
                                         security_concern="x")[1]
+
+
+def test_event_is_comment_for_every_input_combination():
+    import itertools
+    findings_options = ([], [MINOR], [MAJOR], [MAJOR, MINOR], "No", None)
+    for findings, unresolved, iteration, inline, no_new, trusted, valid, sec in itertools.product(
+            findings_options, ([], [{"path": "a.py"}]), (1, 2, psf.MAX_ITERATIONS),
+            (False, True), (False, True), (False, True), (False, True), (None, "leak")):
+        event, reason = psf._decide_review_event(
+            findings, unresolved, iteration, has_inline_comments=inline, no_new_code=no_new,
+            escalated_threads=[{"path": "b.py"}], thread_state_trusted=trusted,
+            findings_valid=valid, security_concern=sec)
+        assert event == "COMMENT"
+        assert isinstance(reason, str) and reason
+
+
+def test_advisory_event_clamps_any_requested_event():
+    for requested in ("APPROVE", "REQUEST_CHANGES", "COMMENT", "PENDING", None, ""):
+        assert psf._advisory_event(requested) == "COMMENT"
+
+
+def test_no_code_path_names_a_blocking_event():
+    # Source-level guard: outside comments and docstrings, patch_suggestion_format
+    # never mentions REQUEST_CHANGES or APPROVE, so nothing can pass them to GitHub.
+    import re
+    src = (REPO_ROOT / "patch_suggestion_format.py").read_text(encoding="utf-8")
+    code = re.sub(r'"""[\s\S]*?"""|#[^\n]*', "", src)
+    assert "REQUEST_CHANGES" not in code
+    assert "APPROVE" not in code
