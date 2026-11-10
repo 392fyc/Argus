@@ -15,7 +15,7 @@ Every phase has a **GATE** that MUST pass before proceeding. Do NOT skip gates.
 Understand these Argus capabilities before executing:
 
 - **Advice only**: every Argus review is a GitHub COMMENT. Argus never requests changes and never approves, so it neither blocks nor unblocks a merge. There is no APPROVED state to wait for.
-- **Whole-PR review**: every review, including the one triggered by a push, reads the whole PR diff, not just the newest commit. A new push produces a fresh review of the whole PR.
+- **On request, whole PR**: Argus reviews only when someone comments `@argus-review review` (each run costs money); every review reads the whole PR diff, not just the newest commit. Under the PR procedure (`.mercury/packs/git-safe/docs/pr-procedure.md`, Mercury #773) the main agent asks for one review of the final head, and again after any commit that answers a finding (threads answered by a commit close only when Argus reviews again).
 - **Fewer, firmer findings**: only medium-or-higher findings are posted, and a finding that repeats an existing thread (resolved by a person, answered, or still open) is not posted again.
 - **Fix-detection resolve**: Argus compares a new commit against open threads by file+line and resolves threads whose lines changed. This says the lines were edited, not that the problem is fixed; a still-unfixed problem may come back as a new finding.
 - **Reply-aware resolution**: when a thread has a human/agent reply, Argus uses an LLM to classify it: ACCEPT (resolve + ack), REJECT (keep open + follow-up), ESCALATE (mark for human). Max 3 reply rounds per thread.
@@ -27,7 +27,7 @@ Understand these Argus capabilities before executing:
 |------|--------|
 | **禁止手动 resolve thread** | Threads are resolved by Argus fix-detection or reply-aware resolution |
 | **禁止回复 fix comments** | Don't reply "Fixed in xxx" — the diff is the explanation |
-| **不轮询、不睡眠等待** | Argus reviews arrive on their own after a push. Check once with a single `gh` call when you need the result (for example when the user asks); do not create cron jobs or sleep loops |
+| **有期限地等待** | After commenting `@argus-review review`, wait for that review with a deadline (15 minutes, e.g. `timeout 900` around a check loop); if it does not come, say so in the PR and continue. Do not create cron jobs or open-ended sleep loops |
 | **只在 disagree 时回复** | Reply only when NOT fixing — Argus LLM will classify the reply |
 | **建议不是门槛** | Treat Argus findings as input to decide on, not as a gate; the merge follows the repository's own rules |
 
@@ -42,7 +42,6 @@ REPO_NAME=$(gh repo view --json name --jq '.name')
 BASE_BRANCH=$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name')
 # Argus PRs target the default branch (master); the dormant develop branch is never a base.
 ITERATION=0
-MAX_ITERATIONS=5
 ```
 
 ## Phase 1: Create PR
@@ -85,17 +84,20 @@ BODY
 
 **GATE 1**: PR created. Extract and store `PR_NUMBER` and `PR_URL`.
 
-## Phase 2: Read the Initial Review
+## Phase 2: Ask Argus to review the final head
 
-Argus reviews a new PR on its own. **Do not poll and do not sleep.** Check once:
+Opening a PR does not start a review. When the independent subagent review has passed and CI is green (the PR procedure, steps 1-2), comment once on the PR and wait with a deadline:
 
 ```bash
-gh pr view <PR_NUMBER> --json reviews,comments
+gh pr comment "$PR_NUMBER" --body "@argus-review review"
+HEAD_SHA=$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)
+timeout 900 bash -c "until gh api --paginate repos/${OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/reviews \
+  --jq '.[] | select(.user.login == \"argus-review[bot]\" and .commit_id == \"'$HEAD_SHA'\") | .id' | grep -q .; do sleep 20; done"
 ```
 
-If Argus has not reviewed yet, tell the user the PR is open and that the review will appear; come back when asked. If the only Argus message says the monthly budget is used up, there is no review this period: report that to the user and continue under the repository's merge rules without it.
+If no review arrives within the deadline, or the only Argus message says the monthly budget is used up, say so in the PR and continue under the PR procedure without it.
 
-**GATE 2**: Argus's review is in, or the user has been told it is pending or unavailable.
+**GATE 2**: Argus's review of the current head is in, or the PR says it did not come.
 
 ## Phase 3: Read + Triage ALL Findings
 
@@ -203,40 +205,31 @@ powershell -ExecutionPolicy Bypass -File $GS/git-safe.ps1 commit -Message "fix: 
 powershell -ExecutionPolicy Bypass -File $GS/git-safe.ps1 push origin "$(git branch --show-current)"
 ```
 
-### Step 5b: Look at the new review (once)
+### Step 5b: Ask for a review of the new head
 
-**MANDATORY**: Do NOT resolve threads. Do NOT post re-review triggers. Do NOT poll or sleep.
+**MANDATORY**: Do NOT resolve threads yourself.
 
-After a push Argus re-reviews the whole PR by itself. When the user asks for the result (or at your next natural step), look once:
-
-```bash
-gh pr view <PR_NUMBER> --json reviews,comments
-MSYS_NO_PATHCONV=1 gh api "repos/${OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/reviews" \
-  --jq '.[] | select(.user.login == "argus-review[bot]") | {id, state, submitted_at, commit_id}'
-```
-
-If no review for the pushed commit exists yet, report that it is still pending.
+A reply in a thread is judged at once; a finding answered by a commit is resolved only when Argus reviews again. So after any commit that answers a finding (a commit that changes logic first gets a new independent subagent review), comment `@argus-review review` once more and wait for the review of the new head with the same 15-minute deadline as Phase 2.
 
 ### Step 5c: Process the review
 
 Argus reviews are always `COMMENTED`; read the findings instead of a state:
 - **New findings** → Increment ITERATION, return to Phase 3.
-- **No new findings** → Proceed to Phase 6.
+- **No new findings and no unresolved thread** → Proceed to Phase 6.
 
 ```bash
 ITERATION=$((ITERATION + 1))
-if [ "$ITERATION" -ge "$MAX_ITERATIONS" ]; then
-  echo "Max iterations reached. Requesting human intervention."
-  gh pr comment "$PR_NUMBER" --body "Max review iterations ($MAX_ITERATIONS) reached. Requesting human guidance."
-  # STOP — do not continue
+if [ "$ITERATION" -ge 2 ]; then
+  echo "Threads still unresolved after two further review runs. Asking the user."
+  # STOP — report to the user (PR procedure, "When to stop and ask the user")
 fi
 ```
 
-**GATE 5**: The review for the pushed commit has been read (or reported pending), and the action is decided.
+**GATE 5**: The review of the pushed head has been read (or the PR says it did not come), and the action is decided.
 
 ## Phase 6: Merge
 
-Merge follows the repository's current rules (see its CLAUDE.md/AGENTS.md): the PR goes to the trunk by pull request, and the human reviewer decides. Argus does not approve, so there is no `reviewDecision == APPROVED` to check. Check:
+Merge follows the PR procedure (`.mercury/packs/git-safe/docs/pr-procedure.md`, Mercury #773): the main agent merges its own PR once every gate holds, without a separate go-ahead; subagents never merge. Argus does not approve, so there is no `reviewDecision == APPROVED` to check. Check:
 
 ```bash
 # 1. CI passes
@@ -254,10 +247,10 @@ query {
 }" --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved==false) | {path, body: .comments.nodes[0].body[0:120]}'
 ```
 
-**GATE 6**: CI is green and the open threads were reported to the user. Ask the user to confirm the merge; then:
+**GATE 6**: an independent subagent passed the exact head (local receipt), CI is green, Argus reviewed the final head and no review thread is unresolved (never resolve one yourself), and `.mercury/packs/git-safe/scripts/guard.ps1 pre-merge -PullRequestNumber "$PR_NUMBER" -NativeReviewReceipt <receipt>` passes. Then merge, pinned to the reviewed head and never with `--admin`:
 
 ```bash
-gh pr merge "$PR_NUMBER" --squash --delete-branch
+gh pr merge "$PR_NUMBER" --squash --delete-branch --match-head-commit "$REVIEWED_HEAD"
 ```
 
 ## Phase 7: Cleanup

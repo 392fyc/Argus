@@ -44,7 +44,7 @@ Argus deploys to a production NAS via GitHub Actions (`deploy.yml` triggers on p
 - **NEVER touch** `configuration.toml` without the Issue body calling out pr-agent config changes as a goal — this file controls pr-agent behavior in production
 - **NEVER commit** secrets, `.env` files, or any file containing `GITHUB_APP_PRIVATE_KEY` / `WEBHOOK_SECRET` / `OPENAI_API_KEY`
 - **NEVER modify** the GitHub App Installation ID, App ID, or webhook URL
-- Deploy-affecting changes reach master only through a PR that a human reviewer confirms before merging — Argus's `deploy.yml` deploys on every push to master; `develop` is dormant and never a target
+- Deploy-affecting changes reach master only through a PR that the main agent merges under the PR procedure (`.mercury/packs/git-safe/docs/pr-procedure.md`); the dev agent never merges — Argus's `deploy.yml` deploys on every push to master; `develop` is dormant and never a target
 
 ## Conventions
 

@@ -1,0 +1,23 @@
+name: Tests
+
+# Runs the unit tests on every pull request and before every deploy (deploy.yml calls it), so
+# guard.ps1 pre-merge has a check to wait for and a failing master never reaches the NAS (Argus #56).
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      # The versions the container runs: pr-agent 0.38.0 (the base image) and the LiteLLM it was tested with.
+      - run: python -m pip install pr-agent==0.38.0 litellm==1.84.0 pytest==9.0.2
+      - run: python -m pytest -q

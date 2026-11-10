@@ -28,6 +28,7 @@ check passed (one call when requests run one after another).
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import contextvars
 import json
@@ -831,11 +832,17 @@ _ALIASES = {
 }
 
 
-def _remove_temporary_comments(owner, repo, number, command="review"):
+def _remove_temporary_comments(owner, repo, number, command="review", started_at=None):
     """Delete Argus's own placeholder for ``command`` left by a failed run.
 
     Only the exact placeholder of that command is removed, so a placeholder of
-    another command still running on the same PR stays.
+    another command still running on the same PR stays. Of several identical
+    placeholders (the same command running twice on one PR), only the earliest
+    one posted after this run started is removed (Argus #56). That is usually
+    this run's own, but not always: a run that started first can post its
+    placeholder after a later run does, and an auto run posts none; then the
+    other run's placeholder goes and this one's stays. Only a placeholder is
+    affected, never a review.
     """
     placeholder = _PLACEHOLDERS.get(_ALIASES.get(command, command))
     if not placeholder:
@@ -846,21 +853,39 @@ def _remove_temporary_comments(owner, repo, number, command="review"):
     if not token:
         raise RuntimeError("no GitHub token to remove the placeholder")
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-    since = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Candidates are placeholders created at or after this run started: one posted
+    # earlier belongs to a run that started before this one and is never removed.
+    # The listing reaches 5 seconds further back only so that GitHub's `since`
+    # (by update time, second precision) cannot cut off a candidate. If this host's
+    # clock runs ahead of GitHub's, this run's own placeholder can look older than
+    # the start and stay; removing another run's placeholder is the worse mistake.
+    # GitHub stamps comments to the second, so the start is cut to the second as well: a placeholder posted in the
+    # same second as the start would otherwise look older than the run (a run started earlier in that same second
+    # is let in too; min() below then picks the earliest).
+    floor = started_at.replace(microsecond=0) if started_at else None
+    since = ((started_at - timedelta(seconds=5)) if started_at
+             else datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
     base = f"https://api.github.com/repos/{owner}/{repo}/issues"
     r = requests.get(f"{base}/{number}/comments", params={"since": since, "per_page": 100},
                      headers=headers, timeout=15)
     if r.status_code != 200:
         raise RuntimeError(f"GitHub returned {r.status_code}")
-    removed = 0
+    mine = []
     for c in r.json():
         user = c.get("user") or {}
         body = (c.get("body") or "").strip()
-        if (user.get("type") == "Bot" and user.get("login") == _BOT_LOGIN
-                and body == placeholder):
-            d = requests.delete(f"{base}/comments/{c['id']}", headers=headers, timeout=15)
-            removed += d.status_code == 204
-    return removed
+        if not (user.get("type") == "Bot" and user.get("login") == _BOT_LOGIN and body == placeholder):
+            continue
+        try:
+            created = datetime.fromisoformat(str(c.get("created_at")).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if floor is None or created >= floor:
+            mine.append((created, c["id"]))
+    if not mine:
+        return 0
+    d = requests.delete(f"{base}/comments/{min(mine)[1]}", headers=headers, timeout=15)
+    return 1 if d.status_code == 204 else 0
 
 
 _cleaner = _remove_temporary_comments
@@ -872,7 +897,7 @@ def set_cleaner(fn):
     _cleaner = fn if fn is not None else _remove_temporary_comments
 
 
-def notify_model_failure(pr_url, request, error):
+def notify_model_failure(pr_url, request, error, started_at=None):
     """Remove the placeholder and post one failure note; never retried, never raises."""
     parsed = parse_pr_url(pr_url)
     command = _command_name(request)
@@ -884,7 +909,7 @@ def notify_model_failure(pr_url, request, error):
     if not parsed:
         return False
     try:
-        _cleaner(parsed[0], parsed[1], parsed[2], command)
+        _cleaner(parsed[0], parsed[1], parsed[2], command, started_at)
     except Exception as e:
         print(f"[Argus] could not remove the placeholder comment: {e}")
     try:
@@ -943,21 +968,24 @@ def apply_patch(ledger_getter=None):
         try:
             ledger.check()
         except BudgetExhausted as e:
-            notify_once(ledger, pr_url, e.reason)
+            await asyncio.to_thread(notify_once, ledger, pr_url, e.reason)
             print(f"[Argus Budget] skipped {request!r} on {pr_url}: {e.reason}")
             return False
         state = {"error": None, "succeeded": 0, "timed_out": False}
+        started_at = datetime.now(timezone.utc)
         token = _run_state.set(state)
         try:
             result = await original_handle(self, pr_url, request, notify)
         finally:
             _run_state.reset(token)
         # PR-Agent swallows errors inside a command, so a quota error or a model
-        # failure during this run is only visible afterwards.
+        # failure during this run is only visible afterwards. The notices make
+        # blocking GitHub calls, so they run in a worker thread and do not stall
+        # other commands on the event loop (Argus #56).
         if ledger.is_exhausted():
-            notify_once(ledger, pr_url, "budget used up during this run")
+            await asyncio.to_thread(notify_once, ledger, pr_url, "budget used up during this run")
         elif state["error"] is not None and state["succeeded"] == 0:
-            notify_model_failure(pr_url, request, state["error"])
+            await asyncio.to_thread(notify_model_failure, pr_url, request, state["error"], started_at)
         return result
 
     setattr(guarded_handle, _PATCH_MARKER, True)

@@ -715,7 +715,8 @@ LiteTimeout.__name__ = "Timeout"
 @pytest.fixture
 def cleaned():
     items = []
-    ab.set_cleaner(lambda owner, repo, number, command: items.append((owner, repo, number, command)))
+    ab.set_cleaner(lambda owner, repo, number, command, started_at=None:
+                   items.append((owner, repo, number, command)))
     yield items
     ab.set_cleaner(None)
 
@@ -883,36 +884,72 @@ class FakeResponse:
         return self._data
 
 
-def test_placeholder_removal_deletes_only_this_commands_own_placeholder(monkeypatch):
+def test_placeholder_removal_deletes_only_this_runs_own_placeholder(monkeypatch):
     import sys as _sys
     bot = {"type": "Bot", "login": "argus-review[bot]"}
+    started = datetime(2026, 11, 10, 5, 0, 0, tzinfo=timezone.utc)
+
+    def at(minute, second=0):
+        return f"2026-11-10T05:{minute:02d}:{second:02d}Z"
+
     comments = [
-        {"id": 1, "user": bot, "body": "Preparing review..."},                   # removed
+        {"id": 1, "user": bot, "body": "Preparing review...", "created_at": at(0, 2)},   # this run's: removed
         {"id": 2, "user": {"type": "User", "login": "argus-review[bot]"},
-         "body": "Preparing review..."},                                          # not a bot
+         "body": "Preparing review...", "created_at": at(0, 1)},                         # not a bot
         {"id": 3, "user": {"type": "Bot", "login": "other[bot]"},
-         "body": "Preparing review..."},                                          # other bot
-        {"id": 4, "user": bot, "body": "Preparing suggestions..."},              # other command
-        {"id": 5, "user": bot, "body": "Preparing review... and a real review"},  # not the placeholder
-        {"id": 6, "user": bot, "body": "Preparing review..."},                   # delete fails
+         "body": "Preparing review...", "created_at": at(0, 1)},                         # other bot
+        {"id": 4, "user": bot, "body": "Preparing suggestions...", "created_at": at(0, 1)},  # other command
+        {"id": 5, "user": bot, "body": "Preparing review... and a real review", "created_at": at(0, 1)},
+        {"id": 6, "user": bot, "body": "Preparing review...", "created_at": at(3)},     # a later run's
+        {"id": 7, "user": bot, "body": "Preparing review...", "created_at": "2026-11-10T04:50:00Z"},  # earlier run
+        {"id": 8, "user": bot, "body": "Preparing review...", "created_at": "2026-11-10T04:59:58Z"},  # run started 2 s earlier
     ]
     deleted = []
+    seen = {}
 
     def fake_get(url, params=None, headers=None, timeout=None):
         assert url.endswith("/repos/a/b/issues/7/comments") and params["per_page"] == 100
+        seen["since"] = params["since"]
         return FakeResponse(200, comments)
 
     def fake_delete(url, headers=None, timeout=None):
         deleted.append(url.rsplit("/", 1)[-1])
-        return FakeResponse(204 if url.endswith("/1") else 404)
+        return FakeResponse(204)
 
     monkeypatch.setitem(_sys.modules, "requests",
                         SimpleNamespace(get=fake_get, delete=fake_delete))
     monkeypatch.setitem(_sys.modules, "patch_suggestion_format",
                         SimpleNamespace(_get_app_installation_token=lambda: "t"))
-    assert ab._remove_temporary_comments("a", "b", 7, "review") == 1
-    assert deleted == ["1", "6"]
-    assert ab._remove_temporary_comments("a", "b", 7, "ask") == 0     # no known placeholder
+    assert ab._remove_temporary_comments("a", "b", 7, "review", started) == 1
+    assert deleted == ["1"]
+    assert seen["since"] == "2026-11-10T04:59:55Z"
+    assert ab._remove_temporary_comments("a", "b", 7, "ask", started) == 0     # no known placeholder
+
+
+def test_a_placeholder_posted_in_the_same_second_as_the_start_is_removed(monkeypatch):
+    import sys as _sys
+    bot = {"type": "Bot", "login": "argus-review[bot]"}
+    started = datetime(2026, 11, 10, 5, 0, 0, 700000, tzinfo=timezone.utc)   # GitHub stamps 05:00:00
+    deleted = []
+    monkeypatch.setitem(_sys.modules, "requests", SimpleNamespace(
+        get=lambda *a, **k: FakeResponse(200, [
+            {"id": 1, "user": bot, "body": "Preparing review...", "created_at": "2026-11-10T05:00:00Z"}]),
+        delete=lambda url, **k: deleted.append(url) or FakeResponse(204)))
+    monkeypatch.setitem(_sys.modules, "patch_suggestion_format",
+                        SimpleNamespace(_get_app_installation_token=lambda: "t"))
+    assert ab._remove_temporary_comments("a", "b", 7, "review", started) == 1
+
+
+def test_placeholder_removal_counts_only_a_successful_delete(monkeypatch):
+    import sys as _sys
+    bot = {"type": "Bot", "login": "argus-review[bot]"}
+    monkeypatch.setitem(_sys.modules, "requests", SimpleNamespace(
+        get=lambda *a, **k: FakeResponse(200, [
+            {"id": 1, "user": bot, "body": "Preparing review...", "created_at": "2026-11-10T05:00:01Z"}]),
+        delete=lambda *a, **k: FakeResponse(404)))
+    monkeypatch.setitem(_sys.modules, "patch_suggestion_format",
+                        SimpleNamespace(_get_app_installation_token=lambda: "t"))
+    assert ab._remove_temporary_comments("a", "b", 7, "review") == 0
 
 
 def test_placeholder_removal_reports_a_failed_listing(monkeypatch):
@@ -930,7 +967,8 @@ def test_aliases_clean_the_same_placeholder_and_get_a_working_hint(monkeypatch):
     bot = {"type": "Bot", "login": "argus-review[bot]"}
     deleted = []
     monkeypatch.setitem(_sys.modules, "requests", SimpleNamespace(
-        get=lambda *a, **k: FakeResponse(200, [{"id": 1, "user": bot, "body": "Preparing review..."}]),
+        get=lambda *a, **k: FakeResponse(200, [{"id": 1, "user": bot, "body": "Preparing review...",
+                                                "created_at": "2026-11-10T05:00:01Z"}]),
         delete=lambda url, **k: deleted.append(url) or FakeResponse(204)))
     monkeypatch.setitem(_sys.modules, "patch_suggestion_format",
                         SimpleNamespace(_get_app_installation_token=lambda: "t"))
@@ -942,3 +980,58 @@ def test_aliases_clean_the_same_placeholder_and_get_a_working_hint(monkeypatch):
 def test_commands_without_a_mention_verb_get_a_slash_hint():
     body = ab.failure_comment("answer", ConnectionError("x"))
     assert "@argus-review" not in body and "重新发送 `/answer`" in body
+
+
+def test_notices_run_off_the_event_loop_thread_and_get_the_start_time(ledger, monkeypatch):
+    seen = {}
+
+    def cleaner(owner, repo, number, command, started_at=None):
+        seen["started_at"] = started_at
+
+    def poster(owner, repo, number, body):
+        seen["thread"] = threading.get_ident()
+
+    async def acompletion(*a, **k):
+        raise ConnectionError("reset")
+
+    handler = SimpleNamespace(acompletion=acompletion)
+
+    async def review(self, pr_url, request, notify=None):
+        seen["loop_thread"] = threading.get_ident()
+        try:
+            await handler.acompletion(model="m", messages=[])
+        except ConnectionError:
+            pass
+        return None
+
+    agent_cls = type("PRAgent", (FakeAgent,), {"_handle_request": review})
+    monkeypatch.setattr(ab, "_load_runtime", lambda: (handler, agent_cls))
+    ab.apply_patch(lambda: ledger)
+    ab.set_cleaner(cleaner)
+    ab.set_poster(poster)
+    try:
+        run(agent_cls()._handle_request("https://github.com/a/b/pull/5", "/review"))
+    finally:
+        ab.set_cleaner(None)
+        ab.set_poster(None)
+    assert seen["thread"] != seen["loop_thread"]
+    assert seen["started_at"] is not None and seen["started_at"].tzinfo is not None
+
+
+def test_the_budget_notice_also_runs_off_the_event_loop_thread(ledger, monkeypatch):
+    seen = {}
+
+    async def spends_the_rest(self, pr_url, request, notify=None):
+        seen["loop_thread"] = threading.get_ident()
+        ledger.record_cost(10)
+        return True
+
+    agent_cls = type("PRAgent", (FakeAgent,), {"_handle_request": spends_the_rest})
+    monkeypatch.setattr(ab, "_load_runtime", lambda: (SimpleNamespace(acompletion=_noop), agent_cls))
+    ab.apply_patch(lambda: ledger)
+    ab.set_poster(lambda owner, repo, number, body: seen.setdefault("thread", threading.get_ident()))
+    try:
+        run(agent_cls()._handle_request("https://github.com/a/b/pull/6", "/review"))
+    finally:
+        ab.set_poster(None)
+    assert seen["thread"] != seen["loop_thread"]
