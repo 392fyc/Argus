@@ -701,3 +701,225 @@ def test_command_name_parsing():
     assert ab._command_name("/review -i") == "review"
     assert ab._command_name(["/Describe", "--x"]) == "describe"
     assert ab._command_name("") == "" and ab._command_name(None) == ""
+
+
+# ── timeouts and the failure note (Argus #52) ─────────────────────
+
+class LiteTimeout(Exception):
+    """Stands in for litellm.Timeout (a subclass named 'Timeout')."""
+
+
+LiteTimeout.__name__ = "Timeout"
+
+
+@pytest.fixture
+def cleaned():
+    items = []
+    ab.set_cleaner(lambda owner, repo, number, command: items.append((owner, repo, number, command)))
+    yield items
+    ab.set_cleaner(None)
+
+
+def test_timeout_errors_are_recognised():
+    assert ab.is_timeout_error(LiteTimeout("x"))
+    assert ab.is_timeout_error(TimeoutError())
+    assert not ab.is_timeout_error(ConnectionError("reset"))
+    assert not ab.is_timeout_error(ProviderError("slow down"))
+
+
+def test_a_timeout_is_charged_an_estimate_and_raised_as_model_timeout(ledger):
+    async def original(*a, **k):
+        raise LiteTimeout("Connection timed out")
+
+    messages = [{"role": "user", "content": "x" * 50000}]
+    with pytest.raises(ab.ModelTimeout):
+        run(make_guard(ledger, original)(model="openai/responses/gpt-6.1-sol", messages=messages))
+    spent = read_ledger(ledger)["spent_usd"]
+    allowance = ab.TIMEOUT_OUTPUT_TOKENS * 10.00 / 1e6     # output at the gpt-6.1-sol price
+    assert allowance <= spent <= 50000 * 2.00 / 1e6 + allowance + 1e-9
+
+
+def test_model_timeout_is_not_an_openai_error():
+    try:
+        import openai
+    except ImportError:
+        pytest.skip("openai not installed")
+    assert not issubclass(ab.ModelTimeout, openai.OpenAIError)
+
+
+def test_after_a_timeout_the_same_command_never_calls_the_model_again(
+        ledger, monkeypatch, posted, cleaned):
+    calls = []
+
+    async def times_out(*a, **k):
+        calls.append(1)
+        raise LiteTimeout("Connection timed out")
+
+    handler = SimpleNamespace(acompletion=times_out)
+
+    async def review(self, pr_url, request, notify=None):
+        # PR-Agent retries the call, as its @retry does after wrapping the error.
+        for _ in range(2):
+            try:
+                await handler.acompletion(model="openai/responses/gpt-6.1-sol", messages=[])
+            except Exception:
+                pass
+        return None
+
+    agent_cls = type("PRAgent", (FakeAgent,), {"_handle_request": review})
+    monkeypatch.setattr(ab, "_load_runtime", lambda: (handler, agent_cls))
+    ab.apply_patch(lambda: ledger)
+    run(agent_cls()._handle_request("https://github.com/a/b/pull/190", "/review"))
+    assert calls == [1]
+    assert cleaned == [("a", "b", 190, "review")]
+    assert len(posted) == 1
+    owner, repo, number, body = posted[0]
+    assert (owner, repo, number) == ("a", "b", 190)
+    assert "未完成 `/review`" in body and "超时" in body and "没有重试" in body
+    assert "`@argus-review review`" in body
+    # The next command starts fresh and may call the model again.
+    run(agent_cls()._handle_request("https://github.com/a/b/pull/190", "/review"))
+    assert calls == [1, 1]
+
+
+def test_no_failure_note_when_a_call_succeeded_before_a_later_one_failed(
+        ledger, monkeypatch, posted, cleaned):
+    outcomes = [SimpleNamespace(usage=usage(1000, 100)), ConnectionError("reset")]
+
+    async def acompletion(*a, **k):
+        item = outcomes.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    handler = SimpleNamespace(acompletion=acompletion)
+
+    async def review(self, pr_url, request, notify=None):
+        await handler.acompletion(model="m", messages=[])     # the review itself
+        try:
+            await handler.acompletion(model="m", messages=[])  # a side call that fails
+        except ConnectionError:
+            pass
+        return True
+
+    agent_cls = type("PRAgent", (FakeAgent,), {"_handle_request": review})
+    monkeypatch.setattr(ab, "_load_runtime", lambda: (handler, agent_cls))
+    ab.apply_patch(lambda: ledger)
+    run(agent_cls()._handle_request("https://github.com/a/b/pull/1", "/review"))
+    assert posted == [] and cleaned == []
+
+
+def test_other_model_failures_get_a_note_naming_the_error_type(
+        ledger, monkeypatch, posted, cleaned):
+    async def acompletion(*a, **k):
+        raise ConnectionError("reset")
+
+    handler = SimpleNamespace(acompletion=acompletion)
+
+    async def review(self, pr_url, request, notify=None):
+        try:
+            await handler.acompletion(model="m", messages=[])
+        except ConnectionError:
+            pass
+        return None
+
+    agent_cls = type("PRAgent", (FakeAgent,), {"_handle_request": review})
+    monkeypatch.setattr(ab, "_load_runtime", lambda: (handler, agent_cls))
+    ab.apply_patch(lambda: ledger)
+    run(agent_cls()._handle_request("https://github.com/a/b/pull/3", "/describe"))
+    assert len(posted) == 1 and "`/describe`" in posted[0][3] and "ConnectionError" in posted[0][3]
+    assert "`@argus-review describe`" in posted[0][3]
+    assert cleaned == [("a", "b", 3, "describe")]
+    assert read_ledger(ledger)["spent_usd"] == 0      # only timeouts are charged
+
+
+def test_failure_note_problems_never_raise(ledger, monkeypatch):
+    def boom(*a):
+        raise RuntimeError("down")
+
+    ab.set_cleaner(boom)
+    ab.set_poster(boom)
+    try:
+        assert ab.notify_model_failure("https://github.com/a/b/pull/1", "/review",
+                                       LiteTimeout("t")) is False
+    finally:
+        ab.set_cleaner(None)
+        ab.set_poster(None)
+
+
+def test_quota_error_gets_the_budget_notice_not_a_failure_note(ledger, monkeypatch, posted, cleaned):
+    async def acompletion(*a, **k):
+        raise ProviderError("Error code: 429", body={"error": {"code": "insufficient_quota"}})
+
+    handler = SimpleNamespace(acompletion=acompletion)
+
+    async def review(self, pr_url, request, notify=None):
+        try:
+            await handler.acompletion(model="m", messages=[])
+        except ProviderError:
+            pass
+        return None
+
+    agent_cls = type("PRAgent", (FakeAgent,), {"_handle_request": review})
+    monkeypatch.setattr(ab, "_load_runtime", lambda: (handler, agent_cls))
+    ab.apply_patch(lambda: ledger)
+    run(agent_cls()._handle_request("https://github.com/a/b/pull/4", "/review"))
+    assert len(posted) == 1 and "额度已用完" in posted[0][3]
+    assert cleaned == []
+
+
+def test_ai_timeout_is_five_minutes():
+    import tomllib
+    cfg = tomllib.loads((REPO_ROOT / "configuration.toml").read_text(encoding="utf-8"))
+    assert cfg["config"]["ai_timeout"] == 300
+
+
+class FakeResponse:
+    def __init__(self, status, data=None):
+        self.status_code = status
+        self._data = data
+
+    def json(self):
+        return self._data
+
+
+def test_placeholder_removal_deletes_only_this_commands_own_placeholder(monkeypatch):
+    import sys as _sys
+    bot = {"type": "Bot", "login": "argus-review[bot]"}
+    comments = [
+        {"id": 1, "user": bot, "body": "Preparing review..."},                   # removed
+        {"id": 2, "user": {"type": "User", "login": "argus-review[bot]"},
+         "body": "Preparing review..."},                                          # not a bot
+        {"id": 3, "user": {"type": "Bot", "login": "other[bot]"},
+         "body": "Preparing review..."},                                          # other bot
+        {"id": 4, "user": bot, "body": "Preparing suggestions..."},              # other command
+        {"id": 5, "user": bot, "body": "Preparing review... and a real review"},  # not the placeholder
+        {"id": 6, "user": bot, "body": "Preparing review..."},                   # delete fails
+    ]
+    deleted = []
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        assert url.endswith("/repos/a/b/issues/7/comments") and params["per_page"] == 100
+        return FakeResponse(200, comments)
+
+    def fake_delete(url, headers=None, timeout=None):
+        deleted.append(url.rsplit("/", 1)[-1])
+        return FakeResponse(204 if url.endswith("/1") else 404)
+
+    monkeypatch.setitem(_sys.modules, "requests",
+                        SimpleNamespace(get=fake_get, delete=fake_delete))
+    monkeypatch.setitem(_sys.modules, "patch_suggestion_format",
+                        SimpleNamespace(_get_app_installation_token=lambda: "t"))
+    assert ab._remove_temporary_comments("a", "b", 7, "review") == 1
+    assert deleted == ["1", "6"]
+    assert ab._remove_temporary_comments("a", "b", 7, "ask") == 0     # no known placeholder
+
+
+def test_placeholder_removal_reports_a_failed_listing(monkeypatch):
+    import sys as _sys
+    monkeypatch.setitem(_sys.modules, "requests", SimpleNamespace(
+        get=lambda *a, **k: FakeResponse(500), delete=None))
+    monkeypatch.setitem(_sys.modules, "patch_suggestion_format",
+                        SimpleNamespace(_get_app_installation_token=lambda: "t"))
+    with pytest.raises(RuntimeError):
+        ab._remove_temporary_comments("a", "b", 7, "review")
