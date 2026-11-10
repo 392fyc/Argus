@@ -254,23 +254,23 @@ ignore_bot_pr = true
 bot_user = "argus-review[bot]"
 override_deployment_type = true
 # settings for "pull_request" event
-handle_pr_actions = ['opened', 'reopened', 'ready_for_review']
+# Reviews run only when someone comments (@argus-review review or /review), never on their own when a PR
+# opens or receives a push: each run costs money (Argus #56, user decision 2026-11-10).
+handle_pr_actions = []
 pr_commands = [
     "/describe --pr_description.final_update_message=false",
     "/review",
     "/improve",
 ]
 # settings for "pull_request" event with "synchronize" action - used to detect and handle push triggers for new commits
-handle_push_trigger = true  # Auto review when new commits are pushed to a PR
+handle_push_trigger = false  # no automatic review on push; see handle_pr_actions above
 push_trigger_ignore_bot_commits = true
 push_trigger_ignore_merge_commits = true
 push_trigger_wait_for_initial_review = true
 push_trigger_pending_tasks_backlog = true
 push_trigger_pending_tasks_ttl = 300
-# Argus #49: a new push re-reviews the WHOLE PR ("/review"), not just the new
-# commits ("/review -i"). The auto-resolve of old threads still compares against the
-# last reviewed commit (since_sha), but that only decides which old threads a new
-# commit has fixed; it does not narrow what a review looks at.
+# Push-triggered runs are off (handle_push_trigger = false above, Argus #56); these commands
+# would apply only if that switch were turned back on. A review always reads the whole PR.
 push_commands = [
     "/describe",
     "/review",

@@ -10,7 +10,8 @@ Argus gives advice. It never blocks a merge and never approves one: every review
 
 | Rule | Behaviour |
 |------|-----------|
-| **Whole PR** | Every review reads the whole PR diff, never only the latest commit. A new push re-reviews the whole PR (`push_commands` uses `/review`, not `/review -i`; a typed `-i` is ignored). |
+| **Whole PR** | Every review reads the whole PR diff, never only the latest commit (a typed `-i` is ignored). |
+| **On request only** | Argus reviews only when someone comments `@argus-review review` (or `/review`); opening a PR or pushing to it starts nothing (`handle_pr_actions = []`, `handle_push_trigger = false`), because every run costs money. A reviewed repository could turn push reviews back on in its own `.pr_agent.toml` (`[github_app] handle_push_trigger = true`, read through `use_repo_settings_file`); none of the five repositories has one. |
 | **Knows the project** | A repository can describe itself in `.argus/review.toml` on the PR's target branch: what to focus on, which architecture/rule documents to read, which paths to ignore. See [Project modules](#project-modules-argusreviewtoml). |
 | **Advice only** | Reviews are always `COMMENT`. Findings are suggestions; the footer says "advice only" (仅供参考), and a `CHANGES_REQUESTED` review left by an earlier Argus version is dismissed at the start of the next review. There is no `REQUEST_CHANGES` and no `APPROVE` anywhere in the code, and PR-Agent's own auto-approve is disabled. |
 | **No repeats** | A finding that matches an existing Argus thread on the same file is not posted again when a person resolved that thread, a person replied in it, Argus judged a reply in it (accepted, "Follow-up" or escalated), or it is still open. A thread that Argus itself closed (its fix-detection and outdated rules do that whenever lines change) does not count: that only says the lines were edited, so a problem that is still there can be reported again. |
