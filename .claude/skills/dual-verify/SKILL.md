@@ -34,12 +34,8 @@ Codex is invoked via `Agent` tool (rescue subagent) — no manual terminal step 
 **Claude Code deep review** (this session):
 
 ```bash
-# Detect the base branch the current branch was cut from.
-# Prefer develop if it exists (Mercury convention), else the repo default branch.
+# Compare against the default branch (master); the dormant develop branch is never a base.
 BASE=$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null || echo "master")
-if gh api "repos/$(gh repo view --json owner --jq '.owner.login')/$(gh repo view --json name --jq '.name')/branches/develop" --silent 2>/dev/null; then
-  BASE=develop
-fi
 git diff "origin/${BASE}...HEAD" --stat
 git diff "origin/${BASE}...HEAD"
 ```
