@@ -16,6 +16,7 @@ COPY patch_reasoning.py /app/patch_reasoning.py
 COPY argus_events.py /app/argus_events.py
 COPY argus_context.py /app/argus_context.py
 COPY argus_budget.py /app/argus_budget.py
+COPY argus_runtime.py /app/argus_runtime.py
 
 CMD ["python", "-m", "gunicorn", \
      "-k", "uvicorn.workers.UvicornWorker", \

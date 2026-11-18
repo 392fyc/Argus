@@ -334,6 +334,11 @@ apply_reasoning_patch()
 from argus_budget import apply_patch as apply_budget_patch
 apply_budget_patch()
 
+# Only the runtime settings [argus_review] allows may come from a trigger comment (Argus #63).
+# Applied after the budget patch so it wraps outermost: a refused command costs nothing.
+from argus_runtime import apply_patch as apply_runtime_patch
+apply_runtime_patch()
+
 # Let the review see .gitignore changes, which PR-Agent filters out by default (Argus #58).
 from argus_context import keep_reviewed_extensions
 _removed = keep_reviewed_extensions()

@@ -134,12 +134,43 @@ How it works:
 
 - **Before** every model call (review, describe, improve, reply judging) the ledger is checked; if the period's budget is used up the call is not made and `BudgetExhausted` is raised. **After** the call, the returned `usage` (input, cached input, output including reasoning) is priced and added.
 - A provider "quota used up" error (`insufficient_quota`, `credit_balance_exhausted`, ...) marks the period as used up and is not retried. An ordinary rate limit (`rate_limit_exceeded`) does not.
-- A call that runs past `ai_timeout` (300 seconds in `configuration.toml`) is not retried: once one call in a command times out, every later call in that command is refused before it reaches the provider. The provider may still have run and billed the timed-out call, and no usage comes back, so the ledger charges a rough estimate: the prompt tokens at the input price plus 16,000 output tokens at the output price (about 0.26 USD for a 50k-token prompt). A long high-effort call can produce more output, so the estimate can still be low. A connection timeout, where the request never reached the provider, is charged and stops the command the same way; LiteLLM reports both as a timeout.
+- A call that runs past `ai_timeout` (300 seconds in `configuration.toml`, changeable as described in [Runtime settings](#runtime-settings)) is not retried: once one call in a command times out, every later call in that command is refused before it reaches the provider. The provider may still have run and billed the timed-out call, and no usage comes back, so the ledger charges a rough estimate: the prompt tokens at the input price plus 16,000 output tokens at the output price (about 0.26 USD for a 50k-token prompt). With a timeout longer than 300 seconds the output part grows in proportion, because the model had longer to write (32,000 tokens at 600 seconds, about 0.42 USD for a 50k-token prompt). A long high-effort call can produce more output, so the estimate can still be low. The failure note names the settings a rerun may change (see below), since rerunning unchanged usually times out again and is billed again. A connection timeout, where the request never reached the provider, is charged and stops the command the same way; LiteLLM reports both as a timeout.
 - When a command gives up because its model calls failed and none succeeded (a timeout or any other error, but not a used-up budget, which has its own notice), Argus deletes that command's own placeholder on the PR ("Preparing review...", "Preparing PR description..." or "Preparing suggestions...", posted by `argus-review[bot]`, exact text only; placeholders of other commands stay; when the same command runs twice on one PR, only the earliest placeholder posted after this run started is removed, which is usually but not always this run's own) and posts one short note naming the command and the reason. The note and the budget notice make blocking GitHub calls, so they run in a worker thread instead of on the event loop. The note is not retried. Comment `@argus-review <command>` to run it again. A command where some calls succeeded and a later one failed (for example a side call after the review was posted) gets no note.
 - When the budget is used up Argus skips every command except `/help` and `/config`, **comments once on that PR** with the amount spent and the next reset time, and writes a `budget_exhausted` event to the event log. Within the same period it stays silent. The notice counts as sent only after the comment was actually posted; if posting fails, a later request tries again, at most 3 attempts per period and at least 2 minutes apart, so a failing GitHub neither loses the notice for good nor floods the PR.
 - The ledger is `/var/log/argus/budget.json` (the mounted `./logs` volume; override with `ARGUS_BUDGET_PATH`): period start, spent amount, used-up flag, notified flag. Writes are atomic (temporary file, flush to disk, rename) and serialised with a thread lock plus an OS file lock. A ledger that cannot be read or fails validation counts as **used up**: stopping early is cheaper than spending without a limit. To recover, fix or delete the file.
 
 **Limit of the cap.** The check happens before a call and cannot know what that call will cost, so the cap can be exceeded by the calls already in flight when the last check passed. The most that can overshoot is (requests running at the same moment) x (up to 3 calls per request, which is what `/improve` runs in parallel; `/review` and `/describe` make one). Estimate of one call, not a measurement: a full 80k-token prompt is about 0.16 USD of input at 2.00 USD per million, plus up to roughly 16k output tokens (reasoning included) at 10.00 USD per million is about 0.16 USD more, so up to about 0.3 USD per call; a typical call is well below that. With one request at a time the overshoot is at most one call, about 0.3 USD in the worst case.
+
+## Runtime settings
+
+The model settings live in `configuration.toml` and change through a pull request to this repository. Two ways change them without one (Argus #63):
+
+**For one command, in the trigger comment.** PR-Agent applies `--section.key=value` arguments of a command to that request only. Argus lets exactly two through (`argus_runtime.py`):
+
+```text
+@argus-review review --config.ai_timeout=600
+@argus-review review --config.reasoning_effort=medium
+```
+
+- `--config.ai_timeout`: whole seconds from 60 to `[argus_review] max_ai_timeout` (900).
+- `--config.reasoning_effort`: one of `[argus_review] reasoning_efforts` (`low`, `medium`, `high`).
+- Any other `--x=y` argument (another model, a different budget, other prompt settings) stops the command before a setting is applied or the model is called, and the PR gets one note saying why. Arguments without `=`, such as `-i`, are unaffected, and so are the location arguments PR-Agent itself adds to a question asked on a code line (`/ask_line --line_start=... --file_name=...`). This includes the text of a question: PR-Agent would apply a `--x=y` written in `@argus-review why does --config.model=x fail?` as a setting, so such a question is refused too; write it without the leading `--`.
+- The usual case is a review that timed out on a large pull request: rerun it with a longer timeout or a lower reasoning effort. The failure note suggests both.
+
+**For every command, on the deployment host.** PR-Agent reads environment variables over the TOML files (`pr_agent/config_loader.py` loads `dynaconf.loaders.env_loader` with no prefix, and re-applies it after a repository's `.pr_agent.toml`), and `docker-compose.yml` passes the host's `.env` into the container. A line `SECTION__KEY=value` overrides `[section] key`; the value is read as TOML, so `600` is a number:
+
+```bash
+# .env on the deployment host (not in Git)
+CONFIG__AI_TIMEOUT=600
+CONFIG__REASONING_EFFORT=medium
+CONFIG__MAX_MODEL_TOKENS=120000
+ARGUS_REVIEW__MAX_AI_TIMEOUT=1200   # raises the per-comment limit
+```
+
+- The container reads `.env` only when it is created, so a change needs a new container: `docker compose up -d pr-agent` (add `--force-recreate` to be sure it is recreated). A plain `docker compose restart` keeps the old values.
+- Changing the model this way (`CONFIG__MODEL`, `CONFIG__MODEL_TURBO`, `CONFIG__MODEL_WEAK`) also works, but the price table in `[argus_budget]` must list the new model, or the budget bills it at the highest listed price.
+- The values in effect are printed when the container starts: `[Argus] runtime settings: {...}` in the container log.
+- PR-Agent's documentation names these variables `PR_AGENT__SECTION__KEY`; the 0.38.0 code reads `SECTION__KEY`, which is what was tested.
 
 ## Tests
 
@@ -158,10 +189,10 @@ How it works:
 |------|---------|
 | `configuration.toml` | PR-Agent settings (model, auto-commands, review rules) plus `[argus_review]` and `[argus_budget]` |
 | `.secrets.toml` | OpenAI key and GitHub App credentials (`.secrets.toml.template` lists the key names) |
-| `.env` | Port and tunnel token |
+| `.env` | Port and tunnel token; optional overrides of the model settings ([Runtime settings](#runtime-settings)) |
 | `.argus/review.toml` (in each reviewed repository, on its target branch) | Project focus, context files, skip paths |
 
-`[argus_review]`: `min_severity` (`Trivial`, `Minor`, `Medium`, `Major`, `Critical`; default `Medium`), `suppress_repeated_findings` (default `true`) and `context_token_ratio` (default `0.25`). Severity comes from the finding's `issue_header`; the review prompt asks the model to start headers with `Critical Bug`, `Security`, `Possible Bug`, `Performance` or `Possible Issue`, which all rank Medium or higher.
+`[argus_review]`: `min_severity` (`Trivial`, `Minor`, `Medium`, `Major`, `Critical`; default `Medium`), `suppress_repeated_findings` (default `true`), `context_token_ratio` (default `0.25`), and the limits of the trigger-comment arguments, `max_ai_timeout` (default `900`) and `reasoning_efforts` (default `["low", "medium", "high"]`). Severity comes from the finding's `issue_header`; the review prompt asks the model to start headers with `Critical Bug`, `Security`, `Possible Bug`, `Performance` or `Possible Issue`, which all rank Medium or higher.
 
 ## GitHub App Setup
 

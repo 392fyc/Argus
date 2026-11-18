@@ -51,8 +51,11 @@ _PATCH_MARKER = "_argus_budget_patch"
 MAX_NOTICE_ATTEMPTS = 3      # tries to post the "used up" comment per period
 NOTICE_RETRY_SECONDS = 120   # wait before another try after one that did not finish
 # Output tokens charged for a call that timed out (its usage never comes back):
-# about the largest review output seen, reasoning included (Argus #52).
+# about the largest review output seen, reasoning included (Argus #52), at the
+# default ai_timeout. A longer timeout lets the model write more before it is
+# cut off, so the charge grows in proportion (Argus #63); a shorter one keeps it.
 TIMEOUT_OUTPUT_TOKENS = 16000
+TIMEOUT_BASE_SECONDS = 300
 
 # Commands that never call the model; they stay available when the budget is spent.
 _FREE_COMMANDS = frozenset({"help", "config", "settings"})
@@ -601,17 +604,18 @@ class BudgetLedger:
             print(f"[Argus Budget] no usage returned for {model!r}; charging ${cost:.2f}")
         return self.record_cost(cost)
 
-    def record_timeout(self, model, prompt_tokens):
+    def record_timeout(self, model, prompt_tokens, timeout_seconds=None):
         """Charge a call that timed out on the client side.
 
         The provider may still have run and billed it, and its usage is never
-        returned. Charge the prompt at the input price plus TIMEOUT_OUTPUT_TOKENS
-        at the output price. A rough estimate: a long high-effort call can
-        produce more output than that, so it may still be low.
+        returned. Charge the prompt at the input price plus
+        timeout_output_tokens(timeout_seconds) at the output price. A rough
+        estimate: a long high-effort call can produce more output than that,
+        so it may still be low.
         """
         price = find_price(model, self.config)
         cost = (_count(prompt_tokens) * price.input
-                + TIMEOUT_OUTPUT_TOKENS * price.output) / 1_000_000
+                + timeout_output_tokens(timeout_seconds) * price.output) / 1_000_000
         print(f"[Argus Budget] call to {model!r} timed out; charging an estimated ${cost:.2f}")
         return self.record_cost(cost)
 
@@ -636,6 +640,20 @@ def _note_outcome(error):
         state["succeeded"] += 1
     else:
         state["error"] = error
+
+
+def timeout_output_tokens(timeout_seconds=None) -> int:
+    """Output tokens charged for a timed-out call: TIMEOUT_OUTPUT_TOKENS at the
+    default timeout or less, scaled up in proportion to a longer one."""
+    if timeout_seconds is None:
+        timeout_seconds = _ai_timeout()
+    try:
+        seconds = float(timeout_seconds)
+    except (TypeError, ValueError):
+        return TIMEOUT_OUTPUT_TOKENS
+    if not math.isfinite(seconds) or seconds <= TIMEOUT_BASE_SECONDS:
+        return TIMEOUT_OUTPUT_TOKENS
+    return math.ceil(TIMEOUT_OUTPUT_TOKENS * seconds / TIMEOUT_BASE_SECONDS)
 
 
 def is_timeout_error(exc) -> bool:
@@ -684,7 +702,7 @@ def make_guarded_acompletion(original, ledger_getter):
             elif is_timeout_error(exc):
                 if state is not None:
                     state["timed_out"] = True
-                ledger.record_timeout(model, estimate_prompt_tokens(kwargs))
+                ledger.record_timeout(model, estimate_prompt_tokens(kwargs), kwargs.get("timeout"))
                 raise ModelTimeout(f"model call timed out: {str(exc)[:200]}") from exc
             raise
         _note_outcome(None)
@@ -797,6 +815,14 @@ def _ai_timeout():
         return None
 
 
+def _reasoning_effort():
+    try:
+        from pr_agent.config_loader import get_settings
+        return get_settings().config.reasoning_effort
+    except Exception:
+        return None
+
+
 def failure_comment(command, error):
     if is_timeout_error(error):
         limit = _ai_timeout()
@@ -807,6 +833,8 @@ def failure_comment(command, error):
     canonical = _ALIASES.get(command, command)
     if canonical in _PLACEHOLDERS:      # the verbs an @mention can start
         hint = f"需要时评论 `@argus-review {canonical}` 重新运行。"
+        if is_timeout_error(error):
+            hint += _timeout_hint(canonical, limit)
     else:
         hint = f"需要时重新发送 `/{command}`。"
     return (
@@ -814,6 +842,38 @@ def failure_comment(command, error):
         f"原因：{reason}。Argus 没有重试。\n\n"
         + hint
     )
+
+
+def _timeout_hint(canonical, limit):
+    """How to rerun a timed-out command with different settings (Argus #63).
+
+    Rerunning unchanged usually hits the same wall and is billed again, so the
+    note names the two settings a comment may change and their limits.
+    """
+    try:
+        import argus_runtime
+        cap, efforts = argus_runtime.limits()
+    except Exception:
+        return ""
+    options = []
+    try:
+        current = int(limit) if limit is not None else None
+    except (TypeError, ValueError):
+        current = None
+    if current is None or current < cap:
+        suggested = cap if current is None else max(argus_runtime.MIN_AI_TIMEOUT, min(cap, current * 2))
+        options.append(f"`@argus-review {canonical} --config.ai_timeout={suggested}`"
+                       f"（超时秒数最多 {cap}）")
+    order = ("low", "medium", "high", "xhigh")
+    effort = _reasoning_effort()
+    lower = ([e for e in reversed(order[:order.index(effort)]) if e in efforts]
+             if effort in order else [])
+    if lower:
+        options.append(f"`@argus-review {canonical} --config.reasoning_effort={lower[0]}`"
+                       "（降低推理强度，更快也更便宜）")
+    if not options:
+        return ""
+    return "原样重跑多半会再次超时并再计费一次；可以改用：" + "，或 ".join(options) + "。"
 
 
 # The placeholder PR-Agent 0.38.0 posts for each command (pr_agent/tools/*.py).
