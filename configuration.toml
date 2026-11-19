@@ -422,7 +422,9 @@ reasoning_efforts = ["low", "medium", "high"] # values --config.reasoning_effort
 [argus_budget]
 # Monthly spend cap (argus_budget.py). A period starts at 00:00 on reset_day in
 # the given timezone and ends at the same moment of the next month.
-monthly_usd = 10
+# The cap itself (monthly_usd) is not set here: this repository is public, so
+# the owner sets ARGUS_BUDGET__MONTHLY_USD in the deployment host's .env
+# (Argus #65). Without it no model call is made.
 reset_day = 15           # 1-28
 timezone = "Asia/Tokyo"
 # Charged when a successful call returns no token usage, so a call is never free.

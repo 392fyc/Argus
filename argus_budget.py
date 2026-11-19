@@ -113,7 +113,9 @@ _DEFAULT_PRICES = (ModelPrice("gpt-6.1-sol", 2.00, 0.10, 10.00),)
 
 @dataclass(frozen=True)
 class BudgetConfig:
-    monthly_usd: float = 10.0
+    # Set only on the deployment host (ARGUS_BUDGET__MONTHLY_USD in .env), never in
+    # this public repository (Argus #65). None, missing or invalid: no call is made.
+    monthly_usd: float | None = None
     reset_day: int = 15          # 1..28: the day of the month a new period starts
     timezone: str = "Asia/Tokyo"
     prices: tuple = _DEFAULT_PRICES
@@ -143,7 +145,8 @@ def _lower_keys(mapping):
 
 def parse_config(raw) -> BudgetConfig:
     """Build a BudgetConfig from the ``[argus_budget]`` table; bad values fall
-    back to the defaults (the cap stays in force rather than turning off)."""
+    back to the defaults (the cap stays in force rather than turning off). A
+    missing or invalid ``monthly_usd`` leaves no cap set, which stops every call."""
     defaults = BudgetConfig()
     if not raw:
         return defaults
@@ -167,8 +170,11 @@ def parse_config(raw) -> BudgetConfig:
             ))
         except (KeyError, TypeError, ValueError):
             print(f"[Argus Budget] ignoring malformed price entry: {entry!r}")
+    monthly = _positive_number(raw.get("monthly_usd"), None)
+    if monthly is None and raw.get("monthly_usd") is not None:
+        print("[Argus Budget] invalid monthly_usd; no call will be made until it is fixed")
     return BudgetConfig(
-        monthly_usd=_positive_number(raw.get("monthly_usd"), defaults.monthly_usd),
+        monthly_usd=monthly,
         reset_day=reset_day,
         timezone=tz.strip(),
         prices=tuple(prices) or defaults.prices,
@@ -178,10 +184,12 @@ def parse_config(raw) -> BudgetConfig:
 
 
 def load_config() -> BudgetConfig:
-    """Read ``[argus_budget]`` from PR-Agent's settings (configuration.toml)."""
+    """Read ``[argus_budget]`` from PR-Agent's global settings (configuration.toml and the
+    environment). Not ``get_settings()``: inside a request that is a copy into which the
+    reviewed repository's ``.pr_agent.toml`` was merged, which must not set the cap (#65)."""
     try:
-        from pr_agent.config_loader import get_settings
-        return parse_config(get_settings().get("argus_budget"))
+        from pr_agent.config_loader import global_settings
+        return parse_config(global_settings.get("argus_budget"))
     except Exception as e:
         print(f"[Argus Budget] settings unavailable ({e}); using defaults")
         return BudgetConfig()
@@ -465,7 +473,8 @@ class BudgetLedger:
         return state, False
 
     def _is_spent(self, state):
-        return state.exhausted or state.spent_usd >= self.config.monthly_usd
+        cap = self.config.monthly_usd
+        return cap is None or state.exhausted or state.spent_usd >= cap
 
     def next_reset(self):
         return period_bounds(self._clock(), self.config)[1]
@@ -485,10 +494,14 @@ class BudgetLedger:
                     self._write(state)  # also probes that the ledger is writable
                     self._degraded = None
                 if self._is_spent(state):
-                    raise BudgetExhausted(
-                        f"budget used up: ${state.spent_usd:.4f} of ${self.config.monthly_usd:.2f}"
-                        if not state.exhausted else "provider reported the quota used up",
-                        spent_usd=state.spent_usd, next_reset=self.next_reset())
+                    # The reason can reach a public PR comment: no amounts in it (Argus #65).
+                    if self.config.monthly_usd is None:
+                        reason = "no monthly budget is configured on the deployment host"
+                    elif state.exhausted:
+                        reason = "provider reported the quota used up"
+                    else:
+                        reason = "budget used up"
+                    raise BudgetExhausted(reason, spent_usd=state.spent_usd, next_reset=self.next_reset())
         except BudgetExhausted:
             raise
         except (OSError, TimeoutError) as e:
@@ -726,10 +739,14 @@ def parse_pr_url(pr_url):
 
 
 def exhausted_comment(spent_usd, config: BudgetConfig, next_reset, reason=""):
-    spent = "未知" if spent_usd is None else f"${spent_usd:.2f}"
+    # Posted on public pull requests: the amounts stay in the host's log and ledger (Argus #65).
+    if config.monthly_usd is None:
+        return (
+            "⚠️ **Argus 暂停审查：部署主机未配置月度花费上限**\n\n"
+            "在主机上设置上限之前，Argus 不审查此 PR 或其他 PR，本期内也不会再发这条提示。"
+        )
     return (
         "⚠️ **Argus 本期审查额度已用完**\n\n"
-        f"本期已花费 {spent}，上限 ${config.monthly_usd:.2f}。"
         "本期内 Argus 不再审查此 PR 或其他 PR，也不会再发这条提示。\n\n"
         f"下次重置：{next_reset.strftime('%Y-%m-%d %H:%M')}（{config.timezone}）。"
         + (f"\n\n原因：{reason}" if reason else "")
@@ -785,7 +802,8 @@ def notify_once(ledger: BudgetLedger, pr_url, reason=""):
                      spent_usd=spent, monthly_usd=ledger.config.monthly_usd,
                      period_start=start.isoformat() if start else None,
                      next_reset=next_reset.isoformat(), reason=reason)
-        print(f"[Argus Budget] budget used up ({reason or 'cap reached'}); "
+        print(f"[Argus Budget] budget used up ({reason or 'cap reached'}; spent {spent}, "
+              f"cap {ledger.config.monthly_usd}); "
               f"next reset {next_reset.isoformat()}")
     if not parsed:
         ledger.confirm_notification()  # no PR to comment on: nothing more to try
@@ -1011,6 +1029,11 @@ def _load_runtime():
 
 def apply_patch(ledger_getter=None):
     """Wrap LiteLLM completion and PR-Agent's request handler, once per process."""
+    if ledger_getter is None:
+        # Read the budget settings now, at startup, before any request can merge a
+        # repository's settings into them (polling mode merges into the global ones).
+        cap = get_ledger().config.monthly_usd
+        print(f"[Argus Budget] monthly cap: {'not set, no model call will be made' if cap is None else cap}")
     ledger_getter = ledger_getter or get_ledger
     handler, agent_cls = _load_runtime()
     if getattr(handler.acompletion, _PATCH_MARKER, False) is True:
