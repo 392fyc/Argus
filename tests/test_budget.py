@@ -20,7 +20,7 @@ if str(REPO_ROOT) not in sys.path:
 import argus_budget as ab  # noqa: E402
 
 JST = timezone(timedelta(hours=9))
-CFG = ab.BudgetConfig()  # 10 USD, reset day 15, Asia/Tokyo, gpt-6.1-sol prices
+CFG = ab.BudgetConfig(monthly_usd=10.0)  # a test cap; reset day 15, Asia/Tokyo, gpt-6.1-sol prices
 
 
 class Clock:
@@ -114,7 +114,7 @@ def test_unknown_timezone_uses_utc_not_a_crash():
 
 def test_config_defaults_match_the_agreed_values():
     cfg = ab.parse_config(None)
-    assert (cfg.monthly_usd, cfg.reset_day, cfg.timezone) == (10.0, 15, "Asia/Tokyo")
+    assert (cfg.monthly_usd, cfg.reset_day, cfg.timezone) == (None, 15, "Asia/Tokyo")
     price = cfg.prices[0]
     assert (price.model, price.input, price.cached_input, price.output) == ("gpt-6.1-sol", 2.0, 0.10, 10.0)
 
@@ -129,8 +129,32 @@ def test_config_reads_table_with_any_key_case():
 @pytest.mark.parametrize("raw", [
     {"monthly_usd": 0}, {"monthly_usd": -5}, {"monthly_usd": "ten"}, {"monthly_usd": True},
     {"monthly_usd": float("nan")}, {"monthly_usd": float("inf")}])
-def test_bad_cap_falls_back_to_the_default_cap(raw):
-    assert ab.parse_config(raw).monthly_usd == 10.0
+def test_bad_cap_leaves_no_cap_and_stops_every_call(raw, tmp_path, clock):
+    cfg = ab.parse_config(raw)
+    assert cfg.monthly_usd is None
+    ledger = ab.BudgetLedger(path=str(tmp_path / "budget.json"), config=cfg, clock=clock)
+    with pytest.raises(ab.BudgetExhausted) as info:
+        ledger.check()
+    assert "no monthly budget is configured" in info.value.reason
+
+
+def test_missing_cap_stops_every_call(tmp_path, clock):
+    ledger = ab.BudgetLedger(path=str(tmp_path / "budget.json"), config=ab.parse_config({}), clock=clock)
+    assert ledger.is_exhausted()
+
+
+def test_notice_and_reason_show_no_amounts(tmp_path, clock):
+    ledger = ab.BudgetLedger(path=str(tmp_path / "budget.json"), config=CFG, clock=clock)
+    ledger.record_cost(12.34)
+    with pytest.raises(ab.BudgetExhausted) as info:
+        ledger.check()
+    text = ab.exhausted_comment(12.34, CFG, ledger.next_reset(), info.value.reason)
+    assert "$" not in text and "12.34" not in text and "10" not in info.value.reason
+
+
+def test_notice_without_a_cap_says_so_and_names_no_reset(clock):
+    text = ab.exhausted_comment(None, ab.parse_config({}), clock(), "x")
+    assert "未配置月度花费上限" in text and "下次重置" not in text
 
 
 @pytest.mark.parametrize("day", [0, 29, 31, "15", None, True, 1.5])
@@ -146,7 +170,9 @@ def test_malformed_price_entries_are_ignored_and_empty_table_keeps_default():
 def test_settings_loader_uses_pr_agent_table(monkeypatch):
     import types
     fake = types.ModuleType("pr_agent.config_loader")
-    fake.get_settings = lambda: SimpleNamespace(get=lambda k: {"monthly_usd": 3} if k == "argus_budget" else None)
+    fake.global_settings = SimpleNamespace(get=lambda k: {"monthly_usd": 3} if k == "argus_budget" else None)
+    # a request's settings (with the reviewed repository's .pr_agent.toml merged in) are not read
+    fake.get_settings = lambda: SimpleNamespace(get=lambda k: {"monthly_usd": 1000} if k == "argus_budget" else None)
     monkeypatch.setitem(sys.modules, "pr_agent", types.ModuleType("pr_agent"))
     monkeypatch.setitem(sys.modules, "pr_agent.config_loader", fake)
     assert ab.load_config().monthly_usd == 3.0
@@ -535,7 +561,7 @@ def test_notice_is_posted_once_with_the_reset_time_and_logged(ledger, posted, ev
     assert len(posted) == 1
     owner, repo, number, body = posted[0]
     assert (owner, repo, number) == ("acme", "widgets", 7)
-    assert "2026-12-15 00:00" in body and "Asia/Tokyo" in body and "$10.00" in body
+    assert "2026-12-15 00:00" in body and "Asia/Tokyo" in body and "$" not in body  # no amounts (#65)
     logged = [e for e in events(event_sink) if e["event_type"] == "budget_exhausted"]
     assert len(logged) == 1
     assert logged[0]["pr_number"] == 7 and logged[0]["repo"] == "acme/widgets"

@@ -256,7 +256,7 @@ def test_timeout_output_tokens_scale_with_a_longer_timeout():
 
 
 def test_a_timed_out_call_is_charged_for_its_own_timeout(tmp_path):
-    ledger = ab.BudgetLedger(path=str(tmp_path / "budget.json"), config=ab.BudgetConfig())
+    ledger = ab.BudgetLedger(path=str(tmp_path / "budget.json"), config=ab.BudgetConfig(monthly_usd=10.0))
 
     class Timeout(Exception):
         pass
