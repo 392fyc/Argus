@@ -382,7 +382,8 @@ def _line_range(issue):
     try:
         start = int(issue.get("start_line") or issue.get("end_line"))
         end = int(issue.get("end_line") or start)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # Not a number, NaN, or infinite (YAML reads ".inf" as a float): no location.
         return None
     return (min(start, end), max(start, end))
 

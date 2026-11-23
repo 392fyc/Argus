@@ -911,3 +911,11 @@ def test_findings_are_ranked_again_after_a_split():
     critical = finding("b.py", 9, 9, header="Critical Bug")
     ranked = ad.rank_findings([medium, critical])
     assert ranked[0] is critical
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan"), "abc"])
+def test_a_line_number_that_is_not_finite_counts_as_no_location(bad):
+    broken = finding("a.py", bad, bad)
+    assert ad._line_range(broken) is None
+    merged = ad.merge_findings([broken], [finding("a.py", 3, 3, content="另一个问题。")])
+    assert len(merged) == 2
