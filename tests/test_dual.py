@@ -247,10 +247,18 @@ def test_nearby_but_different_defects_stay_separate():
     assert sorted(f["argus_source"] for f in merged) == ["claude", "gpt"]
 
 
-def test_same_file_far_apart_matches_on_shared_identifiers():
+def test_findings_without_lines_match_on_shared_identifiers():
     a = finding("a.py", 10, 10, content="parse_config ignores reset_day overflow_guard")
-    b = finding("a.py", 90, 90, content="reset_day overflow_guard in parse_config")
+    b = finding("a.py", None, None, content="reset_day overflow_guard in parse_config")
     assert ad.same_finding(a, b)
+
+
+def test_distant_findings_stay_separate_even_with_shared_identifiers():
+    a = finding("a.py", 10, 12, content="save_record swallows TimeoutError and retry_queue loses the item")
+    b = finding("a.py", 80, 82, content="retry_queue drops save_record on TimeoutError in the fallback branch")
+    assert not ad.same_finding(a, b)
+    merged = ad.merge_findings([a], [b])
+    assert sorted(f["argus_source"] for f in merged) == ["claude", "gpt"]
 
 
 def test_merge_tags_sources_counts_and_ranks_by_severity_then_agreement():
@@ -711,3 +719,32 @@ def test_the_section_says_agreement_is_a_lower_bound():
     stats = {"gpt_status": "ok", "claude_status": "ok", "gpt_findings": 1, "claude_findings": 1,
              "both": 0, "gpt_only": 1, "claude_only": 1}
     assert "偏保守" in ad.comparison_section(stats, "g", "c")
+
+
+def test_a_concern_survives_when_both_finding_lists_are_unusable():
+    gpt = yaml.safe_dump({"review": {"key_issues_to_review": "garbled", "security_concerns": "No"}})
+    claude = yaml.safe_dump({"review": {"key_issues_to_review": "garbled", "security_concerns": "令牌写进了日志"}},
+                            allow_unicode=True)
+    text, stats = ad.merge_predictions(gpt, claude, load_yaml)
+    assert (stats["gpt_status"], stats["claude_status"]) == ("unparsed", "unparsed")
+    review = yaml.safe_load(text)["review"]
+    assert review["security_concerns"] == "令牌写进了日志"
+    assert review["key_issues_to_review"] == "garbled"  # still incomplete
+
+
+def test_both_unusable_without_a_concern_passes_gpt_text_unchanged():
+    gpt = yaml.safe_dump({"review": {"key_issues_to_review": "garbled", "security_concerns": "No"}})
+    text, _ = ad.merge_predictions(gpt, "not yaml at all: [", load_yaml)
+    assert text == gpt
+
+
+def test_usage_is_recorded_even_if_cancelled_while_closing(ledger):
+    class CancelOnClose(FakeClient):
+        async def close(self):
+            raise asyncio.CancelledError()
+
+    client = CancelOnClose(message())
+    with pytest.raises(asyncio.CancelledError):
+        run(ad.claude_review("sys", "user", DUAL, ledger, 300, api_key="k",
+                             client_factory=lambda key, t: client))
+    assert ledger.snapshot()[0] == pytest.approx((10_000 * 4.0 + 1000 * 20.0) / 1_000_000)

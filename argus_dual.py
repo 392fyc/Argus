@@ -236,6 +236,15 @@ def _make_client(api_key, timeout):
     return anthropic.AsyncAnthropic(api_key=api_key, max_retries=0, timeout=timeout)
 
 
+async def _close(client):
+    close = getattr(client, "close", None)
+    if close is not None:
+        try:
+            await close()
+        except Exception:
+            pass
+
+
 async def claude_review(system, user, config: DualConfig, ledger: BudgetLedger,
                         timeout, api_key=None, client_factory=_make_client):
     """Ask Claude for the review. Returns the answer text or raises LineFailed."""
@@ -261,6 +270,7 @@ async def claude_review(system, user, config: DualConfig, ledger: BudgetLedger,
         # The SDK timeout bounds each read; this bounds the whole answer.
         message = await asyncio.wait_for(call(), timeout + 15)
     except Exception as exc:
+        await _close(client)
         estimate = (config.model, len(system) + len(user), timeout)
         if is_timeout_error(exc) or type(exc).__name__ == "APITimeoutError":
             if not _never_sent(exc):
@@ -285,16 +295,16 @@ async def claude_review(system, user, config: DualConfig, ledger: BudgetLedger,
                                   reason="was cancelled while in flight")
         except Exception:
             pass
+        await _close(client)
         raise
-    finally:
-        close = getattr(client, "close", None)
-        if close is not None:
-            try:
-                await close()
-            except Exception:
-                pass
+    # The answer is in: record its usage before anything else can be interrupted.
+    # Shielded, so a cancellation from here on still lets the write finish.
     cost = claude_cost(_field(message, "usage"), price)
-    await asyncio.to_thread(ledger.record_cost, ledger.config.missing_usage_usd if cost is None else cost)
+    try:
+        await asyncio.shield(asyncio.to_thread(
+            ledger.record_cost, ledger.config.missing_usage_usd if cost is None else cost))
+    finally:
+        await _close(client)
     stop = _field(message, "stop_reason")
     if stop in ("refusal", "max_tokens"):
         raise LineFailed(stop)
@@ -395,16 +405,21 @@ def same_finding(a, b, slack=3):
     descriptions must also share at least SIMILAR_TEXT of their character pairs, so a
     null-pointer crash and a missing permission check two lines apart stay separate
     unless their descriptions share enough identifiers or wording.
-    Findings further apart match on the shared-word test Argus uses against its own
-    threads. A heuristic: two models may describe one defect in very different words,
-    which then shows up as two one-sided findings rather than one agreed finding."""
+    Two findings that both name lines further apart than that are different places,
+    and stay separate even when they share identifiers (one function can have two
+    defects in two branches). Only when a finding names no lines does the shared-word
+    test Argus uses against its own threads decide. A heuristic: two models may
+    describe one defect in very different words, which then shows up as two one-sided
+    findings rather than one agreed finding."""
     from patch_suggestion_format import _finding_tokens, _norm_path
     path = _norm_path(a.get("relevant_file"))
     if not path or path != _norm_path(b.get("relevant_file")):
         return False
     ra, rb = _line_range(a), _line_range(b)
-    if ra and rb and ra[0] <= rb[1] + slack and rb[0] <= ra[1] + slack:
-        return text_similarity(a, b) >= SIMILAR_TEXT
+    if ra and rb:
+        if ra[0] <= rb[1] + slack and rb[0] <= ra[1] + slack:
+            return text_similarity(a, b) >= SIMILAR_TEXT
+        return False
     ta, tb = _finding_tokens(a), _finding_tokens(b)
     if not ta or not tb:
         return False
@@ -528,8 +543,9 @@ def merge_predictions(gpt_text, claude_text, load_yaml, gpt_status="ok", claude_
     """Merge the two answers. Returns (prediction_text, stats).
 
     A line whose answer has no valid finding list counts as failed ("unparsed").
-    With one usable line its findings are tagged and used alone; with none the GPT
-    text is returned unchanged so Argus reports it as it always did."""
+    With one usable line its findings are used alone; with none the GPT text goes on
+    so Argus reports it as incomplete as it always did, carrying any security concern
+    either answer stated."""
     import yaml
     g = _parse(gpt_text, load_yaml) if gpt_status == "ok" else None
     c = _parse(claude_text, load_yaml) if claude_status == "ok" else None
@@ -540,15 +556,26 @@ def merge_predictions(gpt_text, claude_text, load_yaml, gpt_status="ok", claude_
     stats = {"gpt_status": gpt_status, "claude_status": claude_status,
              "gpt_findings": len(g[1]) if g else 0, "claude_findings": len(c[1]) if c else 0,
              "both": 0, "gpt_only": 0, "claude_only": 0}
+    # Security is read from both answers, also one whose finding list is unusable.
+    texts = {SOURCE_GPT: gpt_text, SOURCE_CLAUDE: claude_text}
+    loaded = {k: _load(t, load_yaml) if t else None for k, t in texts.items()}
+    reviews = {k: d["review"] if d else None for k, d in loaded.items()}
+    usable = tuple(k for k, parsed in ((SOURCE_GPT, g), (SOURCE_CLAUDE, c)) if parsed)
+    security = merge_security(reviews[SOURCE_GPT], reviews[SOURCE_CLAUDE], usable)
     if g is None and c is None:
-        return gpt_text, stats
+        # No usable finding list: the review stays incomplete as before, but a
+        # concern either answer states is not lost. It goes into the GPT answer
+        # (or Claude's when GPT has no review table); the finding list stays invalid.
+        if security is _NO_VALUE:
+            return gpt_text, stats
+        carrier = loaded[SOURCE_GPT] or loaded[SOURCE_CLAUDE]
+        if carrier is None:
+            return gpt_text, stats
+        carrier = copy.deepcopy(carrier)
+        carrier["review"]["security_concerns"] = security
+        return yaml.safe_dump(carrier, sort_keys=False, allow_unicode=True, width=10 ** 6), stats
     base = copy.deepcopy((g or c)[0])
     review = base["review"]
-    # Security is read from both answers, also one whose finding list is unusable.
-    loaded = {k: (_load(t, load_yaml) or {}).get("review") if t else None
-              for k, t in ((SOURCE_GPT, gpt_text), (SOURCE_CLAUDE, claude_text))}
-    usable = tuple(k for k, parsed in ((SOURCE_GPT, g), (SOURCE_CLAUDE, c)) if parsed)
-    security = merge_security(loaded[SOURCE_GPT], loaded[SOURCE_CLAUDE], usable)
     if security is _NO_VALUE:
         review.pop("security_concerns", None)
     else:
