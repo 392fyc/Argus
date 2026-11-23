@@ -521,7 +521,42 @@ def _combine(g, c):
         header = str(other.get("issue_header") or "").strip()
         label = f"{other_name} 的描述" + (f"（{header}）" if header else "")
         item["issue_content"] = f"{mine}\n\n{label}：{theirs}" if mine else theirs
+    # The two versions as reported, so the repeat filter can judge each on its own
+    # (split_repeated_pairs); removed before the finding is posted.
+    item[VERSIONS_KEY] = [dict(g, argus_source=SOURCE_GPT), dict(c, argus_source=SOURCE_CLAUDE)]
     return item
+
+
+VERSIONS_KEY = "argus_versions"
+
+
+def split_repeated_pairs(findings, repeats):
+    """Judge each version of an agreed finding against the existing threads.
+
+    ``repeats(finding)`` returns a drop reason when the finding repeats an existing
+    thread, else None. When one version repeats and the other does not, the pair
+    was matched wrongly or only half of it is new: the new version is kept on its
+    own (tagged with its line) and the repeated one dropped, instead of the merged
+    finding standing or falling as a whole. Returns (findings, dropped)."""
+    out, dropped = [], []
+    for f in findings:
+        versions = f.get(VERSIONS_KEY)
+        if not (isinstance(versions, list) and len(versions) == 2):
+            out.append(f)
+            continue
+        reasons = [repeats(v) for v in versions]
+        if bool(reasons[0]) != bool(reasons[1]):
+            new = 1 if reasons[0] else 0
+            out.append(versions[new])
+            dropped.append((versions[1 - new], reasons[1 - new]))
+        else:
+            out.append(f)
+    return out, dropped
+
+
+def strip_versions(findings):
+    """The findings without the internal VERSIONS_KEY, ready to be posted."""
+    return [{k: v for k, v in f.items() if k != VERSIONS_KEY} for f in findings]
 
 
 def merge_findings(gpt, claude):

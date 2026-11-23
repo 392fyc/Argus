@@ -1422,9 +1422,7 @@ def filter_findings(findings, min_severity=DEFAULT_MIN_SEVERITY, skip_patterns=(
     it takes no part unless a person replied or Argus judged a reply in it.
     """
     floor = _SEVERITY_RANK[_min_severity_name(min_severity)]
-    threads = [t for t in (threads or [])
-               if not t.get("resolved") or t.get("resolved_by_human")
-               or t.get("replied") or t.get("judged")]
+    threads = _relevant_threads(threads)
     kept, dropped = [], []
     for issue in findings:
         if path_matches_skip(issue.get("relevant_file", ""), skip_patterns):
@@ -1435,13 +1433,30 @@ def filter_findings(findings, min_severity=DEFAULT_MIN_SEVERITY, skip_patterns=(
             dropped.append((issue, f"severity {severity} below {_min_severity_name(min_severity)}"))
             continue
         if suppress_repeats:
-            hit = next((t for t in threads if finding_matches_thread(issue, t)), None)
-            if hit is not None:
-                closed = hit.get("resolved_by_human") or hit.get("replied") or hit.get("judged")
-                dropped.append((issue, "repeats a closed thread" if closed else "repeats an open thread"))
+            reason = repeat_reason(issue, threads)
+            if reason:
+                dropped.append((issue, reason))
                 continue
         kept.append(issue)
     return kept, dropped
+
+
+def _relevant_threads(threads):
+    """The threads a repeat is judged against: open ones, and closed ones a person
+    resolved or answered or Argus judged (see filter_findings)."""
+    return [t for t in (threads or [])
+            if not t.get("resolved") or t.get("resolved_by_human")
+            or t.get("replied") or t.get("judged")]
+
+
+def repeat_reason(issue, threads):
+    """The drop reason when ``issue`` repeats one of ``threads`` (already passed
+    through _relevant_threads), else None."""
+    hit = next((t for t in threads if finding_matches_thread(issue, t)), None)
+    if hit is None:
+        return None
+    closed = hit.get("resolved_by_human") or hit.get("replied") or hit.get("judged")
+    return "repeats a closed thread" if closed else "repeats an open thread"
 
 
 def _fetch_argus_threads(provider, pr_number):
@@ -1497,8 +1512,9 @@ def _filter_prediction(prediction, load_yaml, filter_fn):
     """Apply ``filter_fn`` to the key issues in PR-Agent's YAML prediction.
 
     Returns (prediction, dropped). The text is returned unchanged (byte for
-    byte) unless something was dropped; otherwise it is re-serialised with the
-    kept issues so every later reader of self.prediction sees the same list.
+    byte) unless the list changed (something dropped, or a finding rewritten, as
+    dual review does); otherwise it is re-serialised with the kept issues so every
+    later reader of self.prediction sees the same list.
     """
     data = load_yaml(prediction.strip(), keys_fix_yaml=_REVIEW_YAML_FIX_KEYS,
                      first_key="review", last_key="security_concerns")
@@ -1509,7 +1525,7 @@ def _filter_prediction(prediction, load_yaml, filter_fn):
     if not valid or not findings:
         return prediction, []
     kept, dropped = filter_fn(findings)
-    if not dropped:
+    if not dropped and kept == findings:
         return prediction, []
     review["key_issues_to_review"] = kept
     import yaml
@@ -1907,6 +1923,16 @@ def apply_patch():
                 dual = getattr(self, "_argus_dual", None)
 
                 def apply_filters(findings):
+                    split = []
+                    if dual is not None:
+                        from argus_dual import split_repeated_pairs, strip_versions
+                        if threads is not None:
+                            # Each version of an agreed finding is judged on its own,
+                            # so a wrong pairing cannot hide a new finding (argus_dual.py).
+                            relevant = _relevant_threads(threads)
+                            findings, split = split_repeated_pairs(
+                                findings, lambda f: repeat_reason(f, relevant))
+                        findings = strip_versions(findings)
                     kept, dropped = filter_findings(
                         findings,
                         min_severity=_argus_review_setting("min_severity", DEFAULT_MIN_SEVERITY),
@@ -1920,7 +1946,7 @@ def apply_patch():
                         kept, cut = cap_findings(
                             kept, get_settings().pr_reviewer.get("num_max_findings", 5))
                         dual["cut"] = cut
-                        dropped = dropped + [(f, "dual review: over the inline limit") for f in cut]
+                        dropped = split + dropped + [(f, "dual review: over the inline limit") for f in cut]
                     return kept, dropped
 
                 self.prediction, dropped = _filter_prediction(

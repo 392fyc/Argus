@@ -823,3 +823,42 @@ def test_a_type_error_after_the_request_was_built_is_charged(ledger):
     with pytest.raises(ad.LineFailed):
         call(ledger, TypeError("bad event payload"))
     assert ledger.snapshot()[0] > 0
+
+
+def _thread(issue):
+    return {"path": issue["relevant_file"], "resolved": False, "resolved_by_human": False,
+            "replied": False, "judged": False, "first_bot_body": psf.format_review_finding_body(issue)}
+
+
+def test_a_repeated_half_of_a_pair_does_not_hide_the_new_half():
+    # Paired on nearby lines and shared words, but two defects; only the first was posted before.
+    old = finding("app/store.py", 10, 10,
+                  content="parse_header trusts content_length from request_headers; oversized body exhausts memory.")
+    new = finding("app/store.py", 11, 11, header="Security",
+                  content="parse_header trusts content_type from request_headers; wrong charset garbles text.")
+    merged = ad.merge_findings([old], [new])
+    assert len(merged) == 1 and ad.VERSIONS_KEY in merged[0]
+    threads = psf._relevant_threads([_thread(old)])
+    out, dropped = ad.split_repeated_pairs(merged, lambda f: psf.repeat_reason(f, threads))
+    assert [f["argus_source"] for f in out] == ["claude"]
+    assert "wrong charset" in out[0]["issue_content"]
+    assert dropped[0][1] == "repeats an open thread"
+    kept, _ = psf.filter_findings(ad.strip_versions(out), threads=threads)
+    assert len(kept) == 1 and ad.VERSIONS_KEY not in kept[0]
+
+
+def test_a_pair_with_no_repeat_or_two_repeats_stays_whole():
+    a = finding("a.py", 1, 1, content="列表为空时除以零。")
+    merged = ad.merge_findings([a], [dict(a)])
+    out, dropped = ad.split_repeated_pairs(merged, lambda f: None)
+    assert out == merged and dropped == []
+    out, dropped = ad.split_repeated_pairs(merged, lambda f: "repeats an open thread")
+    assert out == merged and dropped == []
+
+
+def test_stripping_the_versions_rewrites_the_prediction():
+    merged = ad.merge_findings([finding("a.py", 1, 1)], [finding("a.py", 1, 1)])
+    text = yaml.safe_dump({"review": {"key_issues_to_review": merged, "security_concerns": "No"}},
+                          allow_unicode=True)
+    out, dropped = psf._filter_prediction(text, load_yaml, lambda fs: (ad.strip_versions(fs), []))
+    assert dropped == [] and ad.VERSIONS_KEY not in out
