@@ -231,12 +231,20 @@ def test_timeout_is_charged_an_estimate_and_fails_the_line(ledger):
 
 # ── merging ───────────────────────────────────────────────────────
 
-def test_same_file_and_overlapping_lines_is_the_same_finding_even_in_chinese():
-    a = finding("src/a.py", 10, 12, content="这里没有处理空列表。")
-    b = finding("./src/a.py", 13, 14, content="空输入会导致异常。")
+def test_nearby_chinese_findings_match_only_when_they_describe_the_same_defect():
+    a = finding("src/a.py", 10, 12, content="items 为空列表时 total / len(items) 会除以零。")
+    b = finding("./src/a.py", 13, 14, content="len(items) 为 0 时这里除以零并抛出异常。")
     assert ad.same_finding(a, b)
-    assert not ad.same_finding(a, finding("src/b.py", 10, 12))
+    assert not ad.same_finding(a, finding("src/b.py", 10, 12, content=a["issue_content"]))
     assert not ad.same_finding(a, finding("src/a.py", 40, 41, content="另一个问题。"))
+
+
+def test_nearby_but_different_defects_stay_separate():
+    null_crash = finding("a.py", 20, 20, content="user 可能为 None，访问 user.name 会崩溃。")
+    permission = finding("a.py", 22, 22, header="Security", content="删除接口没有检查调用者的管理员权限。")
+    assert not ad.same_finding(null_crash, permission)
+    merged = ad.merge_findings([null_crash], [permission])
+    assert sorted(f["argus_source"] for f in merged) == ["claude", "gpt"]
 
 
 def test_same_file_far_apart_matches_on_shared_identifiers():
@@ -266,11 +274,19 @@ def test_merge_tags_sources_counts_and_ranks_by_severity_then_agreement():
     ("No", "No", "No"),
     ("No", "SQL 注入", "SQL 注入"),
     ("XSS", "SQL 注入", "GPT：XSS\n\nClaude：SQL 注入"),
-    (None, "No", "No"),
+    (None, "No", None),           # GPT cut off before the field: stays incomplete
 ])
 def test_security_concerns_are_united(gpt_sec, claude_sec, expected):
     text, _ = ad.merge_predictions(answer([], gpt_sec), answer([], claude_sec), load_yaml)
-    assert yaml.safe_load(text)["review"]["security_concerns"] == expected
+    assert yaml.safe_load(text)["review"].get("security_concerns") == expected
+
+
+def test_a_concern_survives_an_unusable_finding_list():
+    broken = yaml.safe_dump({"review": {"key_issues_to_review": "garbled", "security_concerns": "令牌写进了日志"}},
+                            allow_unicode=True)
+    text, stats = ad.merge_predictions(answer([finding("a.py", 1, 1)], "No"), broken, load_yaml)
+    assert stats["claude_status"] == "unparsed"
+    assert yaml.safe_load(text)["review"]["security_concerns"] == "令牌写进了日志"
 
 
 def test_unparsable_gpt_answer_falls_back_to_claude_alone():
@@ -625,8 +641,9 @@ def test_the_event_is_written_when_gpt_fails_and_claude_is_unparsable(pr_agent_s
 # ── second Argus review (8a18f39) ─────────────────────────────────
 
 def test_an_exact_pair_is_not_traded_for_a_crossed_one():
-    gpt = [finding("a.py", 20, 20, content="甲"), finding("a.py", 22, 22, content="乙")]
-    claude = [finding("a.py", 20, 20, content="甲"), finding("a.py", 19, 19, content="乙")]
+    a, b = "缓存键没有包含用户编号，会串号。", "重试循环没有上限，会一直重试。"
+    gpt = [finding("a.py", 20, 20, content=a), finding("a.py", 22, 22, content=b)]
+    claude = [finding("a.py", 20, 20, content=a), finding("a.py", 19, 19, content=b)]
     assert ad.best_pairing(gpt, claude) == {0: 0, 1: 1}
 
 
@@ -649,3 +666,48 @@ def test_cancelled_call_is_charged_and_the_cancellation_goes_through(ledger):
 
     client = run(scenario())
     assert client.closed and ledger.snapshot()[0] > 0
+
+
+def test_a_connection_that_never_opened_costs_nothing(ledger):
+    refused = anthropic.APIConnectionError(request=_REQUEST)
+    refused.__cause__ = httpx.ConnectError("name resolution failed")
+    with pytest.raises(ad.LineFailed):
+        call(ledger, refused)
+    timeout = anthropic.APITimeoutError(request=_REQUEST)
+    timeout.__cause__ = httpx.ConnectTimeout("connect timed out")
+    with pytest.raises(ad.LineFailed) as e:
+        call(ledger, timeout)
+    assert e.value.status == "timeout"
+    assert ledger.snapshot()[0] == 0
+
+
+# Pairs from the review of the similarity measure: different defects two lines apart
+# must never merge, whatever language or shared sentence pattern they use.
+DIFFERENT = [
+    ("Missing null check on config before use.", "Missing permission check before delete."),
+    ("The function does not check the return value of open.", "The function does not validate the input path."),
+    ("The handler dereferences request.user without checking for None, so anonymous requests crash.",
+     "The delete endpoint does not verify that the caller has the admin role."),
+    ("这里没有处理空列表，会除以零。", "这里没有处理超时，会一直阻塞。"),
+    ("函数返回值没有被检查，错误会被吞掉。", "函数参数没有被校验，非法输入会被接受。"),
+    ("这里的锁没有释放，并发时会死锁。", "这里的文件句柄没有关闭，会泄漏。"),
+    ("parse_config 在 reset_day 为 0 时会抛出 ValueError。", "parse_config 读取 timezone 时没有校验，非法值会被接受。"),
+    ("user 可能为 None，访问 user.name 会崩溃。", "delete_user 没有检查 is_admin，普通用户也能删除他人账号。"),
+]
+
+
+@pytest.mark.parametrize("a, b", DIFFERENT)
+def test_different_defects_on_nearby_lines_never_merge(a, b):
+    assert not ad.same_finding(finding("a.py", 20, 20, content=a), finding("a.py", 22, 22, content=b))
+
+
+def test_an_answer_without_the_security_field_keeps_the_review_incomplete():
+    cut_off = yaml.safe_dump({"review": {"key_issues_to_review": []}})
+    text, _ = ad.merge_predictions(cut_off, answer([], "No"), load_yaml)
+    assert "security_concerns" not in yaml.safe_load(text)["review"]
+
+
+def test_the_section_says_agreement_is_a_lower_bound():
+    stats = {"gpt_status": "ok", "claude_status": "ok", "gpt_findings": 1, "claude_findings": 1,
+             "both": 0, "gpt_only": 1, "claude_only": 1}
+    assert "偏保守" in ad.comparison_section(stats, "g", "c")

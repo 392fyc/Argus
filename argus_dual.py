@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import os
+import re
 from dataclasses import dataclass, replace
 
 from argus_budget import (BudgetExhausted, BudgetLedger, ModelPrice, _count, _field,
@@ -202,6 +203,24 @@ def _is_claude_quota_error(exc) -> bool:
     return status in (400, 429) and any(m in text for m in _SPEND_LIMIT_MARKERS)
 
 
+def _never_sent(exc) -> bool:
+    """True when the request provably never reached the API: the connection itself
+    could not be made (DNS failure, refused connection, connect timeout). The SDK
+    raises APIConnectionError / APITimeoutError from the underlying httpx error."""
+    try:
+        import httpx
+        before_send = (httpx.ConnectError, httpx.ConnectTimeout, httpx.UnsupportedProtocol)
+    except Exception:
+        return False
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        if isinstance(exc, before_send):
+            return True
+        seen.add(id(exc))
+        exc = exc.__cause__  # only the explicit "raise ... from err" chain
+    return False
+
+
 def _rejected_before_work(exc) -> bool:
     """True for an HTTP error status the API returned instead of a response (the
     request was refused, so nothing was generated or billed). An error event inside
@@ -244,12 +263,13 @@ async def claude_review(system, user, config: DualConfig, ledger: BudgetLedger,
     except Exception as exc:
         estimate = (config.model, len(system) + len(user), timeout)
         if is_timeout_error(exc) or type(exc).__name__ == "APITimeoutError":
-            await asyncio.to_thread(ledger.record_timeout, *estimate)
+            if not _never_sent(exc):
+                await asyncio.to_thread(ledger.record_timeout, *estimate)
             raise LineFailed("timeout") from exc
         if _is_claude_quota_error(exc):
             await asyncio.to_thread(ledger.mark_exhausted)
             raise LineFailed("quota", type(exc).__name__) from exc
-        if not _rejected_before_work(exc):
+        if not (_rejected_before_work(exc) or _never_sent(exc)):
             # The answer may have been under way (a dropped stream, an error event
             # mid-stream): the provider can bill it and no usage comes back. Charge
             # the same estimate as a timeout; stopping early beats under-counting.
@@ -287,9 +307,9 @@ async def claude_review(system, user, config: DualConfig, ledger: BudgetLedger,
 
 # ── Merge ─────────────────────────────────────────────────────────
 
-def _parse(text, load_yaml):
-    """(data, findings) when the answer holds a valid key_issues_to_review, else None."""
-    from patch_suggestion_format import _MISSING, _REVIEW_YAML_FIX_KEYS, _normalize_findings
+def _load(text, load_yaml):
+    """The parsed answer when it has a ``review`` table, whatever else is wrong with it."""
+    from patch_suggestion_format import _REVIEW_YAML_FIX_KEYS
     if not text or not text.strip():
         return None
     try:
@@ -298,9 +318,16 @@ def _parse(text, load_yaml):
     except Exception:
         return None
     review = data.get("review") if isinstance(data, dict) else None
-    if not isinstance(review, dict):
+    return data if isinstance(review, dict) else None
+
+
+def _parse(text, load_yaml):
+    """(data, findings) when the answer holds a valid key_issues_to_review, else None."""
+    from patch_suggestion_format import _MISSING, _normalize_findings
+    data = _load(text, load_yaml)
+    if data is None:
         return None
-    findings, valid = _normalize_findings(review.get("key_issues_to_review", _MISSING))
+    findings, valid = _normalize_findings(data["review"].get("key_issues_to_review", _MISSING))
     return (data, findings) if valid else None
 
 
@@ -313,18 +340,71 @@ def _line_range(issue):
     return (min(start, end), max(start, end))
 
 
+# Share of features (Jaccard) two descriptions of one defect must have in common.
+# Measured on hand-written pairs (Argus PR #74 review): different defects scored at
+# most 0.14, the same defect between 0.00 and 0.24. Text alone cannot separate them
+# well, so the threshold is set to keep findings apart rather than merge them wrongly:
+# a wrong merge hides a finding, a missed one only shows a defect twice.
+SIMILAR_TEXT = 0.2
+_CJK_RUN = re.compile(r"[\u4e00-\u9fff]+")
+_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*[A-Za-z0-9_]")
+# English words and Chinese character pairs any finding may contain; they say
+# nothing about which defect it is.
+_STOP_WORDS = frozenset("""
+the and for are was has have had not but you all any from its this that with will can may should
+would could use via per out see now new old yet off let get than then their they them what when
+which while your here there where because also only just more most such some other each every
+being been were into without missing check checks checked does doesn did before after cause
+causes causing allow allows allowing value values function functions method code line lines call
+calls called return returns error errors issue issues possible bug problem potential
+""".split())
+_STOP_PAIRS = frozenset("""
+这里 没有 导致 可能 处理 问题 如果 需要 应该 因为 建议 存在 以及 进行 使用 调用 当前 这个 一个
+时会 会导 时候 的时 没处 未处 后会 并且 但是 直接 会被 返回 函数 参数 检查 校验 错误 异常
+""".split())
+
+
+def _features(text):
+    """Identifiers and words (3+ letters) plus pairs of adjacent Chinese characters,
+    without the generic ones. Letters are never split into pairs: common letter pairs
+    would make any two English sentences look alike."""
+    text = str(text or "")
+    feats = set()
+    for word in _WORD.findall(text):
+        word = word.lower().strip("._")
+        if len(word) >= 3 and word not in _STOP_WORDS:
+            feats.add("w:" + word)
+    for run in _CJK_RUN.findall(text):
+        for a, b in zip(run, run[1:]):
+            if a + b not in _STOP_PAIRS:
+                feats.add("z:" + a + b)
+    return feats
+
+
+def text_similarity(a, b):
+    """Share of the two descriptions' features they have in common (Jaccard, 0 to 1)."""
+    fa, fb = _features(a.get("issue_content")), _features(b.get("issue_content"))
+    if not fa or not fb:
+        return 0.0
+    return len(fa & fb) / len(fa | fb)
+
+
 def same_finding(a, b, slack=3):
-    """True when two findings from different lines are the same complaint: same file
-    and overlapping lines (within ``slack``), or same file and the shared-word test
-    Argus uses against its own threads. Lines decide most cases: the findings are
-    written in Chinese, which the word test does not split into words."""
+    """True when two findings from different lines are the same complaint, on the same
+    file. Nearby lines (within ``slack``) only make two findings candidates: their
+    descriptions must also share at least SIMILAR_TEXT of their character pairs, so a
+    null-pointer crash and a missing permission check two lines apart stay separate
+    unless their descriptions share enough identifiers or wording.
+    Findings further apart match on the shared-word test Argus uses against its own
+    threads. A heuristic: two models may describe one defect in very different words,
+    which then shows up as two one-sided findings rather than one agreed finding."""
     from patch_suggestion_format import _finding_tokens, _norm_path
     path = _norm_path(a.get("relevant_file"))
     if not path or path != _norm_path(b.get("relevant_file")):
         return False
     ra, rb = _line_range(a), _line_range(b)
     if ra and rb and ra[0] <= rb[1] + slack and rb[0] <= ra[1] + slack:
-        return True
+        return text_similarity(a, b) >= SIMILAR_TEXT
     ta, tb = _finding_tokens(a), _finding_tokens(b)
     if not ta or not tb:
         return False
@@ -333,14 +413,11 @@ def same_finding(a, b, slack=3):
 
 
 def match_score(a, b):
-    """How closely two matching findings agree: the share of distinctive words they
-    have in common (0 to 1) plus how much their line ranges overlap (1 for the same
+    """How closely two matching findings agree: the share of character pairs their
+    descriptions have in common (0 to 1) plus how much their line ranges overlap (1 for the same
     lines, below 0 the further apart they are). Higher is closer. Used only to choose
-    among findings that same_finding already accepts; Chinese text has few such words,
-    so for it the lines decide."""
-    from patch_suggestion_format import _finding_tokens
-    ta, tb = _finding_tokens(a), _finding_tokens(b)
-    shared = len(ta & tb) / min(len(ta), len(tb)) if ta and tb else 0.0
+    among findings that same_finding already accepts."""
+    shared = text_similarity(a, b)
     ra, rb = _line_range(a), _line_range(b)
     closeness = 0.0
     if ra and rb:
@@ -425,18 +502,26 @@ def _security_text(review):
     return str(raw).strip()
 
 
-def merge_security(gpt_review, claude_review_):
-    """A concern from either line is kept (labelled when both report one); "No" when
-    at least one line says clear and neither reports a concern; else unchanged."""
-    texts = {SOURCE_GPT: _security_text(gpt_review), SOURCE_CLAUDE: _security_text(claude_review_)}
+_NO_VALUE = object()
+
+
+def merge_security(gpt_review, claude_review_, usable=(SOURCE_GPT, SOURCE_CLAUDE)):
+    """The merged security_concerns, or _NO_VALUE to leave the field out.
+
+    A concern either answer states is kept, even from an answer whose finding list is
+    unusable (labelled when both report one). "No" only when every usable line says so
+    explicitly: a usable answer without the field (output cut off before it) leaves the
+    field out, so Argus still treats the review as incomplete."""
+    reviews = {SOURCE_GPT: gpt_review, SOURCE_CLAUDE: claude_review_}
+    texts = {k: _security_text(r) if isinstance(r, dict) else None for k, r in reviews.items()}
     concerns = {k: v for k, v in texts.items() if v not in (None, "clear")}
     if len(concerns) == 2:
         return f"GPT：{concerns[SOURCE_GPT]}\n\nClaude：{concerns[SOURCE_CLAUDE]}"
     if concerns:
         return next(iter(concerns.values()))
-    if "clear" in texts.values():
+    if usable and all(texts[k] == "clear" for k in usable):
         return "No"
-    return gpt_review.get("security_concerns")
+    return _NO_VALUE
 
 
 def merge_predictions(gpt_text, claude_text, load_yaml, gpt_status="ok", claude_status="ok"):
@@ -459,11 +544,19 @@ def merge_predictions(gpt_text, claude_text, load_yaml, gpt_status="ok", claude_
         return gpt_text, stats
     base = copy.deepcopy((g or c)[0])
     review = base["review"]
+    # Security is read from both answers, also one whose finding list is unusable.
+    loaded = {k: (_load(t, load_yaml) or {}).get("review") if t else None
+              for k, t in ((SOURCE_GPT, gpt_text), (SOURCE_CLAUDE, claude_text))}
+    usable = tuple(k for k, parsed in ((SOURCE_GPT, g), (SOURCE_CLAUDE, c)) if parsed)
+    security = merge_security(loaded[SOURCE_GPT], loaded[SOURCE_CLAUDE], usable)
+    if security is _NO_VALUE:
+        review.pop("security_concerns", None)
+    else:
+        review["security_concerns"] = security
     if g and c:
         findings = merge_findings(g[1], c[1])
         for f in findings:
             stats[{SOURCE_BOTH: "both", SOURCE_GPT: "gpt_only", SOURCE_CLAUDE: "claude_only"}[f["argus_source"]]] += 1
-        review["security_concerns"] = merge_security(g[0]["review"], c[0]["review"])
     else:
         # One line only: nothing to compare, so findings carry no source tag (an
         # inline "仅 GPT" would suggest Claude looked and disagreed).
@@ -505,6 +598,10 @@ def comparison_section(stats, gpt_model, claude_model, cut=()):
     if sum(usable) == 1:
         lines.append("")
         lines.append("本次只有一条线路给出了可用结果，审查按单线进行，行内评论不标来源。")
+    elif stats.get("gpt_only", 0) and stats.get("claude_only", 0):
+        lines.append("")
+        lines.append("“一致”按同一文件、相近行号且描述用词相近判定，偏保守："
+                     "措辞差别大的同一问题会分别计为单边发现。")
     elif sum(usable) == 0:
         lines.append("")
         lines.append("两条线路都没有给出可用结果。")
