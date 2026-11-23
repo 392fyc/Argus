@@ -620,3 +620,32 @@ def test_the_event_is_written_when_gpt_fails_and_claude_is_unparsable(pr_agent_s
     with pytest.raises(RuntimeError):
         prepare(Reviewer(RuntimeError("gpt down")), "not yaml: [")
     assert emitted and emitted[0]["gpt_status"] == "error" and emitted[0]["claude_status"] == "unparsed"
+
+
+# ── second Argus review (8a18f39) ─────────────────────────────────
+
+def test_an_exact_pair_is_not_traded_for_a_crossed_one():
+    gpt = [finding("a.py", 20, 20, content="甲"), finding("a.py", 22, 22, content="乙")]
+    claude = [finding("a.py", 20, 20, content="甲"), finding("a.py", 19, 19, content="乙")]
+    assert ad.best_pairing(gpt, claude) == {0: 0, 1: 1}
+
+
+def test_cancelled_call_is_charged_and_the_cancellation_goes_through(ledger):
+    async def scenario():
+        started = asyncio.Event()
+
+        async def hang():
+            started.set()
+            await asyncio.sleep(60)
+
+        client = FakeClient(hang)
+        task = asyncio.create_task(ad.claude_review("sys", "user", DUAL, ledger, 300, api_key="k",
+                                                    client_factory=lambda key, t: client))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return client
+
+    client = run(scenario())
+    assert client.closed and ledger.snapshot()[0] > 0

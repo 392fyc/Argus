@@ -256,6 +256,16 @@ async def claude_review(system, user, config: DualConfig, ledger: BudgetLedger,
             await asyncio.to_thread(ledger.record_timeout, *estimate,
                                     reason=f"failed ({type(exc).__name__}) after it may have started")
         raise LineFailed("error", type(exc).__name__) from exc
+    except asyncio.CancelledError:
+        # The review was cancelled while the request was out: the provider may still
+        # bill it. Charge the estimate synchronously (awaiting is not reliable inside
+        # a cancellation), then let the cancellation through.
+        try:
+            ledger.record_timeout(config.model, len(system) + len(user), timeout,
+                                  reason="was cancelled while in flight")
+        except Exception:
+            pass
+        raise
     finally:
         close = getattr(client, "close", None)
         if close is not None:
@@ -345,36 +355,53 @@ def _rank(issue):
     return _SEVERITY_RANK[_finding_severity(issue)]
 
 
+MAX_EXACT_PAIRING = 12  # Claude findings; 2**12 states per GPT finding
+
+
+def best_pairing(gpt, claude):
+    """{gpt index: claude index} for the findings both lines reported.
+
+    Of all one-to-one pairings that same_finding allows, the one with the most pairs,
+    and among those the highest total match_score: no pair is lost to greed, and an
+    exact pair is never traded for a weaker one that gives the same count. Exact by
+    dynamic programming over the set of Claude findings already taken; the lines
+    report a handful of findings each (the prompt asks for at most num_max_findings).
+    Beyond MAX_EXACT_PAIRING Claude findings, the best-scoring pairs are taken first."""
+    edges = {gi: [(ci, match_score(g, c)) for ci, c in enumerate(claude) if same_finding(g, c)]
+             for gi, g in enumerate(gpt)}
+    if len(claude) > MAX_EXACT_PAIRING:
+        pairs, taken = {}, set()
+        for score, gi, ci in sorted(((s, gi, ci) for gi, es in edges.items() for ci, s in es),
+                                    key=lambda e: (-e[0], e[1], e[2])):
+            if gi not in pairs and ci not in taken:
+                pairs[gi] = ci
+                taken.add(ci)
+        return pairs
+    # best[mask] = (pair count, total score, pairing) using the GPT findings seen so far
+    best = {0: (0, 0.0, ())}
+    for gi in range(len(gpt)):
+        step = dict(best)
+        for mask, (count, total, chosen) in best.items():
+            for ci, score in edges[gi]:
+                if mask >> ci & 1:
+                    continue
+                key = mask | 1 << ci
+                value = (count + 1, total + score, chosen + ((gi, ci),))
+                if key not in step or value[:2] > step[key][:2]:
+                    step[key] = value
+        best = step
+    winner = max(best.values(), key=lambda v: (v[0], v[1]))
+    return dict(winner[2])
+
+
 def merge_findings(gpt, claude):
     """One list from both lines, each finding tagged with ``argus_source``.
 
     A finding both lines reported keeps the more severe of the two versions. The list
     is ordered by severity, agreed findings first within a severity, so a cap keeps
     the most severe findings and prefers the agreed ones among equals."""
-    # As many agreed pairs as possible (augmenting paths), each finding trying its
-    # closest candidates first, so a loose match early in one list cannot take the
-    # finding that a later one matches exactly, and no pair is lost to greed.
-    candidates = {gi: [ci for _, ci in sorted(((-match_score(g, c), ci) for ci, c in enumerate(claude)
-                                               if same_finding(g, c)))]
-                  for gi, g in enumerate(gpt)}
-    owner = {}  # claude index -> gpt index
-
-    def place(gi, seen):
-        for ci in candidates[gi]:
-            if ci in seen:
-                continue
-            seen.add(ci)
-            if ci not in owner or place(owner[ci], seen):
-                owner[ci] = gi
-                return True
-        return False
-
-    order_by_best = sorted(candidates, key=lambda gi: -max(
-        (match_score(gpt[gi], claude[ci]) for ci in candidates[gi]), default=float("-inf")))
-    for gi in order_by_best:
-        place(gi, set())
-    pair_of = {gi: ci for ci, gi in owner.items()}
-    used = set(owner)
+    pair_of = best_pairing(gpt, claude)
+    used = set(pair_of.values())
     merged = []
     for gi, g in enumerate(gpt):
         if gi not in pair_of:
@@ -562,8 +589,16 @@ async def dual_prepare_prediction(reviewer, model, original, claude_call=None):
         # The review goes ahead on Claude alone: the command did not fail.
         _note_outcome(None)
         print(f"[Argus Dual] GPT line failed ({stats['gpt_status']}); reviewing with Claude alone")
+    elif stats["gpt_status"] != "ok" and stats["claude_status"] != "ok":
+        # Neither answer is usable, but the GPT call returned: its text goes on as it
+        # did before dual review, and Argus reports it as incomplete output (no
+        # approval wording) instead of a failed command.
+        print(f"[Argus Dual] neither line usable (GPT {stats['gpt_status']}, Claude "
+              f"{stats['claude_status']}); passing the GPT answer on unchanged, as before dual review")
     elif stats["claude_status"] != "ok":
         print(f"[Argus Dual] Claude line unavailable ({stats['claude_status']}); reviewing with GPT alone")
+    elif stats["gpt_status"] != "ok":
+        print(f"[Argus Dual] GPT answer unusable ({stats['gpt_status']}); reviewing with Claude alone")
     reviewer.prediction = text
     reviewer._argus_dual = dict(stats, gpt_model=str(model), claude_model=config.model, cut=[])
     _emit(reviewer, model, config, stats)
