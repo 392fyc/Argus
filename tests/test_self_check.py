@@ -275,6 +275,16 @@ class TestStableSignatures:
         b = self._blocked(str(tmp_path / "b.jsonl"), ["copilot"] * 6)
         assert a[0].signature == b[0].signature
 
+    def test_mixed_case_actor_sets_share_a_signature(self, tmp_path, monkeypatch):
+        # Lower-case before sorting: "Bot-x" sorts before "alice", "bot-x" after it.
+        monkeypatch.delenv("ARGUS_SELF_CHECK_EXPECTED_ACTORS", raising=False)
+        a = self._blocked(str(tmp_path / "a.jsonl"), ["Bot-x"] * 3 + ["alice"] * 3)
+        b = self._blocked(str(tmp_path / "b.jsonl"), ["bot-x"] * 3 + ["alice"] * 3)
+        c = self._blocked(str(tmp_path / "c.jsonl"), ["Bot-x"] * 3 + ["bot-x"] * 3)
+        d = self._blocked(str(tmp_path / "d.jsonl"), ["bot-x"] * 6)
+        assert a[0].signature == b[0].signature
+        assert c[0].signature == d[0].signature
+
     def test_expected_actors_file_nothing(self, tmp_path, monkeypatch):
         monkeypatch.setenv("ARGUS_SELF_CHECK_EXPECTED_ACTORS", "mercury-deploy[bot], Copilot")
         found = self._blocked(str(tmp_path / "a.jsonl"), ["mercury-deploy[bot]"] * 20 + ["copilot"] * 10)

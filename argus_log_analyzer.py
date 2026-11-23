@@ -277,7 +277,7 @@ def analyze(
                 "to ARGUS_SELF_CHECK_EXPECTED_ACTORS."
             ),
             # A new set of actors is a new finding; the same set is not.
-            signature=_signature(TYPE_ACCESS_PATTERN, *[a.lower() for a in actors]),
+            signature=_signature(TYPE_ACCESS_PATTERN, *sorted({a.lower() for a in actors})),
         ))
 
     # Sort: critical → high → medium → low
