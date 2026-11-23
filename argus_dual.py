@@ -31,6 +31,7 @@ import re
 from dataclasses import dataclass, replace
 
 from argus_budget import (BudgetExhausted, BudgetLedger, ModelPrice, _count, _field,
+                          estimate_prompt_tokens,
                           _note_outcome, find_price, is_quota_error, is_timeout_error,
                           parse_config)
 
@@ -237,9 +238,19 @@ def _make_client(api_key, timeout):
     return anthropic.AsyncAnthropic(api_key=api_key, max_retries=0, timeout=timeout)
 
 
-def _failure_outcome(exc, ledger, model, prompt_size, timeout, built=True):
-    """(ledger write or None, LineFailed or None to re-raise) for a failed call."""
-    estimate = functools.partial(ledger.record_timeout, model, prompt_size, timeout)
+def _charge_estimate(ledger, model, system, user, timeout, reason="timed out"):
+    """Charge a call whose usage never came back. The prompt is counted in tokens the
+    way the GPT line counts its own (LiteLLM's counter; one per character only if it
+    cannot count), so a failed Claude call is not charged per character."""
+    tokens = estimate_prompt_tokens({"model": model, "messages": [
+        {"role": "system", "content": system}, {"role": "user", "content": user}]})
+    return ledger.record_timeout(model, tokens, timeout, reason=reason)
+
+
+def _failure_outcome(exc, ledger, model, prompt, timeout, built=True):
+    """(ledger write or None, LineFailed or None to re-raise) for a failed call.
+    ``prompt`` is (system, user); the write runs in a worker thread."""
+    estimate = functools.partial(_charge_estimate, ledger, model, *prompt, timeout)
     if isinstance(exc, asyncio.CancelledError):
         # Cancelled while the request was out: the provider may still bill it.
         return functools.partial(estimate, reason="was cancelled while in flight"), None
@@ -304,7 +315,7 @@ async def claude_review(system, user, config: DualConfig, ledger: BudgetLedger,
         # Record first, then close: the write is shielded and runs in a thread, so a
         # cancellation that arrives while closing (or now) cannot drop it.
         charge, failure = _failure_outcome(exc, ledger, config.model,
-                                           len(system) + len(user), timeout, built)
+                                           (system, user), timeout, built)
         try:
             if charge is not None:
                 await asyncio.shield(asyncio.to_thread(charge))
@@ -354,7 +365,17 @@ def _parse(text, load_yaml):
     if data is None:
         return None
     findings, valid = _normalize_findings(data["review"].get("key_issues_to_review", _MISSING))
-    return (data, findings) if valid else None
+    return (data, strip_internal(findings)) if valid else None
+
+
+INTERNAL_KEYS = ("argus_source", "argus_versions")
+
+
+def strip_internal(findings):
+    """The findings without Argus's internal fields: a model that writes them itself
+    (e.g. ``argus_source: both``) must not set the source note or the pairing."""
+    return [{k: v for k, v in f.items() if k not in INTERNAL_KEYS} if isinstance(f, dict) else f
+            for f in findings]
 
 
 def _line_range(issue):
@@ -581,8 +602,12 @@ def merge_findings(gpt, claude):
         c = claude[pair_of[gi]]
         merged.append(_combine(g, c))
     merged += [dict(c, argus_source=SOURCE_CLAUDE) for i, c in enumerate(claude) if i not in used]
-    order = {SOURCE_BOTH: 0, SOURCE_GPT: 1, SOURCE_CLAUDE: 1}
-    return sorted(merged, key=lambda f: (-_rank(f), order[f["argus_source"]]))
+    return rank_findings(merged)
+
+
+def rank_findings(findings):
+    """Most severe first, agreed findings first among equals (stable otherwise)."""
+    return sorted(findings, key=lambda f: (-_rank(f), 0 if f.get("argus_source") == SOURCE_BOTH else 1))
 
 
 def _security_text(review):

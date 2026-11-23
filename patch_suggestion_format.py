@@ -1926,7 +1926,12 @@ def apply_patch():
 
                 def apply_filters(findings):
                     split, judged = [], ()
-                    if dual is not None:
+                    if dual is None:
+                        # Without dual review these fields mean nothing; one a model
+                        # wrote itself must not add a source note (argus_dual.py).
+                        from argus_dual import strip_internal
+                        findings = strip_internal(findings)
+                    else:
                         from argus_dual import split_repeated_pairs, strip_versions
                         if threads is not None:
                             # Each version of an agreed finding is judged on its own,
@@ -1945,10 +1950,12 @@ def apply_patch():
                     if dual is not None:
                         # Two lines can report up to twice as many findings; the
                         # inline count keeps the single-line limit (argus_dual.py).
-                        from argus_dual import cap_findings
+                        from argus_dual import cap_findings, rank_findings
                         from pr_agent.config_loader import get_settings
+                        # Splitting a pair can lower a finding's severity: rank again
+                        # before the limit decides which go inline.
                         kept, cut = cap_findings(
-                            kept, get_settings().pr_reviewer.get("num_max_findings", 5))
+                            rank_findings(kept), get_settings().pr_reviewer.get("num_max_findings", 5))
                         dual["cut"] = cut
                         dropped = split + dropped + [(f, "dual review: over the inline limit") for f in cut]
                     return kept, dropped

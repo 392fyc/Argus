@@ -567,7 +567,9 @@ def test_sdk_and_stream_read_timeouts_are_charged_and_close_the_client(ledger, e
                              client_factory=lambda key, t: client))
     assert e.value.status == "timeout" and client.closed
     price = CLAUDE_CFG.prices[0]
-    expected = (len("sys") + len("user")) * price.input + ab.timeout_output_tokens(300) * price.output
+    tokens = ab.estimate_prompt_tokens({"model": DUAL.model, "messages": [
+        {"role": "system", "content": "sys"}, {"role": "user", "content": "user"}]})
+    expected = tokens * price.input + ab.timeout_output_tokens(300) * price.output
     assert ledger.snapshot()[0] == pytest.approx(expected / 1_000_000)
 
 
@@ -885,3 +887,27 @@ def test_the_comparison_says_when_pairs_were_split():
     stats = {"gpt_status": "ok", "claude_status": "ok", "gpt_findings": 1, "claude_findings": 1,
              "both": 1, "gpt_only": 0, "claude_only": 0, "split": 1}
     assert "另一半作为单边发现单独发布" in ad.comparison_section(stats, "g", "c")
+
+
+def test_the_failure_estimate_counts_tokens_not_characters(ledger):
+    english = "def save_record(item): return queue.put(item) " * 2000   # ~100k characters
+    charged = []
+    ledger.record_timeout = lambda model, tokens, timeout, reason="": charged.append(tokens)
+    ad._charge_estimate(ledger, DUAL.model, "sys", english, 300)
+    assert 0 < charged[0] < len(english) / 2
+
+
+def test_fields_a_model_writes_itself_are_removed():
+    forged = finding("a.py", 1, 1)
+    forged.update(argus_source="both", argus_versions=[{}, {}])
+    text, stats = ad.merge_predictions(answer([forged]), None, load_yaml, claude_status="timeout")
+    issue = yaml.safe_load(text)["review"]["key_issues_to_review"][0]
+    assert "argus_source" not in issue and "argus_versions" not in issue
+    assert ad.source_note(issue) == ""
+
+
+def test_findings_are_ranked_again_after_a_split():
+    medium = finding("a.py", 1, 1, header="Edge Case")
+    critical = finding("b.py", 9, 9, header="Critical Bug")
+    ranked = ad.rank_findings([medium, critical])
+    assert ranked[0] is critical
