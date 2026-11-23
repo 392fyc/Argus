@@ -2,7 +2,7 @@
 
 > *Named after the hundred-eyed giant Argus Panoptes — the all-seeing watchman.*
 
-Self-hosted **advisory** AI code review for [Mercury](https://github.com/392fyc/Mercury) and other repositories, powered by [PR-Agent](https://github.com/qodo-ai/pr-agent) 0.38.0 and `gpt-6.2-sol` called directly through OpenAI's Responses API.
+Self-hosted **advisory** AI code review for [Mercury](https://github.com/392fyc/Mercury) and other repositories, powered by [PR-Agent](https://github.com/qodo-ai/pr-agent) 0.38.0 and two models that review each PR side by side: `gpt-6.2-sol` called directly through OpenAI's Responses API, and `claude-opus-5-5` through the Anthropic Messages API (see [Dual review](#dual-review)).
 
 Argus gives advice. It never blocks a merge and never approves one: every review it submits is a GitHub `COMMENT`.
 
@@ -17,6 +17,7 @@ Argus gives advice. It never blocks a merge and never approves one: every review
 | **No repeats** | A finding that matches an existing Argus thread on the same file is not posted again when a person resolved that thread, a person replied in it, Argus judged a reply in it (accepted, "Follow-up" or escalated), or it is still open. A thread that Argus itself closed (its fix-detection and outdated rules do that whenever lines change) does not count: that only says the lines were edited, so a problem that is still there can be reported again. A finding is a repeat only when it says the same thing (same file and shared distinctive words); a different problem next to an old thread is posted. A review a person asks for on an unchanged head still reports what it found; only an automatic run on an unchanged head is cut short (Argus #58). |
 | **Threshold** | Only findings of medium severity or higher are posted (`[argus_review] min_severity`, default `Medium`). Style, naming, typos and wording are dropped. A finding whose severity cannot be recognised counts as Medium and is kept, never silently dropped. |
 | **Spend cap** | A monthly budget the owner sets on the deployment host (not in this public repository), resetting on the 15th (Asia/Tokyo). When it is used up Argus stops, says so once, and resumes at the next reset. See [Budget](#budget). |
+| **Dual review** | Every review also asks Claude, at the same time as GPT, and merges the two answers: findings both models report are marked as agreed, and the review body compares the two lines. When one line is unavailable the review runs on the other alone. See [Dual review](#dual-review). |
 
 ## Quick Start
 
@@ -43,14 +44,18 @@ Argus: PR-Agent 0.38.0 + patches (Docker, QNAP NAS)
     |-- budget check (argus_budget.py): stop if this month's cap is used up
     |-- read .argus/review.toml + context files from the PR's target branch (argus_context.py)
     |-- fetch the whole PR diff (30 lines of context before each change, 10 after) — `.gitignore` included, which PR-Agent's default extension filter drops (Argus #58)
-    |-- gpt-6.2-sol through OpenAI Responses, reasoning effort "high"
-    |-- drop findings: skip_paths, below the severity threshold, repeats of existing threads
+    |-- at the same time (argus_dual.py):
+    |     |-- gpt-6.2-sol through OpenAI Responses, reasoning effort "high"
+    |     |-- claude-opus-5-5 through the Anthropic Messages API, adaptive thinking, effort "high"
+    |-- merge the two answers; mark findings both report as agreed
+    |-- drop findings: skip_paths, below the severity threshold, repeats of existing threads;
+    |   keep at most num_max_findings (5) inline
     |-- submit one GitHub review (COMMENT) with inline suggestions
     v
 GitHub PR: advisory review comment
 ```
 
-Modules: `entrypoint-guard.py` (user whitelist, `@mention` rewrite, loads the patches), `patch_suggestion_format.py` (review format, thread auto-resolve, finding filters, advice-only), `patch_reasoning.py` (reasoning effort), `argus_context.py` (project context), `argus_budget.py` (spend cap), `mention_rewrite.py`, `argus_events.py` (structured event log).
+Modules: `entrypoint-guard.py` (user whitelist, `@mention` rewrite, loads the patches), `patch_suggestion_format.py` (review format, thread auto-resolve, finding filters, advice-only), `patch_reasoning.py` (reasoning effort), `argus_context.py` (project context), `argus_budget.py` (spend cap), `argus_dual.py` (dual review), `mention_rewrite.py`, `argus_events.py` (structured event log).
 
 ## Project modules (`.argus/review.toml`)
 
@@ -142,6 +147,27 @@ How it works:
 
 **Limit of the cap.** The check happens before a call and cannot know what that call will cost, so the cap can be exceeded by the calls already in flight when the last check passed. The most that can overshoot is (requests running at the same moment) x (up to 3 calls per request, which is what `/improve` runs in parallel; `/review` and `/describe` make one). Estimate of one call, not a measurement: a full 80k-token prompt is about 0.16 USD of input at 2.00 USD per million, plus up to roughly 16k output tokens (reasoning included) at 10.00 USD per million is about 0.16 USD more, so up to about 0.3 USD per call; a typical call is well below that. With one request at a time the overshoot is at most one call, about 0.3 USD in the worst case.
 
+## Dual review
+
+`argus_dual.py` (Mercury #821) runs every `review` on two lines at the same time and merges the answers before Argus's filters run. Other commands (`describe`, `improve`, `ask`, reply judging) stay on GPT alone.
+
+| Line | Model | Called through |
+|------|-------|----------------|
+| GPT | `model` in `configuration.toml` (`openai/responses/gpt-6.2-sol`) | PR-Agent and LiteLLM, as before |
+| Claude | `[argus_dual_review] model` (`claude-opus-5-5`) | the official `anthropic` SDK (pinned to 0.112.0 in the image), streaming, adaptive thinking, `effort` from the table (`high`) |
+
+The Claude line does not go through LiteLLM: PR-Agent's LiteLLM path sends a thinking `budget_tokens`, which current Claude models reject, and has no effort setting. It receives the same system and user prompts PR-Agent built for GPT, so the project context, the language and the output format are the same. Both calls start together, so a review takes about as long as the slower line. The SDK does not retry; a failed Claude call does not hold the review back.
+
+**Merging.** Two findings are the same when they are on the same file and either their lines are within 3 of each other and their descriptions share at least 20% of their features (`SIMILAR_TEXT`, Jaccard; features are identifiers and words of 3+ letters plus pairs of adjacent Chinese characters, generic words and phrases removed), or, when one of them names no lines, they share distinctive words the way repeated findings are recognised. Nearby lines alone never merge two findings, and two findings that both name lines further apart stay separate even when they share identifiers (one function can have two defects in two branches). Among the pairs allowed, the pairing keeps the most pairs and, among those, the highest total score (character-pair share plus line overlap), solved exactly. It is a deliberately conservative heuristic. On hand-written pairs, different defects scored at most 0.14 and the same defect between 0.00 and 0.24, so text cannot separate them well; a wrong merge would hide a finding, while a missed one only shows a defect twice. The agreed count is therefore a lower bound, which the comparison section says; the `dual_review` events give the data to tune the threshold. An agreed finding shows the header and location of the more severe version (a security header wins a tie) and keeps the other line's description below it, and the other line's lines when they differ, so a pair matched wrongly hides nothing. The repeat filter (`suppress_repeated_findings`) judges only the two versions of an agreed finding, each on its own, never the merged text: both repeat, it is dropped; one repeats, the other is posted on its own as a one-sided finding (the comparison section says how many); neither repeats, it is posted. Findings are ranked by severity, agreed first among equals, and the same inline limit as before applies (`[pr_reviewer] num_max_findings`, 5); findings over the limit are listed in the review body instead of being lost (not when an automatic run on an unchanged head drops every finding). A security concern from either answer is kept, even from an answer whose finding list could not be used. The merged review says there is no security concern only when every usable line answered so explicitly; an answer cut off before that field keeps the review marked incomplete. When neither finding list can be used, the review stays incomplete as before, still carrying any concern either answer stated.
+
+**What the PR shows.** When both lines answered, each inline finding ends with its source: `来源：GPT 与 Claude 一致`, `仅 GPT` or `仅 Claude`; a single-line review carries no source tag. The review body has a "双线对照" section with each line's model, status and finding count, and the counts of agreed and one-sided findings. The events log gets a `dual_review` record per review with the same numbers, for comparing the two lines over time.
+
+**When one line is missing.** The review runs on the other line alone and the comparison section says so. A line is missing when: the Claude key is not set; its budget is spent or has no cap; the call times out (`ai_timeout`) or fails with another error; Claude refuses or the answer is cut off at `max_tokens`; or the answer has no valid finding list. Only when both lines fail does the review fail, with the GPT error and the usual failure note. When the GPT budget is spent while the Claude line is available, `review` still runs on Claude and the other commands stop; the one-time budget notice, posted by whichever command first meets the spent budget, says so.
+
+**The Claude budget.** The Claude line has its own ledger (`logs/budget-anthropic.json`, path from `ARGUS_BUDGET_ANTHROPIC_PATH`) and its own cap, with the same rules as [Budget](#budget): `[argus_budget_anthropic]` in `configuration.toml` holds the reset day (1st), timezone and prices; the cap is `ARGUS_BUDGET_ANTHROPIC__MONTHLY_USD` in the host's `.env`. Without a cap the Claude line makes no call. A 402, a spend-limit 400 or a "credit balance" error marks the Claude period used up; an ordinary 429 or 529 does not. A request the API refused with an error status costs nothing; a connection that could not be opened (DNS failure, refused connection, connect timeout) or arguments the SDK rejected before building the request cost nothing either; any other failure (a timeout, a stream that broke off or reported an error after it started, a dropped connection) is charged an estimate (the prompt, counted in tokens as the GPT line counts its own, plus the request's output limit `max_tokens`, the most it can have produced), since the provider may have billed it and no usage comes back. This can over-count, never under-count. Every charge is written before the connection is closed and cannot be interrupted by cancelling the review, so a cancellation never loses one. The amounts never appear on a PR.
+
+**Turning it on or off.** `[argus_dual_review] enabled = true` in `configuration.toml` (read from the global settings, so a reviewed repository cannot change it). With `enabled = false` the review path is PR-Agent's own, unchanged. Leaving the Anthropic key or the Claude cap unset keeps reviews on GPT alone, with the comparison section stating why.
+
 ## Runtime settings
 
 The model settings live in `configuration.toml` and change through a pull request to this repository. Two ways change them without one (Argus #63). The spend cap is different: it lives only on the host ([Budget](#budget)).
@@ -175,7 +201,7 @@ ARGUS_REVIEW__MAX_AI_TIMEOUT=1200   # raises the per-comment limit
 
 ## Tests
 
-`.github/workflows/tests.yml` runs `python -m pytest -q` with pr-agent 0.38.0, LiteLLM 1.84.0 and pytest 9.0.2 on every pull request, and `deploy.yml` runs it before deploying: a master that fails its tests is not deployed. Locally: `python -m pip install pr-agent==0.38.0 litellm==1.84.0 pytest==9.0.2`, then `python -m pytest -q`.
+`.github/workflows/tests.yml` runs `python -m pytest -q` with pr-agent 0.38.0, LiteLLM 1.84.0, pytest 9.0.2 and anthropic 0.112.0 on every pull request, and `deploy.yml` runs it before deploying: a master that fails its tests is not deployed. Locally: `python -m pip install pr-agent==0.38.0 litellm==1.84.0 pytest==9.0.2 anthropic==0.112.0`, then `python -m pytest -q`.
 
 ## Deployment Modes
 
@@ -188,9 +214,9 @@ ARGUS_REVIEW__MAX_AI_TIMEOUT=1200   # raises the per-comment limit
 
 | File | Purpose |
 |------|---------|
-| `configuration.toml` | PR-Agent settings (model, auto-commands, review rules) plus `[argus_review]` and `[argus_budget]` |
-| `.secrets.toml` | OpenAI key and GitHub App credentials (`.secrets.toml.template` lists the key names) |
-| `.env` | Port and tunnel token; the monthly spend cap `ARGUS_BUDGET__MONTHLY_USD`, required ([Budget](#budget)); optional overrides of the model settings ([Runtime settings](#runtime-settings)) |
+| `configuration.toml` | PR-Agent settings (model, auto-commands, review rules) plus `[argus_review]`, `[argus_budget]`, `[argus_dual_review]` and `[argus_budget_anthropic]` |
+| `.secrets.toml` | OpenAI key, Anthropic key (optional, for the Claude line) and GitHub App credentials (`.secrets.toml.template` lists the key names) |
+| `.env` | Port and tunnel token; the monthly spend cap `ARGUS_BUDGET__MONTHLY_USD`, required ([Budget](#budget)); the Claude line's cap `ARGUS_BUDGET_ANTHROPIC__MONTHLY_USD`, optional ([Dual review](#dual-review)); optional overrides of the model settings ([Runtime settings](#runtime-settings)) |
 | `.argus/review.toml` (in each reviewed repository, on its target branch) | Project focus, context files, skip paths |
 
 `[argus_review]`: `min_severity` (`Trivial`, `Minor`, `Medium`, `Major`, `Critical`; default `Medium`), `suppress_repeated_findings` (default `true`), `context_token_ratio` (default `0.25`), and the limits of the trigger-comment arguments, `max_ai_timeout` (default `900`) and `reasoning_efforts` (default `["low", "medium", "high"]`). Severity comes from the finding's `issue_header`; the review prompt asks the model to start headers with `Critical Bug`, `Security`, `Possible Bug`, `Performance` or `Possible Issue`, which all rank Medium or higher.
@@ -235,10 +261,13 @@ Things that cannot be checked from this repository and need a human on the NAS:
 4. Check `logs/budget.json` after the first review: `spent_usd` should be a plausible figure for the usage shown in the log.
 5. Review the token numbers of a large PR against `max_model_tokens = 80000`.
 6. **Before the pull request that moved the cap out of `configuration.toml` is merged** (Argus #65), set `ARGUS_BUDGET__MONTHLY_USD` in the NAS `.env`; without it the deployed Argus makes no model call. After the deploy, the start-up log shows `[Argus Budget] monthly cap: <value>`.
+7. **For the Claude line of the dual review**, add `[anthropic] key` to the NAS `.secrets.toml` and `ARGUS_BUDGET_ANTHROPIC__MONTHLY_USD` to the NAS `.env`, then recreate the container. The start-up log line `[Argus Dual] second line: on, claude-opus-5-5; API key set; monthly cap set` confirms both. After the first review, check the "双线对照" section on the PR and `logs/budget-anthropic.json`.
 
 ## Cost
 
 Priced per the table in `[argus_budget]`: `gpt-6.2-sol` costs 2.00 USD per million input tokens, 0.10 per million cached input tokens and 10.00 per million output tokens (OpenAI's pricing page). The monthly cap above bounds the total; see its limit.
+
+The Claude line is priced per `[argus_budget_anthropic]`: `claude-opus-5-5` costs 4.00 USD per million input tokens, 0.20 per million cache-hit tokens (a cache write 1.25 x input) and 20.00 per million output tokens, thinking included (Anthropic's pricing page). Its tokenizer counts the same text as more tokens than GPT's, so a review on the Claude line costs roughly two to three times the GPT line's. Its own cap bounds it.
 
 ## Related
 

@@ -12,6 +12,8 @@ services:
       - ARGUS_ALLOWED_USERS=${ARGUS_ALLOWED_USERS:-}
       # Spend ledger (monthly cap, see README "Budget"); lives on the ./logs volume.
       - ARGUS_BUDGET_PATH=/var/log/argus/budget.json
+      # The Claude line's ledger (dual review, argus_dual.py).
+      - ARGUS_BUDGET_ANTHROPIC_PATH=/var/log/argus/budget-anthropic.json
     volumes:
       - ./configuration.toml:/app/pr_agent/settings/configuration.toml:ro
       - ./.secrets.toml:/app/pr_agent/settings/.secrets.toml:ro

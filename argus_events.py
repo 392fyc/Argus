@@ -28,6 +28,7 @@ class EventType(str, Enum):
     MENTION_REWRITTEN = "mention_rewritten"
     REQUEST_BLOCKED = "request_blocked"
     BUDGET_EXHAUSTED = "budget_exhausted"
+    DUAL_REVIEW = "dual_review"
 
 
 @dataclass

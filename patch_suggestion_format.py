@@ -240,8 +240,23 @@ def format_review_finding_body(issue: dict) -> str:
     parts.append("```")
     parts.append("")
     parts.append("</details>")
+    # Dual review (argus_dual.py): which line reported it. Placed after the
+    # <details> block so thread matching, which reads only the text before it,
+    # is unaffected.
+    note = _source_note(issue)
+    if note:
+        parts.append("")
+        parts.append(note)
 
     return "\n".join(parts)
+
+
+def _source_note(issue):
+    try:
+        from argus_dual import source_note
+        return source_note(issue)
+    except Exception:
+        return ""
 
 
 def build_aggregated_agent_prompt(issues: list) -> str:
@@ -300,7 +315,8 @@ def _runtime_engine_info():
 
 
 def build_review_body_additions(findings: list, inline_count: int,
-                                diff_files=None, extra_filenames=None) -> str:
+                                diff_files=None, extra_filenames=None,
+                                dual_section=None, second_model=None) -> str:
     """Build CodeRabbit-style additions to prepend/append to review body.
 
     Adds: actionable comments count, aggregated AI prompt, review info.
@@ -309,6 +325,9 @@ def build_review_body_additions(findings: list, inline_count: int,
     of diff_files (e.g. .gitignore) but were genuinely changed in the PR;
     merged into the 'Files reviewed' footer for display only. Default None
     keeps the footer byte-for-byte identical for every existing caller.
+
+    dual_section / second_model: the dual-review comparison block and the
+    Claude model (argus_dual.py); None leaves the body as before.
     """
     parts = []
 
@@ -349,6 +368,10 @@ def build_review_body_additions(findings: list, inline_count: int,
         except Exception:
             pass
 
+    if dual_section:
+        parts.append(dual_section)
+        parts.append("")
+
     parts.append("---")
     parts.append("")
     parts.append("<details>")
@@ -359,7 +382,8 @@ def build_review_body_additions(findings: list, inline_count: int,
     parts.append("")
     engine_version, model_name = _runtime_engine_info()
     parts.append(f"**Engine**: PR-Agent {engine_version} + Argus patches")
-    parts.append(f"**Model**: {model_name}")
+    parts.append(f"**Model**: {model_name}"
+                 + (f" + {second_model}" if second_model else ""))
     parts.append("**Mode**: CodeRabbit-compatible")
     parts.append("")
     parts.append("</details>")
@@ -1362,11 +1386,36 @@ def finding_matches_thread(issue, thread, min_overlap=3, min_ratio=0.4):
     path = _norm_path(issue.get("relevant_file"))
     if not path or path != _norm_path(thread.get("path")):
         return False
-    a, b = _finding_tokens(issue), _thread_tokens(thread)
-    if not a or not b:
+    a = _finding_tokens(issue)
+
+    def close(b):
+        overlap = len(a & b) if a and b else 0
+        return overlap >= min_overlap and overlap / min(len(a), len(b)) >= min_ratio
+
+    if not close(_thread_tokens(thread)):
         return False
-    overlap = len(a & b)
-    return overlap >= min_overlap and overlap / min(len(a), len(b)) >= min_ratio
+    # An agreed dual-review thread holds two descriptions: one of them must match
+    # on its own too. This only ever narrows the rule above, never widens it.
+    parts = _thread_token_parts(thread)
+    return len(parts) == 1 or any(close(b) for b in parts)
+
+
+# Where an agreed dual-review finding appends the other line's description
+# (argus_dual._combine: "\n\nClaude 的描述（header）：..."; the header may itself
+# contain full-width brackets, so the bracket part ends at the first "）：").
+_OTHER_LINE_DESCRIPTION = re.compile(r"\r?\n\r?\n(?:GPT|Claude) 的描述(?:（[^\n]*?）)?：")
+
+
+def _thread_token_parts(thread):
+    """The thread's word sets, one per description: one for an ordinary finding, two
+    for an agreed dual-review finding (finding_matches_thread uses them only to
+    narrow the match on the whole thread)."""
+    body = thread.get("first_bot_body") or ""
+    signal, sep, rest = body.partition("<details>")
+    pieces = _OTHER_LINE_DESCRIPTION.split(signal)
+    if len(pieces) == 1:
+        return [_thread_tokens(thread)]
+    return [_thread_tokens(dict(thread, first_bot_body=piece + sep + rest)) for piece in pieces]
 
 
 def _is_auto_command():
@@ -1385,7 +1434,7 @@ def should_drop_for_no_new_code(no_new_code, auto_command):
 
 
 def filter_findings(findings, min_severity=DEFAULT_MIN_SEVERITY, skip_patterns=(),
-                    threads=None, suppress_repeats=True):
+                    threads=None, suppress_repeats=True, repeat_judged=frozenset()):
     """Split findings into (kept, dropped) where dropped is [(finding, reason)].
 
     threads: Argus's own review threads on this PR, as dicts with path,
@@ -1396,11 +1445,11 @@ def filter_findings(findings, min_severity=DEFAULT_MIN_SEVERITY, skip_patterns=(
     A thread Argus itself closed (its fix-detection or outdated rules do that
     whenever lines change) says nothing about whether the problem was fixed, so
     it takes no part unless a person replied or Argus judged a reply in it.
+    repeat_judged: ids of findings already judged not to repeat (dual review judges
+    each version of an agreed finding on its own); the repeat test skips them.
     """
     floor = _SEVERITY_RANK[_min_severity_name(min_severity)]
-    threads = [t for t in (threads or [])
-               if not t.get("resolved") or t.get("resolved_by_human")
-               or t.get("replied") or t.get("judged")]
+    threads = _relevant_threads(threads)
     kept, dropped = [], []
     for issue in findings:
         if path_matches_skip(issue.get("relevant_file", ""), skip_patterns):
@@ -1410,14 +1459,31 @@ def filter_findings(findings, min_severity=DEFAULT_MIN_SEVERITY, skip_patterns=(
         if _SEVERITY_RANK[severity] < floor:
             dropped.append((issue, f"severity {severity} below {_min_severity_name(min_severity)}"))
             continue
-        if suppress_repeats:
-            hit = next((t for t in threads if finding_matches_thread(issue, t)), None)
-            if hit is not None:
-                closed = hit.get("resolved_by_human") or hit.get("replied") or hit.get("judged")
-                dropped.append((issue, "repeats a closed thread" if closed else "repeats an open thread"))
+        if suppress_repeats and id(issue) not in repeat_judged:
+            reason = repeat_reason(issue, threads)
+            if reason:
+                dropped.append((issue, reason))
                 continue
         kept.append(issue)
     return kept, dropped
+
+
+def _relevant_threads(threads):
+    """The threads a repeat is judged against: open ones, and closed ones a person
+    resolved or answered or Argus judged (see filter_findings)."""
+    return [t for t in (threads or [])
+            if not t.get("resolved") or t.get("resolved_by_human")
+            or t.get("replied") or t.get("judged")]
+
+
+def repeat_reason(issue, threads):
+    """The drop reason when ``issue`` repeats one of ``threads`` (already passed
+    through _relevant_threads), else None."""
+    hit = next((t for t in threads if finding_matches_thread(issue, t)), None)
+    if hit is None:
+        return None
+    closed = hit.get("resolved_by_human") or hit.get("replied") or hit.get("judged")
+    return "repeats a closed thread" if closed else "repeats an open thread"
 
 
 def _fetch_argus_threads(provider, pr_number):
@@ -1473,8 +1539,9 @@ def _filter_prediction(prediction, load_yaml, filter_fn):
     """Apply ``filter_fn`` to the key issues in PR-Agent's YAML prediction.
 
     Returns (prediction, dropped). The text is returned unchanged (byte for
-    byte) unless something was dropped; otherwise it is re-serialised with the
-    kept issues so every later reader of self.prediction sees the same list.
+    byte) unless the list changed (something dropped, or a finding rewritten, as
+    dual review does); otherwise it is re-serialised with the kept issues so every
+    later reader of self.prediction sees the same list.
     """
     data = load_yaml(prediction.strip(), keys_fix_yaml=_REVIEW_YAML_FIX_KEYS,
                      first_key="review", last_key="security_concerns")
@@ -1485,7 +1552,7 @@ def _filter_prediction(prediction, load_yaml, filter_fn):
     if not valid or not findings:
         return prediction, []
     kept, dropped = filter_fn(findings)
-    if not dropped:
+    if not dropped and kept == findings:
         return prediction, []
     review["key_issues_to_review"] = kept
     import yaml
@@ -1880,12 +1947,43 @@ def apply_patch():
                     pr_num = getattr(self.git_provider, "pr_num", 0)
                     threads = _fetch_argus_threads(self.git_provider, pr_num) if pr_num else None
 
+                dual = getattr(self, "_argus_dual", None)
+
                 def apply_filters(findings):
-                    return filter_findings(
+                    split, judged = [], ()
+                    if dual is None:
+                        # Without dual review these fields mean nothing; one a model
+                        # wrote itself must not add a source note (argus_dual.py).
+                        from argus_dual import strip_internal
+                        findings = strip_internal(findings)
+                    else:
+                        from argus_dual import split_repeated_pairs, strip_versions
+                        if threads is not None:
+                            # Each version of an agreed finding is judged on its own,
+                            # so a wrong pairing cannot hide a new finding (argus_dual.py).
+                            relevant = _relevant_threads(threads)
+                            findings, split, judged = split_repeated_pairs(
+                                findings, lambda f: repeat_reason(f, relevant))
+                            dual["split"] = sum(1 for f, _ in split if f.get("argus_source") != "both")
+                        findings = strip_versions(findings)
+                        judged = frozenset(id(findings[i]) for i in judged)
+                    kept, dropped = filter_findings(
                         findings,
                         min_severity=_argus_review_setting("min_severity", DEFAULT_MIN_SEVERITY),
                         skip_patterns=skip, threads=threads,
-                        suppress_repeats=threads is not None)
+                        suppress_repeats=threads is not None, repeat_judged=judged or frozenset())
+                    if dual is not None:
+                        # Two lines can report up to twice as many findings; the
+                        # inline count keeps the single-line limit (argus_dual.py).
+                        from argus_dual import cap_findings, rank_findings
+                        from pr_agent.config_loader import get_settings
+                        # Splitting a pair can lower a finding's severity: rank again
+                        # before the limit decides which go inline.
+                        kept, cut = cap_findings(
+                            rank_findings(kept), get_settings().pr_reviewer.get("num_max_findings", 5))
+                        dual["cut"] = cut
+                        dropped = split + dropped + [(f, "dual review: over the inline limit") for f in cut]
+                    return kept, dropped
 
                 self.prediction, dropped = _filter_prediction(
                     self.prediction, load_yaml, apply_filters)
@@ -2227,9 +2325,24 @@ def apply_patch():
                 print(f"[Argus] Footer dotfile re-include failed (non-fatal): {e}")
 
             # Build enhanced review body (CodeRabbit-style)
+            dual_section = second_model = None
+            dual = getattr(self, "_argus_dual", None)
+            if dual is not None:
+                try:
+                    from argus_dual import comparison_section
+                    # An unchanged head drops every inline finding; then listing the
+                    # cut ones as "over the limit" would be wrong.
+                    cut = () if no_new_code else (dual.get("cut") or ())
+                    dual_section = comparison_section(
+                        dual, dual.get("gpt_model"), dual.get("claude_model"), cut)
+                    if dual.get("claude_status") == "ok":
+                        second_model = dual.get("claude_model")
+                except Exception as e:
+                    print(f"[Argus Dual] comparison section not built: {e}")
             body_additions = build_review_body_additions(
                 findings, len(inline_comments), diff_files,
-                extra_filenames=footer_extra)
+                extra_filenames=footer_extra,
+                dual_section=dual_section, second_model=second_model)
 
             # Strip PR Reviewer Guide from repeat reviews (iteration >= 2: Argus has
             # already posted a review on this PR). This is about not repeating the
