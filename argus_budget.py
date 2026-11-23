@@ -633,7 +633,7 @@ class BudgetLedger:
             print(f"[Argus Budget] no usage returned for {model!r}; charging ${cost:.2f}")
         return self.record_cost(cost)
 
-    def record_timeout(self, model, prompt_tokens, timeout_seconds=None):
+    def record_timeout(self, model, prompt_tokens, timeout_seconds=None, reason="timed out"):
         """Charge a call that timed out on the client side.
 
         The provider may still have run and billed it, and its usage is never
@@ -645,7 +645,7 @@ class BudgetLedger:
         price = find_price(model, self.config)
         cost = (_count(prompt_tokens) * price.input
                 + timeout_output_tokens(timeout_seconds) * price.output) / 1_000_000
-        print(f"[Argus Budget] call to {model!r} timed out; charging an estimated ${cost:.2f}")
+        print(f"[Argus Budget] call to {model!r} {reason}; charging an estimated ${cost:.2f}")
         return self.record_cost(cost)
 
 

@@ -567,3 +567,56 @@ def test_claude_is_unavailable_with_a_damaged_ledger(tmp_path, clock, monkeypatc
     monkeypatch.setattr(ad, "_api_key", lambda: "k")
     monkeypatch.setattr(ad, "_ledger", ab.BudgetLedger(path=str(path), config=CLAUDE_CFG, clock=clock))
     assert ad.claude_available() is False
+
+
+# ── Argus review follow-up (PR #74) ───────────────────────────────
+
+def test_a_loose_early_match_does_not_take_the_exact_one():
+    gpt = [finding("a.py", 20, 20, content="value may be None here (null_check)")]
+    claude = [finding("a.py", 18, 18, header="Security", content="missing permission check (perm_guard)"),
+              finding("a.py", 20, 20, content="value may be None here (null_check)")]
+    merged = ad.merge_findings(gpt, claude)
+    by_line = {f["start_line"]: f["argus_source"] for f in merged}
+    assert by_line == {20: "both", 18: "claude"}
+    assert len(merged) == 2
+
+
+def test_a_stream_that_drops_mid_answer_is_charged_an_estimate(ledger):
+    with pytest.raises(ad.LineFailed) as e:
+        call(ledger, httpx.RemoteProtocolError("peer closed connection"))
+    assert e.value.status == "error" and ledger.snapshot()[0] > 0
+
+
+def test_a_refused_request_costs_nothing(ledger):
+    with pytest.raises(ad.LineFailed):
+        call(ledger, sdk_error(anthropic.BadRequestError, 400, "invalid_request_error", "bad field"))
+    assert ledger.snapshot()[0] == 0
+
+
+def test_the_event_is_written_when_both_lines_fail(pr_agent_stubs, monkeypatch):
+    emitted = []
+    monkeypatch.setattr(ad, "_emit", lambda reviewer, model, config, stats: emitted.append(dict(stats)))
+    with pytest.raises(RuntimeError):
+        prepare(Reviewer(RuntimeError("gpt down")), ad.LineFailed("timeout"))
+    assert emitted == [{"gpt_status": "error", "claude_status": "timeout"}]
+
+
+def test_pairing_finds_as_many_agreed_pairs_as_possible():
+    gpt = [finding("a.py", 10, 10), finding("a.py", 14, 14)]
+    claude = [finding("a.py", 13, 13), finding("a.py", 17, 17)]
+    merged = ad.merge_findings(gpt, claude)
+    assert [f["argus_source"] for f in merged] == ["both", "both"]
+
+
+def test_an_error_event_inside_a_started_stream_is_charged(ledger):
+    with pytest.raises(ad.LineFailed):
+        call(ledger, sdk_error(anthropic.APIStatusError, 200, "overloaded_error", "Overloaded"))
+    assert ledger.snapshot()[0] > 0 and not ledger.is_exhausted()
+
+
+def test_the_event_is_written_when_gpt_fails_and_claude_is_unparsable(pr_agent_stubs, monkeypatch):
+    emitted = []
+    monkeypatch.setattr(ad, "_emit", lambda reviewer, model, config, stats: emitted.append(dict(stats)))
+    with pytest.raises(RuntimeError):
+        prepare(Reviewer(RuntimeError("gpt down")), "not yaml: [")
+    assert emitted and emitted[0]["gpt_status"] == "error" and emitted[0]["claude_status"] == "unparsed"

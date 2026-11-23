@@ -202,6 +202,14 @@ def _is_claude_quota_error(exc) -> bool:
     return status in (400, 429) and any(m in text for m in _SPEND_LIMIT_MARKERS)
 
 
+def _rejected_before_work(exc) -> bool:
+    """True for an HTTP error status the API returned instead of a response (the
+    request was refused, so nothing was generated or billed). An error event inside
+    a stream that had started arrives with status 200 and is not such a rejection."""
+    status = getattr(exc, "status_code", None)
+    return isinstance(status, int) and status >= 400
+
+
 def _make_client(api_key, timeout):
     import anthropic
     # No SDK retries: a second try would delay the whole review, and the GPT line
@@ -215,8 +223,9 @@ async def claude_review(system, user, config: DualConfig, ledger: BudgetLedger,
     api_key = api_key if api_key is not None else _api_key()
     if not api_key:
         raise LineFailed("no_key")
+    # Ledger calls take a file lock and write to disk: off the event loop (Argus #56).
     try:
-        ledger.check()
+        await asyncio.to_thread(ledger.check)
     except BudgetExhausted as e:
         raise LineFailed("budget", e.reason)
     timeout = float(timeout or 300)
@@ -233,12 +242,19 @@ async def claude_review(system, user, config: DualConfig, ledger: BudgetLedger,
         # The SDK timeout bounds each read; this bounds the whole answer.
         message = await asyncio.wait_for(call(), timeout + 15)
     except Exception as exc:
+        estimate = (config.model, len(system) + len(user), timeout)
         if is_timeout_error(exc) or type(exc).__name__ == "APITimeoutError":
-            ledger.record_timeout(config.model, len(system) + len(user), timeout)
+            await asyncio.to_thread(ledger.record_timeout, *estimate)
             raise LineFailed("timeout") from exc
         if _is_claude_quota_error(exc):
-            ledger.mark_exhausted()
+            await asyncio.to_thread(ledger.mark_exhausted)
             raise LineFailed("quota", type(exc).__name__) from exc
+        if not _rejected_before_work(exc):
+            # The answer may have been under way (a dropped stream, an error event
+            # mid-stream): the provider can bill it and no usage comes back. Charge
+            # the same estimate as a timeout; stopping early beats under-counting.
+            await asyncio.to_thread(ledger.record_timeout, *estimate,
+                                    reason=f"failed ({type(exc).__name__}) after it may have started")
         raise LineFailed("error", type(exc).__name__) from exc
     finally:
         close = getattr(client, "close", None)
@@ -248,7 +264,7 @@ async def claude_review(system, user, config: DualConfig, ledger: BudgetLedger,
             except Exception:
                 pass
     cost = claude_cost(_field(message, "usage"), price)
-    ledger.record_cost(ledger.config.missing_usage_usd if cost is None else cost)
+    await asyncio.to_thread(ledger.record_cost, ledger.config.missing_usage_usd if cost is None else cost)
     stop = _field(message, "stop_reason")
     if stop in ("refusal", "max_tokens"):
         raise LineFailed(stop)
@@ -306,6 +322,24 @@ def same_finding(a, b, slack=3):
     return overlap >= 3 and overlap / min(len(ta), len(tb)) >= 0.4
 
 
+def match_score(a, b):
+    """How closely two matching findings agree: the share of distinctive words they
+    have in common (0 to 1) plus how much their line ranges overlap (1 for the same
+    lines, below 0 the further apart they are). Higher is closer. Used only to choose
+    among findings that same_finding already accepts; Chinese text has few such words,
+    so for it the lines decide."""
+    from patch_suggestion_format import _finding_tokens
+    ta, tb = _finding_tokens(a), _finding_tokens(b)
+    shared = len(ta & tb) / min(len(ta), len(tb)) if ta and tb else 0.0
+    ra, rb = _line_range(a), _line_range(b)
+    closeness = 0.0
+    if ra and rb:
+        overlap = min(ra[1], rb[1]) - max(ra[0], rb[0]) + 1
+        span = max(ra[1], rb[1]) - min(ra[0], rb[0]) + 1
+        closeness = overlap / span if overlap > 0 else (overlap - 1) / span
+    return shared + closeness
+
+
 def _rank(issue):
     from patch_suggestion_format import _SEVERITY_RANK, _finding_severity
     return _SEVERITY_RANK[_finding_severity(issue)]
@@ -317,14 +351,36 @@ def merge_findings(gpt, claude):
     A finding both lines reported keeps the more severe of the two versions. The list
     is ordered by severity, agreed findings first within a severity, so a cap keeps
     the most severe findings and prefers the agreed ones among equals."""
-    merged, used = [], set()
-    for g in gpt:
-        match = next((i for i, c in enumerate(claude) if i not in used and same_finding(g, c)), None)
-        if match is None:
+    # As many agreed pairs as possible (augmenting paths), each finding trying its
+    # closest candidates first, so a loose match early in one list cannot take the
+    # finding that a later one matches exactly, and no pair is lost to greed.
+    candidates = {gi: [ci for _, ci in sorted(((-match_score(g, c), ci) for ci, c in enumerate(claude)
+                                               if same_finding(g, c)))]
+                  for gi, g in enumerate(gpt)}
+    owner = {}  # claude index -> gpt index
+
+    def place(gi, seen):
+        for ci in candidates[gi]:
+            if ci in seen:
+                continue
+            seen.add(ci)
+            if ci not in owner or place(owner[ci], seen):
+                owner[ci] = gi
+                return True
+        return False
+
+    order_by_best = sorted(candidates, key=lambda gi: -max(
+        (match_score(gpt[gi], claude[ci]) for ci in candidates[gi]), default=float("-inf")))
+    for gi in order_by_best:
+        place(gi, set())
+    pair_of = {gi: ci for ci, gi in owner.items()}
+    used = set(owner)
+    merged = []
+    for gi, g in enumerate(gpt):
+        if gi not in pair_of:
             merged.append(dict(g, argus_source=SOURCE_GPT))
             continue
-        used.add(match)
-        c = claude[match]
+        c = claude[pair_of[gi]]
         keep = c if _rank(c) > _rank(g) else g
         merged.append(dict(keep, argus_source=SOURCE_BOTH))
     merged += [dict(c, argus_source=SOURCE_CLAUDE) for i, c in enumerate(claude) if i not in used]
@@ -492,6 +548,8 @@ async def dual_prepare_prediction(reviewer, model, original, claude_call=None):
     if not claude_ok and not isinstance(claude_result, LineFailed):
         print(f"[Argus Dual] Claude line raised {type(claude_result).__name__}: {claude_result}")
     if not gpt_ok and not claude_ok:
+        _emit(reviewer, model, config, {"gpt_status": _line_status(gpt_result),
+                                        "claude_status": claude_status})
         raise gpt_result
     text, stats = merge_predictions(gpt_result if gpt_ok else None,
                                     claude_result if claude_ok else None, load_yaml,
@@ -499,6 +557,7 @@ async def dual_prepare_prediction(reviewer, model, original, claude_call=None):
                                     claude_status=claude_status)
     if not gpt_ok:
         if stats["claude_status"] != "ok":
+            _emit(reviewer, model, config, stats)
             raise gpt_result
         # The review goes ahead on Claude alone: the command did not fail.
         _note_outcome(None)
@@ -507,13 +566,18 @@ async def dual_prepare_prediction(reviewer, model, original, claude_call=None):
         print(f"[Argus Dual] Claude line unavailable ({stats['claude_status']}); reviewing with GPT alone")
     reviewer.prediction = text
     reviewer._argus_dual = dict(stats, gpt_model=str(model), claude_model=config.model, cut=[])
+    _emit(reviewer, model, config, stats)
+
+
+def _emit(reviewer, model, config, stats):
+    """One dual_review event per review, failed ones included, so the log can
+    compare how often each line was usable."""
     try:
         from argus_events import emitter, EventType
         provider = reviewer.git_provider
         repo = getattr(getattr(provider, "repo", None), "full_name", None)
         emitter.emit(EventType.DUAL_REVIEW, pr_number=getattr(provider, "pr_num", None), repo=repo,
-                     gpt_model=str(model), claude_model=config.model,
-                     **{k: v for k, v in stats.items()})
+                     gpt_model=str(model), claude_model=config.model, **dict(stats))
     except Exception as e:
         print(f"[Argus Dual] event not written: {e}")
 
