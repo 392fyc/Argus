@@ -238,19 +238,21 @@ def _make_client(api_key, timeout):
     return anthropic.AsyncAnthropic(api_key=api_key, max_retries=0, timeout=timeout)
 
 
-def _charge_estimate(ledger, model, system, user, timeout, reason="timed out"):
+def _charge_estimate(ledger, model, system, user, timeout, max_tokens=None, reason="timed out"):
     """Charge a call whose usage never came back. The prompt is counted in tokens the
     way the GPT line counts its own (LiteLLM's counter; one per character only if it
-    cannot count), so a failed Claude call is not charged per character."""
+    cannot count), so a failed Claude call is not charged per character. The output
+    is charged at the request's own limit (``max_tokens``): the most it can have
+    produced, so the estimate never falls short of the bill."""
     tokens = estimate_prompt_tokens({"model": model, "messages": [
         {"role": "system", "content": system}, {"role": "user", "content": user}]})
-    return ledger.record_timeout(model, tokens, timeout, reason=reason)
+    return ledger.record_timeout(model, tokens, timeout, reason=reason, output_tokens=max_tokens)
 
 
-def _failure_outcome(exc, ledger, model, prompt, timeout, built=True):
+def _failure_outcome(exc, ledger, model, prompt, timeout, built=True, max_tokens=None):
     """(ledger write or None, LineFailed or None to re-raise) for a failed call.
     ``prompt`` is (system, user); the write runs in a worker thread."""
-    estimate = functools.partial(_charge_estimate, ledger, model, *prompt, timeout)
+    estimate = functools.partial(_charge_estimate, ledger, model, *prompt, timeout, max_tokens)
     if isinstance(exc, asyncio.CancelledError):
         # Cancelled while the request was out: the provider may still bill it.
         return functools.partial(estimate, reason="was cancelled while in flight"), None
@@ -315,7 +317,7 @@ async def claude_review(system, user, config: DualConfig, ledger: BudgetLedger,
         # Record first, then close: the write is shielded and runs in a thread, so a
         # cancellation that arrives while closing (or now) cannot drop it.
         charge, failure = _failure_outcome(exc, ledger, config.model,
-                                           (system, user), timeout, built)
+                                           (system, user), timeout, built, config.max_tokens)
         try:
             if charge is not None:
                 await asyncio.shield(asyncio.to_thread(charge))
@@ -533,7 +535,9 @@ def _combine(g, c):
     """One agreed finding from the two versions. The header (and location) of the
     more severe one (a security header wins a tie: the merged severity never drops
     below either version's, so the severity filter cannot drop it); the other version's
-    description is kept below, so a pair matched wrongly hides nothing."""
+    description is kept below, and so is its location when it differs (two call sites
+    a few lines apart described in the same words), so a pair matched wrongly hides
+    nothing."""
     g_first = (_rank(g), _is_security(g)) >= (_rank(c), _is_security(c))
     keep, other, other_name = (g, c, "Claude") if g_first else (c, g, "GPT")
     item = dict(keep, argus_source=SOURCE_BOTH)
@@ -542,7 +546,12 @@ def _combine(g, c):
     if theirs and theirs != mine:
         header = str(other.get("issue_header") or "").strip()
         label = f"{other_name} 的描述" + (f"（{header}）" if header else "")
-        item["issue_content"] = f"{mine}\n\n{label}：{theirs}" if mine else theirs
+        mine = f"{mine}\n\n{label}：{theirs}" if mine else theirs
+    here, there = _line_range(keep), _line_range(other)
+    if there and there != here:
+        lines = f"第 {there[0]} 行" if there[0] == there[1] else f"第 {there[0]}-{there[1]} 行"
+        mine = f"{mine}\n\n{other_name} 标注的位置：{lines}" if mine else f"{other_name} 标注的位置：{lines}"
+    item["issue_content"] = mine
     # The two versions as reported, so the repeat filter can judge each on its own
     # (split_repeated_pairs); removed before the finding is posted.
     item[VERSIONS_KEY] = [dict(g, argus_source=SOURCE_GPT), dict(c, argus_source=SOURCE_CLAUDE)]
