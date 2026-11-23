@@ -936,3 +936,36 @@ def test_an_agreed_thread_is_matched_one_description_at_a_time():
     assert not psf.finding_matches_thread(new, thread)
     # The same defects as before still count as repeats.
     assert psf.finding_matches_thread(a, thread) and psf.finding_matches_thread(b, thread)
+
+
+def _agreed_thread(gpt_text, claude_text, claude_header="Possible Bug"):
+    item = ad._combine(finding("app/store.py", 10, 10, content=gpt_text),
+                       finding("app/store.py", 11, 11, header=claude_header, content=claude_text))
+    return _thread(ad.strip_versions([item])[0])
+
+
+def test_a_short_description_does_not_widen_the_repeat_match():
+    thread = _agreed_thread(
+        "nightly backup rotation renames the ledger file so period_start is read from a stale "
+        "copy and the monthly window restarts early during maintenance windows",
+        "ledger snapshot period_start rotated")
+    new = finding("app/store.py", 40, 40,
+                  content="notify_once posts twice under concurrency; ledger snapshot period_start rotated "
+                          "between claim and confirm so both workers believe they own the notice")
+    assert not psf.finding_matches_thread(new, thread)
+
+
+def test_a_separator_inside_an_ordinary_description_does_not_widen_the_match():
+    body = finding("app/store.py", 10, 10, content=(
+        "cache invalidation misses tenant_id prefix when the eviction worker restarts after deploys"
+        "\n\nGPT 的描述：retry backoff jitter"))
+    new = finding("app/store.py", 40, 40, content="retry backoff jitter grows unbounded in the uploader "
+                                                    "when the queue drains slowly across regions overnight")
+    assert not psf.finding_matches_thread(new, _thread(body))
+
+
+def test_a_header_with_full_width_brackets_still_splits():
+    thread = _agreed_thread("ledger snapshot misses lock around record_cost write",
+                            "reset_day timezone handling around record_cost write breaks lock",
+                            claude_header="Possible Bug（并发）")
+    assert len(psf._thread_token_parts(thread)) == 2

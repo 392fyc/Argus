@@ -1387,24 +1387,29 @@ def finding_matches_thread(issue, thread, min_overlap=3, min_ratio=0.4):
     if not path or path != _norm_path(thread.get("path")):
         return False
     a = _finding_tokens(issue)
-    if not a:
+
+    def close(b):
+        overlap = len(a & b) if a and b else 0
+        return overlap >= min_overlap and overlap / min(len(a), len(b)) >= min_ratio
+
+    if not close(_thread_tokens(thread)):
         return False
-    for b in _thread_token_parts(thread):
-        overlap = len(a & b) if b else 0
-        if overlap >= min_overlap and overlap / min(len(a), len(b)) >= min_ratio:
-            return True
-    return False
+    # An agreed dual-review thread holds two descriptions: one of them must match
+    # on its own too. This only ever narrows the rule above, never widens it.
+    parts = _thread_token_parts(thread)
+    return len(parts) == 1 or any(close(b) for b in parts)
 
 
 # Where an agreed dual-review finding appends the other line's description
-# (argus_dual._combine: "\n\nClaude 的描述（header）：...").
-_OTHER_LINE_DESCRIPTION = re.compile(r"\r?\n\r?\n(?:GPT|Claude) 的描述(?:（[^）\n]*）)?：")
+# (argus_dual._combine: "\n\nClaude 的描述（header）：..."; the header may itself
+# contain full-width brackets, so the bracket part ends at the first "）：").
+_OTHER_LINE_DESCRIPTION = re.compile(r"\r?\n\r?\n(?:GPT|Claude) 的描述(?:（[^\n]*?）)?：")
 
 
 def _thread_token_parts(thread):
-    """The thread's word sets to match against: one for an ordinary finding; one per
-    description for an agreed dual-review finding, so a new finding never matches
-    only on the words of two different descriptions taken together."""
+    """The thread's word sets, one per description: one for an ordinary finding, two
+    for an agreed dual-review finding (finding_matches_thread uses them only to
+    narrow the match on the whole thread)."""
     body = thread.get("first_bot_body") or ""
     signal, sep, rest = body.partition("<details>")
     pieces = _OTHER_LINE_DESCRIPTION.split(signal)
