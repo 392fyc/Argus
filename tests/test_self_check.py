@@ -247,3 +247,51 @@ class TestSelfCheck:
             filed = run(days=3, dry_run=False, sink_path=sink)
         mock_file.assert_not_called()
         assert filed == 0
+
+
+# ── Stable signatures and expected actors (Argus #72) ─────────────────────────
+
+class TestStableSignatures:
+    def _blocked(self, sink, actors):
+        _write_events(sink, [_make_event(EventType.REQUEST_BLOCKED, actor=a) for a in actors])
+        return [c for c in analyze(sink_path=sink) if c.type == TYPE_ACCESS_PATTERN]
+
+    def test_same_actors_different_counts_same_signature(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("ARGUS_SELF_CHECK_EXPECTED_ACTORS", raising=False)
+        a = self._blocked(str(tmp_path / "a.jsonl"), ["bot-x"] * 5)
+        b = self._blocked(str(tmp_path / "b.jsonl"), ["bot-x"] * 28)
+        assert a and b and a[0].signature == b[0].signature
+        assert a[0].title != b[0].title  # the title still reports the count
+
+    def test_new_actor_set_gets_a_new_signature(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("ARGUS_SELF_CHECK_EXPECTED_ACTORS", raising=False)
+        a = self._blocked(str(tmp_path / "a.jsonl"), ["bot-x"] * 6)
+        b = self._blocked(str(tmp_path / "b.jsonl"), ["bot-x"] * 3 + ["stranger"] * 3)
+        assert a[0].signature != b[0].signature
+
+    def test_actor_case_does_not_change_signature(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("ARGUS_SELF_CHECK_EXPECTED_ACTORS", raising=False)
+        a = self._blocked(str(tmp_path / "a.jsonl"), ["Copilot"] * 6)
+        b = self._blocked(str(tmp_path / "b.jsonl"), ["copilot"] * 6)
+        assert a[0].signature == b[0].signature
+
+    def test_expected_actors_file_nothing(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ARGUS_SELF_CHECK_EXPECTED_ACTORS", "mercury-deploy[bot], Copilot")
+        found = self._blocked(str(tmp_path / "a.jsonl"), ["mercury-deploy[bot]"] * 20 + ["copilot"] * 10)
+        assert found == []
+
+    def test_expected_actors_do_not_count_toward_threshold(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ARGUS_SELF_CHECK_EXPECTED_ACTORS", "mercury-deploy[bot]")
+        found = self._blocked(str(tmp_path / "a.jsonl"), ["mercury-deploy[bot]"] * 20 + ["stranger"] * 4)
+        assert found == []
+        found = self._blocked(str(tmp_path / "b.jsonl"), ["mercury-deploy[bot]"] * 20 + ["stranger"] * 5)
+        assert len(found) == 1 and "stranger" in found[0].evidence[1]
+        assert "mercury-deploy" not in found[0].evidence[1]
+
+    def test_error_spike_signature_ignores_count(self, tmp_path):
+        s1, s2 = str(tmp_path / "a.jsonl"), str(tmp_path / "b.jsonl")
+        _write_events(s1, [_make_event(EventType.ERROR, message="err") for _ in range(4)])
+        _write_events(s2, [_make_event(EventType.ERROR, message="err") for _ in range(9)])
+        c1 = [c for c in analyze(sink_path=s1) if c.type == TYPE_ERROR_SPIKE]
+        c2 = [c for c in analyze(sink_path=s2) if c.type == TYPE_ERROR_SPIKE]
+        assert c1 and c2 and c1[0].signature == c2[0].signature

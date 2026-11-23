@@ -50,6 +50,9 @@ services:
       - SKIP_DOCKER_WRAPPER=1
       - EVENTS_HOST_PATH=/var/log/argus/events.jsonl
       - ARGUS_STATE_FILE=/var/log/argus/self-check-state.json
+      # Accounts whose webhook events are blocked by design (Argus #72): Mercury's
+      # update app and GitHub's coding agent. Override in .env to change the list.
+      - ARGUS_SELF_CHECK_EXPECTED_ACTORS=${ARGUS_SELF_CHECK_EXPECTED_ACTORS:-mercury-deploy[bot],Copilot}
     volumes:
       - ./logs:/var/log/argus
       - .:/workspace:ro

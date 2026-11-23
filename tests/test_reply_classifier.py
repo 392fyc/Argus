@@ -392,3 +392,59 @@ def test_parser_strips_verdict_prefix_and_colon(judge):
     )
     assert verdict == "ACCEPT"
     assert reason == "trimmed reason here"
+
+
+# -------- Budget and timeout behind PR-Agent's wrapper (Argus #68) -------
+
+class _NeedsArgs(Exception):
+    """Stands in for openai.APIError, whose constructor needs arguments."""
+
+    def __init__(self, message, request):
+        super().__init__(message)
+
+
+def _wrapped(exc):
+    """Raise ``exc`` the way PR-Agent 0.38.0 does: ``raise openai.APIError from e``."""
+    try:
+        raise exc
+    except Exception as e:
+        raise _NeedsArgs from e  # fails with TypeError, like the real class
+
+
+@pytest.mark.parametrize("make, kind", [
+    (lambda ab: ab.BudgetExhausted("monthly cap reached"), "budget used up"),
+    (lambda ab: ab.ModelTimeout("model call timed out"), "model timed out"),
+])
+def test_wrapped_budget_or_timeout_is_named(judge, monkeypatch, make, kind):
+    import argus_budget as ab
+
+    async def failing(self, **kwargs):
+        _wrapped(make(ab))
+
+    monkeypatch.setattr(_FakeAIHandler, "chat_completion", failing)
+    verdict, reason = judge(original_finding="x", reply_body="y")
+    assert verdict == "ESCALATE"
+    # "LLM error" keeps the caller silent on the thread (entrypoint-guard).
+    assert reason.startswith(f"LLM error: {kind}")
+    assert "TypeError" not in reason and "__init__" not in reason
+
+
+def test_other_errors_keep_their_message(judge, monkeypatch):
+    async def failing(self, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(_FakeAIHandler, "chat_completion", failing)
+    verdict, reason = judge(original_finding="x", reply_body="y")
+    assert (verdict, reason) == ("ESCALATE", "LLM error: boom")
+
+
+def test_argus_stop_follows_the_chain_and_stops_on_cycles():
+    import argus_budget as ab
+    try:
+        _wrapped(ab.BudgetExhausted("cap"))
+    except TypeError as outer:
+        assert isinstance(ab.argus_stop(outer), ab.BudgetExhausted)
+    a, b = ValueError("a"), ValueError("b")
+    a.__context__, b.__context__ = b, a
+    assert ab.argus_stop(a) is None
+    assert ab.argus_stop(None) is None

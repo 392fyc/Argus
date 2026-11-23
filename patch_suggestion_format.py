@@ -578,8 +578,25 @@ def _judge_reply_with_llm(original_finding, reply_body):
         return "ESCALATE", f"LLM error: Unparseable response: {text[:100]}"
 
     except Exception as e:
+        stop = _argus_stop(e)
+        if stop is not None:
+            # Budget used up or the model timed out: name it instead of PR-Agent's
+            # wrapping TypeError (Argus #68). The "LLM error" prefix keeps the
+            # caller silent on the thread and out of the escalation statistics.
+            kind = "budget used up" if type(stop).__name__ == "BudgetExhausted" else "model timed out"
+            print(f"[Argus] LLM reply judgment skipped: {kind}: {stop}")
+            return "ESCALATE", f"LLM error: {kind}: {stop}"
         print(f"[Argus] LLM reply judgment failed: {e}")
         return "ESCALATE", f"LLM error: {e}"
+
+
+def _argus_stop(exc):
+    """argus_budget.argus_stop, or None when the module is not available."""
+    try:
+        from argus_budget import argus_stop
+    except Exception:
+        return None
+    return argus_stop(exc)
 
 
 # Max reply-judgment rounds per thread before forced escalation
