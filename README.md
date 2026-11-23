@@ -223,6 +223,8 @@ ARGUS_ALLOWED_USERS=392fyc,trusted-bot
 
 Leave empty to allow all users. The guard logs all allow/block decisions.
 
+Blocked requests are recorded as events, and the self-check files an Issue when one window has five or more. Accounts that are blocked by design (Argus reviews only on request) are left out of that count: `ARGUS_SELF_CHECK_EXPECTED_ACTORS` (comma-separated, case-insensitive; default `mercury-deploy[bot],Copilot` in `docker-compose.yml`, override in `.env`). A report's signature depends on the problem type and, for blocked requests, on the set of blocked accounts, so a repeat with a different count does not open a second Issue while the first is open (Argus #72).
+
 ## First deployment
 
 Things that cannot be checked from this repository and need a human on the NAS:

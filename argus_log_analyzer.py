@@ -54,9 +54,26 @@ class ProblemCluster:
     signature: str = ""  # sha256 used for deduplication
 
     def __post_init__(self) -> None:
+        # One open Issue per problem type: the title carries counts that change
+        # from run to run, so it must not feed the signature (Argus #72).
         if not self.signature:
-            raw = f"{self.type}:{self.title}".encode()
-            self.signature = hashlib.sha256(raw).hexdigest()[:16]
+            self.signature = _signature(self.type)
+
+
+def _signature(*parts: str) -> str:
+    return hashlib.sha256(":".join(parts).encode()).hexdigest()[:16]
+
+
+def expected_actors() -> set:
+    """Actors whose blocked requests are expected (Argus #72), lower-cased.
+
+    ARGUS_SELF_CHECK_EXPECTED_ACTORS is a comma-separated list; Argus reviews
+    only on request, so webhook events from these accounts are blocked by design
+    and need no report.
+    """
+    import os as _os
+    raw = _os.environ.get("ARGUS_SELF_CHECK_EXPECTED_ACTORS", "")
+    return {a.strip().lower() for a in raw.split(",") if a.strip()}
 
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
@@ -236,11 +253,13 @@ def analyze(
         ))
 
     # ── 5. Access control pattern ─────────────────────────────────────────────
+    expected = expected_actors()
     blocked_events = [
         e for e in events if e.event_type == EventType.REQUEST_BLOCKED
+        and str(e.payload.get("actor", "<unknown>")).lower() not in expected
     ]
     if len(blocked_events) >= _BLOCKED_THRESHOLD:
-        actors = list({e.payload.get("actor", "<unknown>") for e in blocked_events})
+        actors = sorted({str(e.payload.get("actor", "<unknown>")) for e in blocked_events})
         clusters.append(ProblemCluster(
             type=TYPE_ACCESS_PATTERN,
             severity=SEVERITY_LOW,
@@ -254,8 +273,11 @@ def analyze(
             hypothesis=(
                 "UNVERIFIED: may indicate unauthorized probe activity, a "
                 "misconfigured whitelist, or a legitimate user not yet added "
-                "to ARGUS_ALLOWED_USERS."
+                "to ARGUS_ALLOWED_USERS. If these actors are expected, add them "
+                "to ARGUS_SELF_CHECK_EXPECTED_ACTORS."
             ),
+            # A new set of actors is a new finding; the same set is not.
+            signature=_signature(TYPE_ACCESS_PATTERN, *sorted({a.lower() for a in actors})),
         ))
 
     # Sort: critical → high → medium → low

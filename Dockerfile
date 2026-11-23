@@ -9,6 +9,10 @@
 # Mercury #498.
 FROM pragent/pr-agent:0.38.0-github_app@sha256:f07a88d52c816aef04fee53e31fa99b5ff9fd9dee186e652677f730a2b0888bc
 
+# Unbuffered stdout, so the import-time prints of the guard and the patches reach
+# the container log as soon as they are made (Argus #69).
+ENV PYTHONUNBUFFERED=1
+
 COPY entrypoint-guard.py /app/entrypoint-guard.py
 COPY mention_rewrite.py /app/mention_rewrite.py
 COPY patch_suggestion_format.py /app/patch_suggestion_format.py

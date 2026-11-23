@@ -86,6 +86,22 @@ class BudgetExhausted(Exception):
         self.next_reset = next_reset
 
 
+def argus_stop(exc):
+    """The BudgetExhausted or ModelTimeout behind ``exc``, or None.
+
+    PR-Agent 0.38.0 wraps any non-OpenAI error with ``raise openai.APIError from e``
+    without arguments, which itself fails with a TypeError; the original error
+    is then only reachable through ``__context__`` / ``__cause__`` (Argus #68).
+    """
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        if isinstance(exc, (BudgetExhausted, ModelTimeout)):
+            return exc
+        seen.add(id(exc))
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
 class ModelTimeout(Exception):
     """Raised in place of a provider timeout.
 
