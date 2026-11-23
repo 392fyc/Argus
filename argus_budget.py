@@ -754,16 +754,24 @@ def parse_pr_url(pr_url):
     return (m.group(1), m.group(2), int(m.group(3))) if m else None
 
 
-def exhausted_comment(spent_usd, config: BudgetConfig, next_reset, reason=""):
+def exhausted_comment(spent_usd, config: BudgetConfig, next_reset, reason="",
+                      review_continues=False):
     # Posted on public pull requests: the amounts stay in the host's log and ledger (Argus #65).
+    # review_continues: review still runs on the second (Claude) line (argus_dual.py).
+    continues = ("GPT 线路暂停：`review` 改由第二条线路（Claude）单线审查，"
+                 "其他需要 GPT 的命令暂停。本期内不会再发这条提示。")
     if config.monthly_usd is None:
         return (
             "⚠️ **Argus 暂停审查：部署主机未配置月度花费上限**\n\n"
-            "在主机上设置上限之前，Argus 不审查此 PR 或其他 PR，本期内也不会再发这条提示。"
+            "在主机上设置上限之前，"
+            + (continues if review_continues else
+               "Argus 不审查此 PR 或其他 PR，本期内也不会再发这条提示。")
         )
     return (
         "⚠️ **Argus 本期审查额度已用完**\n\n"
-        "本期内 Argus 不再审查此 PR 或其他 PR，也不会再发这条提示。\n\n"
+        + ("本期内" + continues if review_continues else
+           "本期内 Argus 不再审查此 PR 或其他 PR，也不会再发这条提示。")
+        + "\n\n"
         f"下次重置：{next_reset.strftime('%Y-%m-%d %H:%M')}（{config.timezone}）。"
         + (f"\n\n原因：{reason}" if reason else "")
     )
@@ -826,7 +834,8 @@ def notify_once(ledger: BudgetLedger, pr_url, reason=""):
         return True
     try:
         _poster(parsed[0], parsed[1], parsed[2],
-                exhausted_comment(spent, ledger.config, next_reset, reason))
+                exhausted_comment(spent, ledger.config, next_reset, reason,
+                                  review_continues=review_alternate_available()))
     except Exception as e:
         print(f"[Argus Budget] could not post the budget notice (attempt {attempt}): {e}")
         emitter.emit(EventType.ERROR, pr_number=number, repo=owner_repo,
@@ -1028,6 +1037,28 @@ def get_ledger() -> BudgetLedger:
         return _ledger
 
 
+# Set by argus_dual.apply_patch: True while /review can run on the Claude line alone.
+_review_alternate = None
+
+
+def set_review_alternate(fn):
+    """Register (or clear with None) the check that a second review line is available."""
+    global _review_alternate
+    _review_alternate = fn
+
+
+def review_alternate_available() -> bool:
+    try:
+        return bool(_review_alternate and _review_alternate())
+    except Exception:
+        return False
+
+
+def _is_review(request):
+    command = _command_name(request)
+    return _ALIASES.get(command, command) == "review"
+
+
 def _command_name(request):
     try:
         first = request.split()[0] if isinstance(request, str) else request[0]
@@ -1064,12 +1095,21 @@ def apply_patch(ledger_getter=None):
         ledger = ledger_getter()
         if _command_name(request) in _FREE_COMMANDS:
             return await original_handle(self, pr_url, request, notify)
+        is_review = _is_review(request)
         try:
             ledger.check()
         except BudgetExhausted as e:
+            # The check reads the Claude ledger (file lock, maybe a write): off the event loop (#56).
+            # Once per period; the notice says when review goes on with the second line.
             await asyncio.to_thread(notify_once, ledger, pr_url, e.reason)
-            print(f"[Argus Budget] skipped {request!r} on {pr_url}: {e.reason}")
-            return False
+            # The availability check reads the Claude ledger (file lock, maybe a write),
+            # so it runs off the event loop (#56).
+            if not (is_review and await asyncio.to_thread(review_alternate_available)):
+                print(f"[Argus Budget] skipped {request!r} on {pr_url}: {e.reason}")
+                return False
+            # The GPT line is stopped; the review runs on the Claude line alone.
+            print(f"[Argus Budget] GPT line stopped ({e.reason}); {request!r} on {pr_url} "
+                  "runs on the second line")
         state = {"error": None, "succeeded": 0, "timed_out": False}
         started_at = datetime.now(timezone.utc)
         token = _run_state.set(state)

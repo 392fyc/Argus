@@ -240,8 +240,23 @@ def format_review_finding_body(issue: dict) -> str:
     parts.append("```")
     parts.append("")
     parts.append("</details>")
+    # Dual review (argus_dual.py): which line reported it. Placed after the
+    # <details> block so thread matching, which reads only the text before it,
+    # is unaffected.
+    note = _source_note(issue)
+    if note:
+        parts.append("")
+        parts.append(note)
 
     return "\n".join(parts)
+
+
+def _source_note(issue):
+    try:
+        from argus_dual import source_note
+        return source_note(issue)
+    except Exception:
+        return ""
 
 
 def build_aggregated_agent_prompt(issues: list) -> str:
@@ -300,7 +315,8 @@ def _runtime_engine_info():
 
 
 def build_review_body_additions(findings: list, inline_count: int,
-                                diff_files=None, extra_filenames=None) -> str:
+                                diff_files=None, extra_filenames=None,
+                                dual_section=None, second_model=None) -> str:
     """Build CodeRabbit-style additions to prepend/append to review body.
 
     Adds: actionable comments count, aggregated AI prompt, review info.
@@ -309,6 +325,9 @@ def build_review_body_additions(findings: list, inline_count: int,
     of diff_files (e.g. .gitignore) but were genuinely changed in the PR;
     merged into the 'Files reviewed' footer for display only. Default None
     keeps the footer byte-for-byte identical for every existing caller.
+
+    dual_section / second_model: the dual-review comparison block and the
+    Claude model (argus_dual.py); None leaves the body as before.
     """
     parts = []
 
@@ -349,6 +368,10 @@ def build_review_body_additions(findings: list, inline_count: int,
         except Exception:
             pass
 
+    if dual_section:
+        parts.append(dual_section)
+        parts.append("")
+
     parts.append("---")
     parts.append("")
     parts.append("<details>")
@@ -359,7 +382,8 @@ def build_review_body_additions(findings: list, inline_count: int,
     parts.append("")
     engine_version, model_name = _runtime_engine_info()
     parts.append(f"**Engine**: PR-Agent {engine_version} + Argus patches")
-    parts.append(f"**Model**: {model_name}")
+    parts.append(f"**Model**: {model_name}"
+                 + (f" + {second_model}" if second_model else ""))
     parts.append("**Mode**: CodeRabbit-compatible")
     parts.append("")
     parts.append("</details>")
@@ -1880,12 +1904,24 @@ def apply_patch():
                     pr_num = getattr(self.git_provider, "pr_num", 0)
                     threads = _fetch_argus_threads(self.git_provider, pr_num) if pr_num else None
 
+                dual = getattr(self, "_argus_dual", None)
+
                 def apply_filters(findings):
-                    return filter_findings(
+                    kept, dropped = filter_findings(
                         findings,
                         min_severity=_argus_review_setting("min_severity", DEFAULT_MIN_SEVERITY),
                         skip_patterns=skip, threads=threads,
                         suppress_repeats=threads is not None)
+                    if dual is not None:
+                        # Two lines can report up to twice as many findings; the
+                        # inline count keeps the single-line limit (argus_dual.py).
+                        from argus_dual import cap_findings
+                        from pr_agent.config_loader import get_settings
+                        kept, cut = cap_findings(
+                            kept, get_settings().pr_reviewer.get("num_max_findings", 5))
+                        dual["cut"] = cut
+                        dropped = dropped + [(f, "dual review: over the inline limit") for f in cut]
+                    return kept, dropped
 
                 self.prediction, dropped = _filter_prediction(
                     self.prediction, load_yaml, apply_filters)
@@ -2227,9 +2263,24 @@ def apply_patch():
                 print(f"[Argus] Footer dotfile re-include failed (non-fatal): {e}")
 
             # Build enhanced review body (CodeRabbit-style)
+            dual_section = second_model = None
+            dual = getattr(self, "_argus_dual", None)
+            if dual is not None:
+                try:
+                    from argus_dual import comparison_section
+                    # An unchanged head drops every inline finding; then listing the
+                    # cut ones as "over the limit" would be wrong.
+                    cut = () if no_new_code else (dual.get("cut") or ())
+                    dual_section = comparison_section(
+                        dual, dual.get("gpt_model"), dual.get("claude_model"), cut)
+                    if dual.get("claude_status") == "ok":
+                        second_model = dual.get("claude_model")
+                except Exception as e:
+                    print(f"[Argus Dual] comparison section not built: {e}")
             body_additions = build_review_body_additions(
                 findings, len(inline_comments), diff_files,
-                extra_filenames=footer_extra)
+                extra_filenames=footer_extra,
+                dual_section=dual_section, second_model=second_model)
 
             # Strip PR Reviewer Guide from repeat reviews (iteration >= 2: Argus has
             # already posted a review on this PR). This is about not repeating the

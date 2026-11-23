@@ -334,6 +334,14 @@ apply_reasoning_patch()
 from argus_budget import apply_patch as apply_budget_patch
 apply_budget_patch()
 
+# Dual review: Claude reviews the same diff next to GPT (Mercury #821). Applied after
+# the budget patch, which it tells when a review can still run on the Claude line.
+try:
+    from argus_dual import apply_patch as apply_dual_patch
+    apply_dual_patch()
+except Exception as e:
+    print(f"[Argus Dual] not applied, reviews run on GPT alone: {e}")
+
 # Only the runtime settings [argus_review] allows may come from a trigger comment (Argus #63).
 # Applied after the budget patch so it wraps outermost: a refused command costs nothing.
 from argus_runtime import apply_patch as apply_runtime_patch

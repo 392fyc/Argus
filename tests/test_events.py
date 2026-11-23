@@ -41,6 +41,7 @@ class TestArgusEventSchema:
         expected = {
             "review_started", "finding_posted", "reply_classified",
             "thread_resolved", "error", "mention_rewritten", "request_blocked", "budget_exhausted",
+            "dual_review",
         }
         assert {e.value for e in EventType} == expected
 
