@@ -534,24 +534,29 @@ def split_repeated_pairs(findings, repeats):
     """Judge each version of an agreed finding against the existing threads.
 
     ``repeats(finding)`` returns a drop reason when the finding repeats an existing
-    thread, else None. When one version repeats and the other does not, the pair
-    was matched wrongly or only half of it is new: the new version is kept on its
-    own (tagged with its line) and the repeated one dropped, instead of the merged
-    finding standing or falling as a whole. Returns (findings, dropped)."""
-    out, dropped = [], []
+    thread, else None. Only the two versions decide, never the merged text (whose
+    words are the union of both and can look like a repeat when neither is):
+    both repeat, the pair is dropped; one repeats, the new version is kept on its
+    own (tagged with its line) and the other dropped; neither repeats, the pair is
+    kept and its index returned in ``judged`` so the repeat test is not run on the
+    merged text again. Returns (findings, dropped, judged)."""
+    out, dropped, judged = [], [], set()
     for f in findings:
         versions = f.get(VERSIONS_KEY)
         if not (isinstance(versions, list) and len(versions) == 2):
             out.append(f)
             continue
         reasons = [repeats(v) for v in versions]
-        if bool(reasons[0]) != bool(reasons[1]):
+        if reasons[0] and reasons[1]:
+            dropped.append((f, reasons[0]))
+        elif reasons[0] or reasons[1]:
             new = 1 if reasons[0] else 0
             out.append(versions[new])
             dropped.append((versions[1 - new], reasons[1 - new]))
         else:
+            judged.add(len(out))
             out.append(f)
-    return out, dropped
+    return out, dropped, judged
 
 
 def strip_versions(findings):
@@ -705,6 +710,9 @@ def comparison_section(stats, gpt_model, claude_model, cut=()):
     elif sum(usable) == 0:
         lines.append("")
         lines.append("两条线路都没有给出可用结果。")
+    if stats.get("split"):
+        lines += ["", f"有 {stats['split']} 条“一致”发现的一半与已有讨论重复，"
+                      "另一半作为单边发现单独发布（行内标为仅一方）。"]
     if cut:
         lines += ["", f"因行内评论条数上限，以下 {len(cut)} 条未发为行内评论："]
         def one_line(value):

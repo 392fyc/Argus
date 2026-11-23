@@ -1409,7 +1409,7 @@ def should_drop_for_no_new_code(no_new_code, auto_command):
 
 
 def filter_findings(findings, min_severity=DEFAULT_MIN_SEVERITY, skip_patterns=(),
-                    threads=None, suppress_repeats=True):
+                    threads=None, suppress_repeats=True, repeat_judged=frozenset()):
     """Split findings into (kept, dropped) where dropped is [(finding, reason)].
 
     threads: Argus's own review threads on this PR, as dicts with path,
@@ -1420,6 +1420,8 @@ def filter_findings(findings, min_severity=DEFAULT_MIN_SEVERITY, skip_patterns=(
     A thread Argus itself closed (its fix-detection or outdated rules do that
     whenever lines change) says nothing about whether the problem was fixed, so
     it takes no part unless a person replied or Argus judged a reply in it.
+    repeat_judged: ids of findings already judged not to repeat (dual review judges
+    each version of an agreed finding on its own); the repeat test skips them.
     """
     floor = _SEVERITY_RANK[_min_severity_name(min_severity)]
     threads = _relevant_threads(threads)
@@ -1432,7 +1434,7 @@ def filter_findings(findings, min_severity=DEFAULT_MIN_SEVERITY, skip_patterns=(
         if _SEVERITY_RANK[severity] < floor:
             dropped.append((issue, f"severity {severity} below {_min_severity_name(min_severity)}"))
             continue
-        if suppress_repeats:
+        if suppress_repeats and id(issue) not in repeat_judged:
             reason = repeat_reason(issue, threads)
             if reason:
                 dropped.append((issue, reason))
@@ -1923,21 +1925,23 @@ def apply_patch():
                 dual = getattr(self, "_argus_dual", None)
 
                 def apply_filters(findings):
-                    split = []
+                    split, judged = [], ()
                     if dual is not None:
                         from argus_dual import split_repeated_pairs, strip_versions
                         if threads is not None:
                             # Each version of an agreed finding is judged on its own,
                             # so a wrong pairing cannot hide a new finding (argus_dual.py).
                             relevant = _relevant_threads(threads)
-                            findings, split = split_repeated_pairs(
+                            findings, split, judged = split_repeated_pairs(
                                 findings, lambda f: repeat_reason(f, relevant))
+                            dual["split"] = sum(1 for f, _ in split if f.get("argus_source") != "both")
                         findings = strip_versions(findings)
+                        judged = frozenset(id(findings[i]) for i in judged)
                     kept, dropped = filter_findings(
                         findings,
                         min_severity=_argus_review_setting("min_severity", DEFAULT_MIN_SEVERITY),
                         skip_patterns=skip, threads=threads,
-                        suppress_repeats=threads is not None)
+                        suppress_repeats=threads is not None, repeat_judged=judged or frozenset())
                     if dual is not None:
                         # Two lines can report up to twice as many findings; the
                         # inline count keeps the single-line limit (argus_dual.py).

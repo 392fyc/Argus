@@ -839,7 +839,8 @@ def test_a_repeated_half_of_a_pair_does_not_hide_the_new_half():
     merged = ad.merge_findings([old], [new])
     assert len(merged) == 1 and ad.VERSIONS_KEY in merged[0]
     threads = psf._relevant_threads([_thread(old)])
-    out, dropped = ad.split_repeated_pairs(merged, lambda f: psf.repeat_reason(f, threads))
+    out, dropped, judged = ad.split_repeated_pairs(merged, lambda f: psf.repeat_reason(f, threads))
+    assert judged == set()
     assert [f["argus_source"] for f in out] == ["claude"]
     assert "wrong charset" in out[0]["issue_content"]
     assert dropped[0][1] == "repeats an open thread"
@@ -847,13 +848,13 @@ def test_a_repeated_half_of_a_pair_does_not_hide_the_new_half():
     assert len(kept) == 1 and ad.VERSIONS_KEY not in kept[0]
 
 
-def test_a_pair_with_no_repeat_or_two_repeats_stays_whole():
+def test_a_pair_is_judged_whole_when_both_versions_agree():
     a = finding("a.py", 1, 1, content="列表为空时除以零。")
     merged = ad.merge_findings([a], [dict(a)])
-    out, dropped = ad.split_repeated_pairs(merged, lambda f: None)
-    assert out == merged and dropped == []
-    out, dropped = ad.split_repeated_pairs(merged, lambda f: "repeats an open thread")
-    assert out == merged and dropped == []
+    out, dropped, judged = ad.split_repeated_pairs(merged, lambda f: None)
+    assert out == merged and dropped == [] and judged == {0}
+    out, dropped, judged = ad.split_repeated_pairs(merged, lambda f: "repeats an open thread")
+    assert out == [] and [r for _, r in dropped] == ["repeats an open thread"]
 
 
 def test_stripping_the_versions_rewrites_the_prediction():
@@ -862,3 +863,25 @@ def test_stripping_the_versions_rewrites_the_prediction():
                           allow_unicode=True)
     out, dropped = psf._filter_prediction(text, load_yaml, lambda fs: (ad.strip_versions(fs), []))
     assert dropped == [] and ad.VERSIONS_KEY not in out
+
+
+def test_a_pair_whose_versions_are_new_is_not_dropped_on_its_merged_text():
+    # Neither version repeats the old thread, but their words together would.
+    old = finding("src/auth.py", 40, 40, content="ledger snapshot reset_day timezone parse_config")
+    gpt = finding("src/auth.py", 10, 10, content="ledger snapshot misses lock around record_cost write")
+    claude = finding("src/auth.py", 11, 11, content="reset_day timezone handling around record_cost write breaks lock")
+    merged = ad.merge_findings([gpt], [claude])
+    assert len(merged) == 1
+    threads = psf._relevant_threads([_thread(old)])
+    assert psf.repeat_reason(gpt, threads) is None and psf.repeat_reason(claude, threads) is None
+    out, dropped, judged = ad.split_repeated_pairs(merged, lambda f: psf.repeat_reason(f, threads))
+    stripped = ad.strip_versions(out)
+    kept, _ = psf.filter_findings(stripped, threads=threads,
+                                  repeat_judged=frozenset(id(stripped[i]) for i in judged))
+    assert len(kept) == 1
+
+
+def test_the_comparison_says_when_pairs_were_split():
+    stats = {"gpt_status": "ok", "claude_status": "ok", "gpt_findings": 1, "claude_findings": 1,
+             "both": 1, "gpt_only": 0, "claude_only": 0, "split": 1}
+    assert "另一半作为单边发现单独发布" in ad.comparison_section(stats, "g", "c")
