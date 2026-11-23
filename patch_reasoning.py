@@ -1,7 +1,7 @@
 """Pass the configured reasoning effort through for Argus's target model only.
 
 The target is whatever ``config.model`` (and ``model_turbo`` / ``model_weak``)
-names in configuration.toml, currently ``openai/responses/gpt-6.1-sol``.
+names in configuration.toml, currently ``openai/responses/gpt-6.2-sol``.
 PR-Agent 0.38.0 sends ``reasoning_effort`` only for models in its static
 SUPPORT_REASONING_EFFORT_MODELS list (o3/o4-mini), and LiteLLM drops
 ``reasoning_effort`` for a model it does not know unless the parameter is named

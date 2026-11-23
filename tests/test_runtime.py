@@ -266,7 +266,7 @@ def test_a_timed_out_call_is_charged_for_its_own_timeout(tmp_path):
 
     guarded = ab.make_guarded_acompletion(original, lambda: ledger)
     with pytest.raises(ab.ModelTimeout):
-        run(guarded(model="openai/responses/gpt-6.1-sol", messages=[], timeout=600))
+        run(guarded(model="openai/responses/gpt-6.2-sol", messages=[], timeout=600))
     spent = ledger.snapshot()[0]
     # 32000 output tokens at 10 USD per million; the empty prompt still counts a few tokens.
     assert spent == pytest.approx(2 * ab.TIMEOUT_OUTPUT_TOKENS * 10.00 / 1e6, abs=1e-4)
