@@ -237,7 +237,7 @@ def _make_client(api_key, timeout):
     return anthropic.AsyncAnthropic(api_key=api_key, max_retries=0, timeout=timeout)
 
 
-def _failure_outcome(exc, ledger, model, prompt_size, timeout):
+def _failure_outcome(exc, ledger, model, prompt_size, timeout, built=True):
     """(ledger write or None, LineFailed or None to re-raise) for a failed call."""
     estimate = functools.partial(ledger.record_timeout, model, prompt_size, timeout)
     if isinstance(exc, asyncio.CancelledError):
@@ -250,9 +250,10 @@ def _failure_outcome(exc, ledger, model, prompt_size, timeout):
         return (None if _never_sent(exc) else estimate), LineFailed("timeout")
     if _is_claude_quota_error(exc):
         return ledger.mark_exhausted, LineFailed("quota", name)
-    if isinstance(exc, TypeError) or _rejected_before_work(exc) or _never_sent(exc):
-        # Refused, never connected, or the SDK rejected the arguments before sending
-        # (a TypeError, e.g. an SDK too old for a parameter): nothing to bill.
+    if not built or _rejected_before_work(exc) or _never_sent(exc):
+        # Refused, never connected, or the SDK rejected the arguments before anything
+        # was sent (e.g. an SDK too old for a parameter): nothing to bill. A failure
+        # after the request was built is charged, whatever its type.
         return None, LineFailed("error", name)
     # The answer may have been under way (a dropped stream, an error event
     # mid-stream): the provider can bill it and no usage comes back. Charge the same
@@ -285,12 +286,17 @@ async def claude_review(system, user, config: DualConfig, ledger: BudgetLedger,
     price = find_price(config.model, ledger.config)
     client = client_factory(api_key, timeout)
     try:
+        built = False
+
         async def call():
-            async with client.messages.stream(
-                    model=config.model, max_tokens=config.max_tokens, system=system,
-                    messages=[{"role": "user", "content": user}],
-                    thinking={"type": "adaptive"},
-                    output_config={"effort": config.effort}) as stream:
+            nonlocal built
+            manager = client.messages.stream(
+                model=config.model, max_tokens=config.max_tokens, system=system,
+                messages=[{"role": "user", "content": user}],
+                thinking={"type": "adaptive"},
+                output_config={"effort": config.effort})
+            built = True  # the SDK accepted the arguments; sending starts on entering
+            async with manager as stream:
                 return await stream.get_final_message()
         # The SDK timeout bounds each read; this bounds the whole answer.
         message = await asyncio.wait_for(call(), timeout + 15)
@@ -298,7 +304,7 @@ async def claude_review(system, user, config: DualConfig, ledger: BudgetLedger,
         # Record first, then close: the write is shielded and runs in a thread, so a
         # cancellation that arrives while closing (or now) cannot drop it.
         charge, failure = _failure_outcome(exc, ledger, config.model,
-                                           len(system) + len(user), timeout)
+                                           len(system) + len(user), timeout, built)
         try:
             if charge is not None:
                 await asyncio.shield(asyncio.to_thread(charge))
@@ -503,9 +509,10 @@ def _is_security(finding):
 
 def _combine(g, c):
     """One agreed finding from the two versions. The header (and location) of the
-    more severe one, a security header over any other; the other version's
+    more severe one (a security header wins a tie: the merged severity never drops
+    below either version's, so the severity filter cannot drop it); the other version's
     description is kept below, so a pair matched wrongly hides nothing."""
-    g_first = (_is_security(g), _rank(g)) >= (_is_security(c), _rank(c))
+    g_first = (_rank(g), _is_security(g)) >= (_rank(c), _is_security(c))
     keep, other, other_name = (g, c, "Claude") if g_first else (c, g, "GPT")
     item = dict(keep, argus_source=SOURCE_BOTH)
     mine = str(keep.get("issue_content") or "").strip()

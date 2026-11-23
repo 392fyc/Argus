@@ -787,8 +787,18 @@ def test_a_failed_call_is_charged_even_if_cancelled_while_closing(ledger, failur
 
 
 def test_arguments_the_sdk_rejects_cost_nothing(ledger):
+    class OldSdk(FakeClient):
+        def __init__(self):
+            super().__init__(message())
+
+            class Messages:
+                def stream(self, **kwargs):
+                    raise TypeError("unexpected keyword argument 'output_config'")
+            self.messages = Messages()
+
     with pytest.raises(ad.LineFailed) as e:
-        call(ledger, TypeError("unexpected keyword argument 'output_config'"))
+        run(ad.claude_review("sys", "user", DUAL, ledger, 300, api_key="k",
+                             client_factory=lambda key, t: OldSdk()))
     assert e.value.status == "error"
     assert ledger.snapshot()[0] == 0
 
@@ -799,3 +809,17 @@ def test_the_continue_notice_says_review_stops_with_the_claude_budget():
     config = ab.parse_config({"monthly_usd": 1})
     text = ab.exhausted_comment(1.0, config, datetime(2026, 12, 1), review_continues=True)
     assert "Claude 线路本期额度也用完" in text
+
+
+def test_a_more_severe_version_wins_over_a_minor_security_header():
+    critical = finding("src/auth.py", 10, 10, header="Critical Bug", content="token check skipped for admin users")
+    minor = finding("src/auth.py", 11, 11, header="Security nit", content="token check skipped for admin users")
+    merged = ad.merge_findings([critical], [minor])
+    assert len(merged) == 1 and merged[0]["issue_header"] == "Critical Bug"
+    assert psf._finding_severity(merged[0]) == "Critical"
+
+
+def test_a_type_error_after_the_request_was_built_is_charged(ledger):
+    with pytest.raises(ad.LineFailed):
+        call(ledger, TypeError("bad event payload"))
+    assert ledger.snapshot()[0] > 0
