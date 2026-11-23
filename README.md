@@ -2,7 +2,7 @@
 
 > *Named after the hundred-eyed giant Argus Panoptes — the all-seeing watchman.*
 
-Self-hosted **advisory** AI code review for [Mercury](https://github.com/392fyc/Mercury) and other repositories, powered by [PR-Agent](https://github.com/qodo-ai/pr-agent) 0.38.0 and `gpt-6.1-sol` called directly through OpenAI's Responses API.
+Self-hosted **advisory** AI code review for [Mercury](https://github.com/392fyc/Mercury) and other repositories, powered by [PR-Agent](https://github.com/qodo-ai/pr-agent) 0.38.0 and `gpt-6.2-sol` called directly through OpenAI's Responses API.
 
 Argus gives advice. It never blocks a merge and never approves one: every review it submits is a GitHub `COMMENT`.
 
@@ -43,7 +43,7 @@ Argus: PR-Agent 0.38.0 + patches (Docker, QNAP NAS)
     |-- budget check (argus_budget.py): stop if this month's cap is used up
     |-- read .argus/review.toml + context files from the PR's target branch (argus_context.py)
     |-- fetch the whole PR diff (30 lines of context before each change, 10 after) — `.gitignore` included, which PR-Agent's default extension filter drops (Argus #58)
-    |-- gpt-6.1-sol through OpenAI Responses, reasoning effort "high"
+    |-- gpt-6.2-sol through OpenAI Responses, reasoning effort "high"
     |-- drop findings: skip_paths, below the severity threshold, repeats of existing threads
     |-- submit one GitHub review (COMMENT) with inline suggestions
     v
@@ -95,9 +95,9 @@ How the content is used:
 
 ## Model routing
 
-`configuration.toml` sets `model`, `model_turbo` and `model_weak` to `openai/responses/gpt-6.1-sol`, with `fallback_models=[]`.
+`configuration.toml` sets `model`, `model_turbo` and `model_weak` to `openai/responses/gpt-6.2-sol`, with `fallback_models=[]`.
 
-- `openai/` is the LiteLLM provider and `responses/` selects LiteLLM's Chat-Completions-to-Responses bridge. The prefix matters: LiteLLM (v1.84.0, `get_llm_provider_logic.py`) cannot infer a provider from a bare `responses/gpt-6.1-sol`, while `openai/responses/<model>` resolves to provider `openai` and `responses_api_bridge_check` in `litellm/main.py` then strips `responses/` and routes through the bridge.
+- `openai/` is the LiteLLM provider and `responses/` selects LiteLLM's Chat-Completions-to-Responses bridge. The prefix matters: LiteLLM (v1.84.0, `get_llm_provider_logic.py`) cannot infer a provider from a bare `responses/gpt-6.2-sol`, while `openai/responses/<model>` resolves to provider `openai` and `responses_api_bridge_check` in `litellm/main.py` then strips `responses/` and routes through the bridge.
 - `reasoning_effort = "high"`. PR-Agent 0.38.0 sends `reasoning_effort` only for models in its static `SUPPORT_REASONING_EFFORT_MODELS` (o3, o4-mini), and LiteLLM drops the parameter for an unknown model unless it is named in `allowed_openai_params`. `patch_reasoning.py` adds both for the configured model (`model`, `model_turbo`, `model_weak`) and leaves other models untouched. The bridge turns `reasoning_effort` into the Responses `reasoning` parameter (`litellm_responses_transformation/transformation.py`, `_map_reasoning_effort`).
 - `.secrets.toml` needs only `[openai] key`. Do not leave `api_type`, `api_base`, `api_version` or `deployment_id` there: a `deployment_id` makes LiteLLM switch the call to Azure (`litellm/main.py`: `if deployment_id is not None`).
 - Not yet exercised against the real OpenAI API from this repository: see [First deployment](#first-deployment).
@@ -121,7 +121,7 @@ timezone = "Asia/Tokyo"
 missing_usage_usd = 0.10  # charged when a call returns no token usage
 
 [[argus_budget.prices]]   # USD per 1,000,000 tokens
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 input = 2.00
 cached_input = 0.10
 output = 10.00
@@ -228,7 +228,7 @@ Leave empty to allow all users. The guard logs all allow/block decisions.
 Things that cannot be checked from this repository and need a human on the NAS:
 
 1. **Before the pull request that switches to OpenAI is merged** (merging deploys it automatically), edit `.secrets.toml` on the NAS: set `[openai] key` to an OpenAI API key and **remove** `api_type`, `api_base`, `api_version` and `deployment_id` from `[openai]`. If they are still there when the new container starts, a `deployment_id` makes LiteLLM send the call to Azure, and `api_type = "azure"` makes PR-Agent put an `azure/` prefix on the model name; either way the OpenAI route fails. The file is mounted read-only into the container, so changing it takes effect the next time the container starts.
-2. After the deploy, open a test PR and read the container log: confirm the request goes to `api.openai.com` (not Azure), the model answers, the response carries usage, and `reasoning_effort` is accepted. If the `openai/responses/gpt-6.1-sol` string or the reasoning parameter is rejected, adjust the model string in `configuration.toml`.
+2. After the deploy, open a test PR and read the container log: confirm the request goes to `api.openai.com` (not Azure), the model answers, the response carries usage, and `reasoning_effort` is accepted. If the `openai/responses/gpt-6.2-sol` string or the reasoning parameter is rejected, adjust the model string in `configuration.toml`.
 3. The first review on a PR that an older Argus left a `REQUEST_CHANGES` review on will dismiss that review ("Argus now only gives advice ..."); this needs the App's Pull requests write permission and a failure is only logged. Any such review on a PR that never gets another Argus review stays and can be dismissed by hand on GitHub.
 4. Check `logs/budget.json` after the first review: `spent_usd` should be a plausible figure for the usage shown in the log.
 5. Review the token numbers of a large PR against `max_model_tokens = 80000`.
@@ -236,7 +236,7 @@ Things that cannot be checked from this repository and need a human on the NAS:
 
 ## Cost
 
-Priced per the table in `[argus_budget]`: `gpt-6.1-sol` costs 2.00 USD per million input tokens, 0.10 per million cached input tokens and 10.00 per million output tokens (OpenAI's pricing page). The monthly cap above bounds the total; see its limit.
+Priced per the table in `[argus_budget]`: `gpt-6.2-sol` costs 2.00 USD per million input tokens, 0.10 per million cached input tokens and 10.00 per million output tokens (OpenAI's pricing page). The monthly cap above bounds the total; see its limit.
 
 ## Related
 

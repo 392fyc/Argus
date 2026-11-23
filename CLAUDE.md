@@ -22,7 +22,7 @@ Role definitions: `.claude/agents/*.md` — Argus's own `dev` and `acceptance`, 
 
 ## Role positioning
 
-Argus reviews pull requests for Mercury and other 392fyc repos using PR-Agent (0.38, `pragent/pr-agent` base image) + Argus patches on the model configured in `configuration.toml` (currently `openai/responses/gpt-6.1-sol`, called directly through OpenAI's Responses API). Argus is advisory: every review it submits is a `COMMENT`, never `REQUEST_CHANGES` or `APPROVE`, and a monthly spend cap (`argus_budget.py`) stops it when the budget is used up. It runs as a Docker container on a QNAP NAS behind a Cloudflare tunnel (`argus.fyc-space.uk`). The GitHub App is `Argus-review`.
+Argus reviews pull requests for Mercury and other 392fyc repos using PR-Agent (0.38, `pragent/pr-agent` base image) + Argus patches on the model configured in `configuration.toml` (currently `openai/responses/gpt-6.2-sol`, called directly through OpenAI's Responses API). Argus is advisory: every review it submits is a `COMMENT`, never `REQUEST_CHANGES` or `APPROVE`, and a monthly spend cap (`argus_budget.py`) stops it when the budget is used up. It runs as a Docker container on a QNAP NAS behind a Cloudflare tunnel (`argus.fyc-space.uk`). The GitHub App is `Argus-review`.
 
 > **Operator-only facts** (not verifiable from this repo alone — sourced from the Mercury operator's notes, subject to operator confirmation before acting):
 > - App ID: `3279157`

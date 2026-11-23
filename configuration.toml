@@ -2,22 +2,22 @@
 # Your repository configuration should only include options you wish to override from the defaults.
 
 [config]
-# models: gpt-6.1-sol through OpenAI's Responses API, called directly (no Azure).
+# models: gpt-6.2-sol through OpenAI's Responses API, called directly (no Azure).
 # "openai/" names the LiteLLM provider and "responses/" routes the request through
 # LiteLLM's Chat-Completions-to-Responses bridge. The provider prefix is required:
 # LiteLLM (litellm_core_utils/get_llm_provider_logic.py, v1.84.0) cannot infer a
-# provider from a bare "responses/gpt-6.1-sol", while "openai/responses/<model>"
+# provider from a bare "responses/gpt-6.2-sol", while "openai/responses/<model>"
 # is resolved to provider "openai" and the bridge then strips "responses/"
 # (litellm/main.py responses_api_bridge_check). Not yet exercised against the real
 # OpenAI API: confirm on first deployment (see README "First deployment").
 # The model must NOT be combined with any [openai] api_type/api_base/deployment_id
 # in .secrets.toml: a deployment_id makes LiteLLM switch to Azure (litellm/main.py,
 # "if deployment_id is not None").
-model="openai/responses/gpt-6.1-sol"
-model_turbo="openai/responses/gpt-6.1-sol"
+model="openai/responses/gpt-6.2-sol"
+model_turbo="openai/responses/gpt-6.2-sol"
 fallback_models=[]
 #model_reasoning="o4-mini" # dedicated reasoning model for self-reflection
-model_weak="openai/responses/gpt-6.1-sol"
+model_weak="openai/responses/gpt-6.2-sol"
 # CLI
 git_provider="github"
 publish_output=true
@@ -430,11 +430,11 @@ timezone = "Asia/Tokyo"
 # Charged when a successful call returns no token usage, so a call is never free.
 missing_usage_usd = 0.10
 
-# Prices in USD per 1,000,000 tokens. gpt-6.1-sol: input 2.00, cached input 0.10,
+# Prices in USD per 1,000,000 tokens. gpt-6.2-sol: input 2.00, cached input 0.10,
 # output 10.00 (OpenAI pricing page). An unlisted model is billed at the highest
 # price in this table. Output includes reasoning tokens.
 [[argus_budget.prices]]
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 input = 2.00
 cached_input = 0.10
 output = 10.00

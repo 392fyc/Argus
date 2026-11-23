@@ -20,7 +20,7 @@ if str(REPO_ROOT) not in sys.path:
 import argus_budget as ab  # noqa: E402
 
 JST = timezone(timedelta(hours=9))
-CFG = ab.BudgetConfig(monthly_usd=10.0)  # a test cap; reset day 15, Asia/Tokyo, gpt-6.1-sol prices
+CFG = ab.BudgetConfig(monthly_usd=10.0)  # a test cap; reset day 15, Asia/Tokyo, gpt-6.2-sol prices
 
 
 class Clock:
@@ -116,7 +116,7 @@ def test_config_defaults_match_the_agreed_values():
     cfg = ab.parse_config(None)
     assert (cfg.monthly_usd, cfg.reset_day, cfg.timezone) == (None, 15, "Asia/Tokyo")
     price = cfg.prices[0]
-    assert (price.model, price.input, price.cached_input, price.output) == ("gpt-6.1-sol", 2.0, 0.10, 10.0)
+    assert (price.model, price.input, price.cached_input, price.output) == ("gpt-6.2-sol", 2.0, 0.10, 10.0)
 
 
 def test_config_reads_table_with_any_key_case():
@@ -180,7 +180,7 @@ def test_settings_loader_uses_pr_agent_table(monkeypatch):
 
 # ── pricing ───────────────────────────────────────────────────────
 
-PRICE = ab.ModelPrice("gpt-6.1-sol", 2.00, 0.10, 10.00)
+PRICE = ab.ModelPrice("gpt-6.2-sol", 2.00, 0.10, 10.00)
 
 
 def usage(prompt, completion, cached=0, reasoning=0):
@@ -217,12 +217,12 @@ def test_no_usage_is_not_priced():
 
 
 def test_model_names_are_normalised_and_unknown_models_cost_the_most():
-    assert ab.normalize_model("openai/responses/GPT-6.1-Sol") == "gpt-6.1-sol"
+    assert ab.normalize_model("openai/responses/GPT-6.2-Sol") == "gpt-6.2-sol"
     cfg = ab.BudgetConfig(prices=(ab.ModelPrice("cheap", 1, 1, 2), ab.ModelPrice("dear", 5, 5, 40)))
     assert ab.find_price("openai/responses/dear", cfg).output == 40
     assert ab.find_price("something-else", cfg).model == "dear"
-    snapshot = ab.find_price("gpt-6.1-sol-2026-10-01", CFG)
-    assert snapshot.model == "gpt-6.1-sol"
+    snapshot = ab.find_price("gpt-6.2-sol-2026-10-01", CFG)
+    assert snapshot.model == "gpt-6.2-sol"
 
 
 def test_responses_bridge_usage_shape_is_priced():
@@ -467,7 +467,7 @@ def test_call_prices_the_response_and_adds_it_to_the_ledger(ledger):
         return SimpleNamespace(usage=usage(10000, 2000, cached=4000, reasoning=1500))
 
     guarded = make_guard(ledger, original)
-    run(guarded(model="openai/responses/gpt-6.1-sol", messages=[]))
+    run(guarded(model="openai/responses/gpt-6.2-sol", messages=[]))
     assert read_ledger(ledger)["spent_usd"] == pytest.approx(0.0324)
 
 
@@ -715,11 +715,11 @@ async def _noop(*a, **k):
 
 def test_wrapped_litellm_call_is_blocked_when_budget_is_used_up(ledger, monkeypatch):
     handler, _, calls = wire(ledger, monkeypatch)
-    run(handler.acompletion(model="openai/responses/gpt-6.1-sol"))
+    run(handler.acompletion(model="openai/responses/gpt-6.2-sol"))
     assert calls == [1]
     ledger.record_cost(10)
     with pytest.raises(ab.BudgetExhausted):
-        run(handler.acompletion(model="openai/responses/gpt-6.1-sol"))
+        run(handler.acompletion(model="openai/responses/gpt-6.2-sol"))
     assert calls == [1]
 
 
@@ -760,9 +760,9 @@ def test_a_timeout_is_charged_an_estimate_and_raised_as_model_timeout(ledger):
 
     messages = [{"role": "user", "content": "x" * 50000}]
     with pytest.raises(ab.ModelTimeout):
-        run(make_guard(ledger, original)(model="openai/responses/gpt-6.1-sol", messages=messages))
+        run(make_guard(ledger, original)(model="openai/responses/gpt-6.2-sol", messages=messages))
     spent = read_ledger(ledger)["spent_usd"]
-    allowance = ab.TIMEOUT_OUTPUT_TOKENS * 10.00 / 1e6     # output at the gpt-6.1-sol price
+    allowance = ab.TIMEOUT_OUTPUT_TOKENS * 10.00 / 1e6     # output at the gpt-6.2-sol price
     assert allowance <= spent <= 50000 * 2.00 / 1e6 + allowance + 1e-9
 
 
@@ -788,7 +788,7 @@ def test_after_a_timeout_the_same_command_never_calls_the_model_again(
         # PR-Agent retries the call, as its @retry does after wrapping the error.
         for _ in range(2):
             try:
-                await handler.acompletion(model="openai/responses/gpt-6.1-sol", messages=[])
+                await handler.acompletion(model="openai/responses/gpt-6.2-sol", messages=[])
             except Exception:
                 pass
         return None

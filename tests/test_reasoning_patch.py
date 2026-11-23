@@ -14,7 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import patch_reasoning
 
-TARGET_MODEL = "openai/responses/gpt-6.1-sol"
+TARGET_MODEL = "openai/responses/gpt-6.2-sol"
 
 
 class FakeReasoningEffort(str, Enum):
@@ -77,7 +77,7 @@ class ReasoningPatchTests(unittest.IsolatedAsyncioTestCase):
     async def test_other_model_is_forwarded_without_modification(self):
         allowed = ["response_format"]
         await self.patched(
-            model="openai/responses/gpt-6.1-sol-preview",
+            model="openai/responses/gpt-6.2-sol-preview",
             messages=[],
             allowed_openai_params=allowed,
             custom_parameter="kept",
@@ -86,7 +86,7 @@ class ReasoningPatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.original.await_args.kwargs,
             {
-                "model": "openai/responses/gpt-6.1-sol-preview",
+                "model": "openai/responses/gpt-6.2-sol-preview",
                 "messages": [],
                 "allowed_openai_params": allowed,
                 "custom_parameter": "kept",

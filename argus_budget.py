@@ -106,9 +106,9 @@ class ModelPrice:
     output: float
 
 
-# gpt-6.1-sol list price: input 2.00, cached input 0.10, output 10.00 (OpenAI
-# pricing page, as given in Argus #49). Used when configuration.toml has no table.
-_DEFAULT_PRICES = (ModelPrice("gpt-6.1-sol", 2.00, 0.10, 10.00),)
+# gpt-6.2-sol list price: input 2.00, cached input 0.10, output 10.00 (OpenAI
+# pricing page, checked again for Argus #70). Used when configuration.toml has no table.
+_DEFAULT_PRICES = (ModelPrice("gpt-6.2-sol", 2.00, 0.10, 10.00),)
 
 
 @dataclass(frozen=True)
@@ -241,7 +241,7 @@ def _count(value):
 
 
 def normalize_model(model) -> str:
-    """'openai/responses/gpt-6.1-sol' -> 'gpt-6.1-sol'."""
+    """'openai/responses/gpt-6.2-sol' -> 'gpt-6.2-sol'."""
     return str(model or "").rsplit("/", 1)[-1].strip().lower()
 
 
@@ -255,7 +255,7 @@ def find_price(model, config: BudgetConfig) -> ModelPrice:
         if name == key:
             return price
         if name.startswith(key) and (best is None or len(key) > len(best.model)):
-            best = price  # e.g. a dated snapshot 'gpt-6.1-sol-2026-...'
+            best = price  # e.g. a dated snapshot 'gpt-6.2-sol-2026-...'
     if best is not None:
         return best
     print(f"[Argus Budget] no price for model {model!r}; using the highest listed price")
