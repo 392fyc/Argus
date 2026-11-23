@@ -969,3 +969,20 @@ def test_a_header_with_full_width_brackets_still_splits():
                             "reset_day timezone handling around record_cost write breaks lock",
                             claude_header="Possible Bug（并发）")
     assert len(psf._thread_token_parts(thread)) == 2
+
+
+def test_an_agreed_finding_keeps_the_other_lines_location():
+    text = "save_record swallows TimeoutError so the write is silently lost."
+    merged = ad.merge_findings([finding("a.py", 10, 10, content=text)], [finding("a.py", 12, 13, content=text)])
+    assert len(merged) == 1
+    content = merged[0]["issue_content"]
+    assert content.startswith(text) and "Claude 标注的位置：第 12-13 行" in content
+    same = ad.merge_findings([finding("a.py", 10, 10, content=text)], [finding("a.py", 10, 10, content=text)])
+    assert same[0]["issue_content"] == text
+
+
+def test_a_failed_call_is_charged_at_the_request_output_limit(ledger):
+    charged = []
+    ledger.record_timeout = lambda model, tokens, timeout, reason="", output_tokens=None: charged.append(output_tokens)
+    ad._charge_estimate(ledger, DUAL.model, "sys", "user", 300, DUAL.max_tokens)
+    assert charged == [DUAL.max_tokens]
