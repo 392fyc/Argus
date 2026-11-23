@@ -919,3 +919,20 @@ def test_a_line_number_that_is_not_finite_counts_as_no_location(bad):
     assert ad._line_range(broken) is None
     merged = ad.merge_findings([broken], [finding("a.py", 3, 3, content="另一个问题。")])
     assert len(merged) == 2
+
+
+def test_an_agreed_thread_is_matched_one_description_at_a_time():
+    # An earlier agreed finding: two descriptions in one thread.
+    a = finding("app/store.py", 10, 10, content="ledger snapshot misses lock around record_cost write")
+    b = finding("app/store.py", 11, 11, content="reset_day timezone handling around record_cost write breaks lock")
+    merged = ad.strip_versions(ad.merge_findings([a], [b]))
+    assert len(merged) == 1
+    thread = _thread(merged[0])
+    assert len(psf._thread_token_parts(thread)) == 2
+    crlf = dict(thread, first_bot_body=thread["first_bot_body"].replace("\n", "\r\n"))
+    assert len(psf._thread_token_parts(crlf)) == 2
+    # A new defect sharing some words with each description, but not enough with either.
+    new = finding("app/store.py", 30, 30, content="ledger snapshot reset_day timezone drift")
+    assert not psf.finding_matches_thread(new, thread)
+    # The same defects as before still count as repeats.
+    assert psf.finding_matches_thread(a, thread) and psf.finding_matches_thread(b, thread)
