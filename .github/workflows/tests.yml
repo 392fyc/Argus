@@ -19,5 +19,5 @@ jobs:
         with:
           python-version: "3.12"
       # The versions the container runs: pr-agent 0.38.0 (the base image) and the LiteLLM it was tested with.
-      - run: python -m pip install pr-agent==0.38.0 litellm==1.84.0 pytest==9.0.2
+      - run: python -m pip install pr-agent==0.38.0 litellm==1.84.0 pytest==9.0.2 anthropic==0.112.0
       - run: python -m pytest -q

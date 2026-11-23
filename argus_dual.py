@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import functools
 import os
 import re
 from dataclasses import dataclass, replace
@@ -236,6 +237,30 @@ def _make_client(api_key, timeout):
     return anthropic.AsyncAnthropic(api_key=api_key, max_retries=0, timeout=timeout)
 
 
+def _failure_outcome(exc, ledger, model, prompt_size, timeout):
+    """(ledger write or None, LineFailed or None to re-raise) for a failed call."""
+    estimate = functools.partial(ledger.record_timeout, model, prompt_size, timeout)
+    if isinstance(exc, asyncio.CancelledError):
+        # Cancelled while the request was out: the provider may still bill it.
+        return functools.partial(estimate, reason="was cancelled while in flight"), None
+    if not isinstance(exc, Exception):
+        return None, None
+    name = type(exc).__name__
+    if is_timeout_error(exc) or name == "APITimeoutError":
+        return (None if _never_sent(exc) else estimate), LineFailed("timeout")
+    if _is_claude_quota_error(exc):
+        return ledger.mark_exhausted, LineFailed("quota", name)
+    if isinstance(exc, TypeError) or _rejected_before_work(exc) or _never_sent(exc):
+        # Refused, never connected, or the SDK rejected the arguments before sending
+        # (a TypeError, e.g. an SDK too old for a parameter): nothing to bill.
+        return None, LineFailed("error", name)
+    # The answer may have been under way (a dropped stream, an error event
+    # mid-stream): the provider can bill it and no usage comes back. Charge the same
+    # estimate as a timeout; stopping early beats under-counting.
+    return (functools.partial(estimate, reason=f"failed ({name}) after it may have started"),
+            LineFailed("error", name))
+
+
 async def _close(client):
     close = getattr(client, "close", None)
     if close is not None:
@@ -269,34 +294,19 @@ async def claude_review(system, user, config: DualConfig, ledger: BudgetLedger,
                 return await stream.get_final_message()
         # The SDK timeout bounds each read; this bounds the whole answer.
         message = await asyncio.wait_for(call(), timeout + 15)
-    except Exception as exc:
-        await _close(client)
-        estimate = (config.model, len(system) + len(user), timeout)
-        if is_timeout_error(exc) or type(exc).__name__ == "APITimeoutError":
-            if not _never_sent(exc):
-                await asyncio.to_thread(ledger.record_timeout, *estimate)
-            raise LineFailed("timeout") from exc
-        if _is_claude_quota_error(exc):
-            await asyncio.to_thread(ledger.mark_exhausted)
-            raise LineFailed("quota", type(exc).__name__) from exc
-        if not (_rejected_before_work(exc) or _never_sent(exc)):
-            # The answer may have been under way (a dropped stream, an error event
-            # mid-stream): the provider can bill it and no usage comes back. Charge
-            # the same estimate as a timeout; stopping early beats under-counting.
-            await asyncio.to_thread(ledger.record_timeout, *estimate,
-                                    reason=f"failed ({type(exc).__name__}) after it may have started")
-        raise LineFailed("error", type(exc).__name__) from exc
-    except asyncio.CancelledError:
-        # The review was cancelled while the request was out: the provider may still
-        # bill it. Charge the estimate synchronously (awaiting is not reliable inside
-        # a cancellation), then let the cancellation through.
+    except BaseException as exc:
+        # Record first, then close: the write is shielded and runs in a thread, so a
+        # cancellation that arrives while closing (or now) cannot drop it.
+        charge, failure = _failure_outcome(exc, ledger, config.model,
+                                           len(system) + len(user), timeout)
         try:
-            ledger.record_timeout(config.model, len(system) + len(user), timeout,
-                                  reason="was cancelled while in flight")
-        except Exception:
-            pass
-        await _close(client)
-        raise
+            if charge is not None:
+                await asyncio.shield(asyncio.to_thread(charge))
+        finally:
+            await _close(client)
+        if failure is None:
+            raise
+        raise failure from exc
     # The answer is in: record its usage before anything else can be interrupted.
     # Shielded, so a cancellation from here on still lets the write finish.
     cost = claude_cost(_field(message, "usage"), price)
@@ -486,10 +496,32 @@ def best_pairing(gpt, claude):
     return dict(winner[2])
 
 
+def _is_security(finding):
+    header = str(finding.get("issue_header") or "").lower()
+    return "security" in header or "安全" in header
+
+
+def _combine(g, c):
+    """One agreed finding from the two versions. The header (and location) of the
+    more severe one, a security header over any other; the other version's
+    description is kept below, so a pair matched wrongly hides nothing."""
+    g_first = (_is_security(g), _rank(g)) >= (_is_security(c), _rank(c))
+    keep, other, other_name = (g, c, "Claude") if g_first else (c, g, "GPT")
+    item = dict(keep, argus_source=SOURCE_BOTH)
+    mine = str(keep.get("issue_content") or "").strip()
+    theirs = str(other.get("issue_content") or "").strip()
+    if theirs and theirs != mine:
+        header = str(other.get("issue_header") or "").strip()
+        label = f"{other_name} 的描述" + (f"（{header}）" if header else "")
+        item["issue_content"] = f"{mine}\n\n{label}：{theirs}" if mine else theirs
+    return item
+
+
 def merge_findings(gpt, claude):
     """One list from both lines, each finding tagged with ``argus_source``.
 
-    A finding both lines reported keeps the more severe of the two versions. The list
+    A finding both lines reported keeps the more severe version's header and both
+    descriptions (_combine), so a wrong pairing never hides a finding. The list
     is ordered by severity, agreed findings first within a severity, so a cap keeps
     the most severe findings and prefers the agreed ones among equals."""
     pair_of = best_pairing(gpt, claude)
@@ -500,8 +532,7 @@ def merge_findings(gpt, claude):
             merged.append(dict(g, argus_source=SOURCE_GPT))
             continue
         c = claude[pair_of[gi]]
-        keep = c if _rank(c) > _rank(g) else g
-        merged.append(dict(keep, argus_source=SOURCE_BOTH))
+        merged.append(_combine(g, c))
     merged += [dict(c, argus_source=SOURCE_CLAUDE) for i, c in enumerate(claude) if i not in used]
     order = {SOURCE_BOTH: 0, SOURCE_GPT: 1, SOURCE_CLAUDE: 1}
     return sorted(merged, key=lambda f: (-_rank(f), order[f["argus_source"]]))

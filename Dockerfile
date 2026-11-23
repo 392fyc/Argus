@@ -13,6 +13,10 @@ FROM pragent/pr-agent:0.38.0-github_app@sha256:f07a88d52c816aef04fee53e31fa99b5f
 # the container log as soon as they are made (Argus #69).
 ENV PYTHONUNBUFFERED=1
 
+# The Claude line (argus_dual.py) needs an anthropic SDK that accepts adaptive
+# thinking and output_config; pr-agent only requires anthropic>=0.69.0.
+RUN python -m pip install --no-cache-dir anthropic==0.112.0
+
 COPY entrypoint-guard.py /app/entrypoint-guard.py
 COPY mention_rewrite.py /app/mention_rewrite.py
 COPY patch_suggestion_format.py /app/patch_suggestion_format.py

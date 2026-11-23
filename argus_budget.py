@@ -759,7 +759,8 @@ def exhausted_comment(spent_usd, config: BudgetConfig, next_reset, reason="",
     # Posted on public pull requests: the amounts stay in the host's log and ledger (Argus #65).
     # review_continues: review still runs on the second (Claude) line (argus_dual.py).
     continues = ("GPT 线路暂停：`review` 改由第二条线路（Claude）单线审查，"
-                 "其他需要 GPT 的命令暂停。本期内不会再发这条提示。")
+                 "其他需要 GPT 的命令暂停。若 Claude 线路本期额度也用完，`review` 随之停止。"
+                 "本期内不会再发这条提示。")
     if config.monthly_usd is None:
         return (
             "⚠️ **Argus 暂停审查：部署主机未配置月度花费上限**\n\n"
@@ -1099,7 +1100,6 @@ def apply_patch(ledger_getter=None):
         try:
             ledger.check()
         except BudgetExhausted as e:
-            # The check reads the Claude ledger (file lock, maybe a write): off the event loop (#56).
             # Once per period; the notice says when review goes on with the second line.
             await asyncio.to_thread(notify_once, ledger, pr_url, e.reason)
             # The availability check reads the Claude ledger (file lock, maybe a write),

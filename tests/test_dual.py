@@ -748,3 +748,54 @@ def test_usage_is_recorded_even_if_cancelled_while_closing(ledger):
         run(ad.claude_review("sys", "user", DUAL, ledger, 300, api_key="k",
                              client_factory=lambda key, t: client))
     assert ledger.snapshot()[0] == pytest.approx((10_000 * 4.0 + 1000 * 20.0) / 1_000_000)
+
+
+def test_a_wrong_pairing_hides_no_finding():
+    # Two defects in one function: they share identifiers and may be paired.
+    timeout = finding("src/auth.py", 10, 30,
+                      content="load_config reads config.timeout without validation; negative values hang.")
+    traversal = finding("src/auth.py", 12, 12, header="Security",
+                        content="load_config reads config.path without validation; path traversal possible.")
+    merged = ad.merge_findings([timeout], [traversal])
+    texts = " ".join(f["issue_content"] for f in merged)
+    assert "negative values hang" in texts and "path traversal" in texts
+    if len(merged) == 1:
+        assert merged[0]["issue_header"] == "Security"
+        assert "GPT 的描述" in merged[0]["issue_content"]
+
+
+def test_an_agreed_finding_with_one_description_is_not_repeated():
+    a = finding("a.py", 1, 1, content="列表为空时除以零。")
+    merged = ad.merge_findings([a], [dict(a)])
+    assert merged[0]["issue_content"] == "列表为空时除以零。"
+
+
+@pytest.mark.parametrize("failure", [
+    lambda: anthropic.APIConnectionError(request=_REQUEST),   # dropped mid-answer
+    lambda: TimeoutError(),
+])
+def test_a_failed_call_is_charged_even_if_cancelled_while_closing(ledger, failure):
+    class CancelOnClose(FakeClient):
+        async def close(self):
+            raise asyncio.CancelledError()
+
+    client = CancelOnClose(failure())
+    with pytest.raises(asyncio.CancelledError):
+        run(ad.claude_review("sys", "user", DUAL, ledger, 300, api_key="k",
+                             client_factory=lambda key, t: client))
+    assert ledger.snapshot()[0] > 0
+
+
+def test_arguments_the_sdk_rejects_cost_nothing(ledger):
+    with pytest.raises(ad.LineFailed) as e:
+        call(ledger, TypeError("unexpected keyword argument 'output_config'"))
+    assert e.value.status == "error"
+    assert ledger.snapshot()[0] == 0
+
+
+def test_the_continue_notice_says_review_stops_with_the_claude_budget():
+    import argus_budget as ab
+    from datetime import datetime
+    config = ab.parse_config({"monthly_usd": 1})
+    text = ab.exhausted_comment(1.0, config, datetime(2026, 12, 1), review_continues=True)
+    assert "Claude 线路本期额度也用完" in text
