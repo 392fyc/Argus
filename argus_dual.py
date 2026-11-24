@@ -393,11 +393,12 @@ def _line_range(issue):
 # Share of features (Jaccard) two descriptions of one defect must have in common.
 # Measured on hand-written pairs (Argus PR #74 review): different defects scored at
 # most 0.14, the same defect between 0.00 and 0.24. Text alone cannot separate them
-# well, so the threshold is set to keep findings apart rather than merge them wrongly:
-# a wrong merge hides a finding, a missed one only shows a defect twice.
+# well. A wrong pairing gives the wrong count and attribution, so keep the
+# similarity threshold conservative.
 SIMILAR_TEXT = 0.2
 _CJK_RUN = re.compile(r"[\u4e00-\u9fff]+")
 _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*[A-Za-z0-9_]")
+_CODE_REFERENCE = re.compile(r"`([A-Za-z_][A-Za-z0-9_.]{2,})`")
 # English words and Chinese character pairs any finding may contain; they say
 # nothing about which defect it is.
 _STOP_WORDS = frozenset("""
@@ -439,12 +440,25 @@ def text_similarity(a, b):
     return len(fa & fb) / len(fa | fb)
 
 
+def _agree_on_code_references(a, b):
+    """Compare a short report with a longer one using exact code references and shared wording."""
+    text_a = str(a.get("issue_content") or "")
+    text_b = str(b.get("issue_content") or "")
+    anchors_a = set(_CODE_REFERENCE.findall(text_a))
+    anchors_b = set(_CODE_REFERENCE.findall(text_b))
+    if len(anchors_a & anchors_b) < 2:
+        return False
+    fa, fb = _features(text_a), _features(text_b)
+    shared = len(fa & fb)
+    return shared >= 12 and shared >= SIMILAR_TEXT * min(len(fa), len(fb))
+
+
 def same_finding(a, b, slack=3):
     """True when two findings from different lines are the same complaint, on the same
     file. Nearby lines (within ``slack``) only make two findings candidates: their
-    descriptions must also share at least SIMILAR_TEXT of their character pairs, so a
-    null-pointer crash and a missing permission check two lines apart stay separate
-    unless their descriptions share enough identifiers or wording.
+    descriptions must share enough wording. When shared wording is diluted by extra
+    detail, accept two exact code references if the descriptions also share at least
+    12 features and cover SIMILAR_TEXT of the shorter description's features.
     Two findings that both name lines further apart than that are different places,
     and stay separate even when they share identifiers (one function can have two
     defects in two branches). Only when a finding names no lines does the shared-word
@@ -458,7 +472,7 @@ def same_finding(a, b, slack=3):
     ra, rb = _line_range(a), _line_range(b)
     if ra and rb:
         if ra[0] <= rb[1] + slack and rb[0] <= ra[1] + slack:
-            return text_similarity(a, b) >= SIMILAR_TEXT
+            return text_similarity(a, b) >= SIMILAR_TEXT or _agree_on_code_references(a, b)
         return False
     ta, tb = _finding_tokens(a), _finding_tokens(b)
     if not ta or not tb:
@@ -740,8 +754,9 @@ def comparison_section(stats, gpt_model, claude_model, cut=()):
         lines.append("本次只有一条线路给出了可用结果，审查按单线进行，行内评论不标来源。")
     elif stats.get("gpt_only", 0) and stats.get("claude_only", 0):
         lines.append("")
-        lines.append("“一致”按同一文件、相近行号且描述用词相近判定，偏保守："
-                     "措辞差别大的同一问题会分别计为单边发现。")
+        lines.append("“一致”要求同一文件、相近行号和相似描述。"
+                     "当一份描述比另一份详细时，共同的代码引用也可作为依据。"
+                     "匹配偏保守，措辞差别大的同一问题可能分别计为单边发现。")
     elif sum(usable) == 0:
         lines.append("")
         lines.append("两条线路都没有给出可用结果。")

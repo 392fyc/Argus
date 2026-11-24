@@ -247,6 +247,39 @@ def test_nearby_but_different_defects_stay_separate():
     assert sorted(f["argus_source"] for f in merged) == ["claude", "gpt"]
 
 
+def test_fbe4624_criterion_pair_counts_as_one_agreed_finding():
+    # Reconstructed from Mercury #822's first review. The shorter report and the
+    # detailed report both say that positional matching can accept an unjudged item.
+    path = "packs/core/skills/image-api/scripts/image_check.py"
+    gpt = finding(path, 158, 162, content=(
+        "脚本只核对返回条数，然后按位置覆盖模型返回的 `criterion`。"
+        "如果模型把第一条验收标准答了两次且均为 `pass`，第二条即使未被判断，回执也会标为通过并退出 0。"
+        "可给每条标准分配唯一 ID，验证无遗漏、重复或未知 ID 后再汇总。"
+    ))
+    claude = finding(path, 158, 158, content=(
+        "脚本只按位置把模型返回的 `items` 与卡片 `criteria` 对应，"
+        "丢弃了模型回填的 `criterion`，只校验了条数。模型漏判第 2 条、重复了第 1 条，"
+        "或调换了顺序，而条数仍然相同。这时某条验收实际没有被判定，整体仍可能得到 `pass`，退出码为 0。"
+        "报告里的理由会挂到错误的条目上。如果按照位置判断，即使回填的名称和卡片原文不同，程序也会生成错误的结果。"
+        "可以使用独立的条目序号字段，并在返回结果与输入不一致时输出 `unsure`。"
+    ))
+    assert ad.text_similarity(gpt, claude) < ad.SIMILAR_TEXT
+    text, stats = ad.merge_predictions(answer([gpt]), answer([claude]), load_yaml)
+    merged = yaml.safe_load(text)["review"]["key_issues_to_review"]
+    assert (stats["both"], stats["gpt_only"], stats["claude_only"]) == (1, 0, 0)
+    assert [item["argus_source"] for item in merged] == ["both"]
+    assert gpt["issue_content"] in merged[0]["issue_content"]
+    assert claude["issue_content"] in merged[0]["issue_content"]
+
+
+def test_two_code_references_alone_do_not_match_different_defects():
+    missing = finding("review.py", 158, 161, content=(
+        "模型把第一条验收答了两次且均为 `pass`，按位置覆盖 `criterion` 会漏掉第二条验收。"))
+    escaping = finding("review.py", 159, 160, content=(
+        "把含换行的 `criterion` 拼进 Markdown 表时会分裂数据行，建议单独转义文本和值 `pass`。"))
+    assert not ad.same_finding(missing, escaping)
+
+
 def test_findings_without_lines_match_on_shared_identifiers():
     a = finding("a.py", 10, 10, content="parse_config ignores reset_day overflow_guard")
     b = finding("a.py", None, None, content="reset_day overflow_guard in parse_config")
