@@ -399,7 +399,12 @@ SIMILAR_TEXT = 0.2
 _CJK_RUN = re.compile(r"[\u4e00-\u9fff]+")
 _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*[A-Za-z0-9_]")
 _CODE_REFERENCE = re.compile(r"`([A-Za-z_][A-Za-z0-9_.]{2,})`")
-_SENTENCE_END = re.compile(r"[。！？；!?\n]+|\.(?=\s|$)")
+_SENTENCE_END = re.compile(r"[。！？；;!?]+|\.(?=\s|$)|\r?\n[ \t]*\r?\n")
+_EXIT_STATUS = re.compile(
+    r"(?:\bexit(?:ed|s)?(?:\s+with)?(?:\s+(?:status|code)){0,2}|退出(?:状态码?|码)?)"
+    r"\s*[:=为]?\s*`?(-?[0-9]+)\b",
+    re.IGNORECASE,
+)
 # English words and Chinese character pairs any finding may contain; they say
 # nothing about which defect it is.
 _STOP_WORDS = frozenset("""
@@ -447,34 +452,39 @@ def _anchored_sentences(issue):
     for sentence in sentences:
         references = set(_CODE_REFERENCE.findall(sentence))
         if references:
-            anchored.append((references, _features(_CODE_REFERENCE.sub(" ", sentence))))
+            words = _features(_CODE_REFERENCE.sub(" ", sentence))
+            anchored.append((references, words, set(_EXIT_STATUS.findall(sentence))))
     return anchored
 
 
 def _agree_on_code_references(a, b):
-    """Require two separate sentence pairs with different shared references.
+    """Require a shared exit status and separate evidence about the mechanism.
 
-    Each pair must also share wording after stripping the quoted identifiers. One
-    sentence that recites the same setup and names two symbols is insufficient.
+    In two distinct sentence pairs, each pair must share wording and a code
+    reference, with no shared reference used across both pairs. One pair must
+    describe the same exit status. This lets a short report corroborate a
+    longer report that describes the same command behavior.
     """
     left, right = _anchored_sentences(a), _anchored_sentences(b)
     matched = []
-    for i, (refs_a, words_a) in enumerate(left):
-        for j, (refs_b, words_b) in enumerate(right):
+    for i, (refs_a, words_a, statuses_a) in enumerate(left):
+        for j, (refs_b, words_b, statuses_b) in enumerate(right):
             shared = refs_a & refs_b
             if not shared or len(words_a & words_b) < 4:
                 continue
-            if any(i != x and j != y and len(shared | refs) >= 2 for x, y, refs in matched):
+            same_status = len(statuses_a) == 1 and statuses_a == statuses_b
+            if any(i != x and j != y and shared.isdisjoint(refs) and (same_status or status)
+                   for x, y, refs, status in matched):
                 return True
-            matched.append((i, j, shared))
+            matched.append((i, j, shared, same_status))
     return False
 
 
 def same_finding(a, b, slack=3, *, use_code_references=True):
     """True when two findings from different lines are the same complaint, on the same
     file. Nearby lines (within ``slack``) only make two findings candidates: their
-    descriptions must share enough wording. For overlapping locations, two separate
-    sentence pairs can corroborate the match through code references and wording.
+    descriptions must share enough wording. For overlapping locations, reporting
+    the same exit status and mechanism can corroborate a match.
     Two findings that both name lines further apart than that are different places,
     and stay separate even when they share identifiers (one function can have two
     defects in two branches). Only when a finding names no lines does the shared-word
