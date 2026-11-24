@@ -32,6 +32,8 @@ import asyncio
 import shlex
 from functools import wraps
 
+from argus_events import EventType, emitter
+
 _PATCH_MARKER = "_argus_runtime_patch"
 MIN_AI_TIMEOUT = 60
 DEFAULT_MAX_AI_TIMEOUT = 900
@@ -170,6 +172,51 @@ def notify_rejected(pr_url, request, reason):
         print(f"[Argus] could not post the refusal note: {e}")
         return False
     return True
+
+
+def _notify_review_start_failure(pr_url, sender_id, is_eligible):
+    import argus_budget
+
+    parsed = argus_budget.parse_pr_url(pr_url)
+    if not parsed:
+        return False
+    owner, repo, number = parsed
+    emitter.emit(EventType.ERROR, pr_number=number, repo=f"{owner}/{repo}",
+                 message="/review could not connect to GitHub while opening the PR")
+    try:
+        if not is_eligible(sender_id, pr_url):
+            return False
+        argus_budget._poster(owner, repo, number,
+                            "⚠️ **Argus 未发布本轮审查**\n\n"
+                            "读取 GitHub PR 数据时连接中断，本轮没有发布审查。"
+                            "已有线程的回复仅对应各自的发现。")
+    except Exception as error:
+        print(f"[Argus] could not post review start failure: {type(error).__name__}")
+        return False
+    return True
+
+
+def wrap_review_comment_handler(original, is_eligible):
+    """Report the GitHub startup failure that can end a manual review before dispatch."""
+    from requests.exceptions import ConnectionError
+
+    @wraps(original)
+    async def checked_comment(body, event, sender, sender_id, action, log_context, agent):
+        try:
+            return await original(body, event, sender, sender_id, action, log_context, agent)
+        except ValueError as error:
+            comment = body.get("comment", {})
+            request = comment.get("body", "") if isinstance(comment, dict) else ""
+            pr_url = log_context.get("api_url")
+            if (action == "created" and isinstance(request, str) and request.lstrip().startswith("/")
+                    and _command_name(request) in ("review", "review_pr", "auto_review") and pr_url
+                    and isinstance(error.__cause__, ConnectionError)
+                    and str(error) == f"Failed to get git provider for {pr_url}"):
+                if await asyncio.to_thread(_notify_review_start_failure, pr_url, sender_id, is_eligible):
+                    return {}
+            raise
+
+    return checked_comment
 
 
 def effective_settings(settings=None):

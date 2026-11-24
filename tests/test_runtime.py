@@ -199,6 +199,56 @@ def test_a_failed_note_does_not_raise(agent_cls):
     assert agent_cls.calls == []
 
 
+@pytest.mark.parametrize(("request_text", "eligible", "connection_lost", "reports"), [
+    ("/review --config.ai_timeout=600", True, True, True),
+    ("/describe", True, True, False),
+    ("/review", False, True, False),
+    ("/review", True, False, False),
+])
+def test_github_comment_handler_reports_a_review_start_disconnect(
+        monkeypatch, posted, request_text, eligible, connection_lost, reports):
+    pytest.importorskip("pr_agent")
+    from pr_agent.servers import github_app
+    from requests.exceptions import ConnectionError
+
+    def unavailable(pr_url):
+        cause = ConnectionError("peer disconnected") if connection_lost else RuntimeError("other failure")
+        raise ValueError(f"Failed to get git provider for {pr_url}") from cause
+
+    monkeypatch.setattr(github_app, "get_git_provider_with_context", unavailable)
+    recorded = []
+    monkeypatch.setattr(rt.emitter, "emit", lambda event, **fields: recorded.append((event, fields)))
+    url = "https://api.github.com/repos/a/b/pulls/7"
+    eligibility_checks = []
+
+    def is_eligible(sender_id, pr_url):
+        eligibility_checks.append((sender_id, pr_url))
+        return eligible
+
+    async def should_not_dispatch(*args, **kwargs):
+        pytest.fail("the provider lookup failed before dispatch")
+
+    handler = rt.wrap_review_comment_handler(github_app.handle_comments_on_pr, is_eligible)
+    call = handler({"issue": {"pull_request": {"url": url}}, "comment": {"id": 12, "body": request_text}},
+                   "issue_comment", "maintainer", "42", "created", {},
+                   SimpleNamespace(handle_request=should_not_dispatch))
+
+    if reports:
+        assert run(call) == {}
+        assert len(posted) == 1
+        assert posted[0][:3] == ("a", "b", 7)
+        assert "未发布本轮审查" in posted[0][3] and "连接中断" in posted[0][3]
+    else:
+        with pytest.raises(ValueError, match="Failed to get git provider"):
+            run(call)
+        assert posted == []
+    expected_check = request_text.startswith("/review") and connection_lost
+    assert eligibility_checks == ([("42", url)] if expected_check else [])
+    assert len(recorded) == int(expected_check)
+    if expected_check:
+        assert recorded[0][0] == rt.EventType.ERROR and recorded[0][1]["pr_number"] == 7
+
+
 def test_runtime_patch_wraps_outside_the_budget_patch():
     source = (REPO_ROOT / "entrypoint-guard.py").read_text(encoding="utf-8")
     assert source.index("apply_budget_patch()") < source.index("apply_runtime_patch()")

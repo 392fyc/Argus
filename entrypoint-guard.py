@@ -283,8 +283,13 @@ def _patch_mention_handler():
     """
     try:
         from pr_agent.servers import github_app as ga_mod
+        from argus_runtime import wrap_review_comment_handler
 
-        original_handle = ga_mod.handle_comments_on_pr
+        def is_eligible(sender_id, pr_url):
+            return ga_mod.get_identity_provider().verify_eligibility(
+                "github", sender_id, pr_url) is not ga_mod.Eligibility.NOT_ELIGIBLE
+
+        original_handle = wrap_review_comment_handler(ga_mod.handle_comments_on_pr, is_eligible)
 
         async def patched_handle(body, event, sender, sender_id,
                                  action, log_context, agent):
