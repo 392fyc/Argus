@@ -29,6 +29,7 @@ environment variables over the TOML files; see README "Runtime settings").
 from __future__ import annotations
 
 import asyncio
+import logging
 import shlex
 from functools import wraps
 
@@ -213,6 +214,8 @@ def wrap_review_comment_handler(original, is_eligible):
                     and isinstance(error.__cause__, ConnectionError)
                     and str(error) == f"Failed to get git provider for {pr_url}"):
                 if await asyncio.to_thread(_notify_review_start_failure, pr_url, sender_id, is_eligible):
+                    logging.getLogger(__name__).warning("GitHub connection failed while opening %s", pr_url,
+                                                        exc_info=True)
                     return {}
             raise
 

@@ -206,7 +206,7 @@ def test_a_failed_note_does_not_raise(agent_cls):
     ("/review", True, False, False),
 ])
 def test_github_comment_handler_reports_a_review_start_disconnect(
-        monkeypatch, posted, request_text, eligible, connection_lost, reports):
+        monkeypatch, posted, caplog, request_text, eligible, connection_lost, reports):
     pytest.importorskip("pr_agent")
     from pr_agent.servers import github_app
     from requests.exceptions import ConnectionError
@@ -238,6 +238,9 @@ def test_github_comment_handler_reports_a_review_start_disconnect(
         assert len(posted) == 1
         assert posted[0][:3] == ("a", "b", 7)
         assert "未发布本轮审查" in posted[0][3] and "连接中断" in posted[0][3]
+        record = next(r for r in caplog.records if r.name == "argus_runtime")
+        assert isinstance(record.exc_info[1].__cause__, ConnectionError)
+        assert "peer disconnected" not in posted[0][3]
     else:
         with pytest.raises(ValueError, match="Failed to get git provider"):
             run(call)
