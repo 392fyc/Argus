@@ -399,6 +399,7 @@ SIMILAR_TEXT = 0.2
 _CJK_RUN = re.compile(r"[\u4e00-\u9fff]+")
 _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*[A-Za-z0-9_]")
 _CODE_REFERENCE = re.compile(r"`([A-Za-z_][A-Za-z0-9_.]{2,})`")
+_SENTENCE_END = re.compile(r"[。！？；!?\n]+|\.(?=\s|$)")
 # English words and Chinese character pairs any finding may contain; they say
 # nothing about which defect it is.
 _STOP_WORDS = frozenset("""
@@ -440,25 +441,40 @@ def text_similarity(a, b):
     return len(fa & fb) / len(fa | fb)
 
 
+def _anchored_sentences(issue):
+    sentences = _SENTENCE_END.split(str(issue.get("issue_content") or ""))
+    anchored = []
+    for sentence in sentences:
+        references = set(_CODE_REFERENCE.findall(sentence))
+        if references:
+            anchored.append((references, _features(_CODE_REFERENCE.sub(" ", sentence))))
+    return anchored
+
+
 def _agree_on_code_references(a, b):
-    """Compare a short report with a longer one using exact code references and shared wording."""
-    text_a = str(a.get("issue_content") or "")
-    text_b = str(b.get("issue_content") or "")
-    anchors_a = set(_CODE_REFERENCE.findall(text_a))
-    anchors_b = set(_CODE_REFERENCE.findall(text_b))
-    if len(anchors_a & anchors_b) < 2:
-        return False
-    fa, fb = _features(text_a), _features(text_b)
-    shared = len(fa & fb)
-    return shared >= 12 and shared >= SIMILAR_TEXT * min(len(fa), len(fb))
+    """Require two separate sentence pairs with different shared references.
+
+    Each pair must also share wording after stripping the quoted identifiers. One
+    sentence that recites the same setup and names two symbols is insufficient.
+    """
+    left, right = _anchored_sentences(a), _anchored_sentences(b)
+    matched = []
+    for i, (refs_a, words_a) in enumerate(left):
+        for j, (refs_b, words_b) in enumerate(right):
+            shared = refs_a & refs_b
+            if not shared or len(words_a & words_b) < 4:
+                continue
+            if any(i != x and j != y and len(shared | refs) >= 2 for x, y, refs in matched):
+                return True
+            matched.append((i, j, shared))
+    return False
 
 
-def same_finding(a, b, slack=3):
+def same_finding(a, b, slack=3, *, use_code_references=True):
     """True when two findings from different lines are the same complaint, on the same
     file. Nearby lines (within ``slack``) only make two findings candidates: their
-    descriptions must share enough wording. When shared wording is diluted by extra
-    detail, accept two exact code references if the descriptions also share at least
-    12 features and cover SIMILAR_TEXT of the shorter description's features.
+    descriptions must share enough wording. For overlapping locations, two separate
+    sentence pairs can corroborate the match through code references and wording.
     Two findings that both name lines further apart than that are different places,
     and stay separate even when they share identifiers (one function can have two
     defects in two branches). Only when a finding names no lines does the shared-word
@@ -472,7 +488,10 @@ def same_finding(a, b, slack=3):
     ra, rb = _line_range(a), _line_range(b)
     if ra and rb:
         if ra[0] <= rb[1] + slack and rb[0] <= ra[1] + slack:
-            return text_similarity(a, b) >= SIMILAR_TEXT or _agree_on_code_references(a, b)
+            if text_similarity(a, b) >= SIMILAR_TEXT:
+                return True
+            overlap = max(ra[0], rb[0]) <= min(ra[1], rb[1])
+            return use_code_references and overlap and _agree_on_code_references(a, b)
         return False
     ta, tb = _finding_tokens(a), _finding_tokens(b)
     if not ta or not tb:
@@ -504,18 +523,9 @@ def _rank(issue):
 MAX_EXACT_PAIRING = 12  # Claude findings; 2**12 states per GPT finding
 
 
-def best_pairing(gpt, claude):
-    """{gpt index: claude index} for the findings both lines reported.
-
-    Of all one-to-one pairings that same_finding allows, the one with the most pairs,
-    and among those the highest total match_score: no pair is lost to greed, and an
-    exact pair is never traded for a weaker one that gives the same count. Exact by
-    dynamic programming over the set of Claude findings already taken; the lines
-    report a handful of findings each (the prompt asks for at most num_max_findings).
-    Beyond MAX_EXACT_PAIRING Claude findings, the best-scoring pairs are taken first."""
-    edges = {gi: [(ci, match_score(g, c)) for ci, c in enumerate(claude) if same_finding(g, c)]
-             for gi, g in enumerate(gpt)}
-    if len(claude) > MAX_EXACT_PAIRING:
+def _best_pairing(edges, claude_count):
+    """Maximize pair count, then total match score. Use greedy ranking above the state limit."""
+    if claude_count > MAX_EXACT_PAIRING:
         pairs, taken = {}, set()
         for score, gi, ci in sorted(((s, gi, ci) for gi, es in edges.items() for ci, s in es),
                                     key=lambda e: (-e[0], e[1], e[2])):
@@ -525,10 +535,10 @@ def best_pairing(gpt, claude):
         return pairs
     # best[mask] = (pair count, total score, pairing) using the GPT findings seen so far
     best = {0: (0, 0.0, ())}
-    for gi in range(len(gpt)):
+    for gi, candidates in edges.items():
         step = dict(best)
         for mask, (count, total, chosen) in best.items():
-            for ci, score in edges[gi]:
+            for ci, score in candidates:
                 if mask >> ci & 1:
                     continue
                 key = mask | 1 << ci
@@ -538,6 +548,25 @@ def best_pairing(gpt, claude):
         best = step
     winner = max(best.values(), key=lambda v: (v[0], v[1]))
     return dict(winner[2])
+
+
+def best_pairing(gpt, claude):
+    """Pair ordinary matches first. Use reference-based matches only for the remaining findings."""
+    def pair(gpt_indices, claude_indices, *, use_code_references):
+        edges = {
+            gi: [(ci, match_score(gpt[gi], claude[ci])) for ci in claude_indices
+                 if same_finding(gpt[gi], claude[ci], use_code_references=use_code_references)]
+            for gi in gpt_indices
+        }
+        return _best_pairing(edges, len(claude_indices))
+
+    pairs = pair(range(len(gpt)), range(len(claude)), use_code_references=False)
+    if len(pairs) < min(len(gpt), len(claude)):
+        taken = set(pairs.values())
+        pairs.update(pair([gi for gi in range(len(gpt)) if gi not in pairs],
+                          [ci for ci in range(len(claude)) if ci not in taken],
+                          use_code_references=True))
+    return pairs
 
 
 def _is_security(finding):

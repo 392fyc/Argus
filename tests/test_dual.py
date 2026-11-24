@@ -280,6 +280,37 @@ def test_two_code_references_alone_do_not_match_different_defects():
     assert not ad.same_finding(missing, escaping)
 
 
+@pytest.mark.parametrize("references", [("save_record", "retry_queue"), ("user", "None")])
+def test_reports_that_share_background_but_describe_different_defects_stay_separate(references):
+    first, second = references
+    background = f"写入流程读取 `{first}` 和 `{second}`，根据审核流程生成新记录并触发同步。"
+    gpt = finding("review.py", 158, 161, content=(
+        background + "同步中断后自动重试时，自增编号会跳过一次，造成编号不连续。"
+        "财务导出根据连续编号核对发票，报表因此会误报缺失单据，即便款项已收齐。"
+    ))
+    claude = finding("review.py", 159, 160, content=(
+        background + "提交新版本时出现异常会丢弃数据库回滚请求，留下旧数据。"
+        "控制台继续展示旧状态，运维无法判断磁盘中是否残留未提交文件。"
+    ))
+    assert ad.text_similarity(gpt, claude) < ad.SIMILAR_TEXT
+    assert not ad.same_finding(gpt, claude)
+
+
+def test_code_references_cannot_displace_an_existing_match():
+    description = "读取 `save_record` 时没有写入异常记录，任务突然终止。`retry_queue` 漏掉失败作业，无法重试。"
+    gpt = finding("review.py", 158, 158, content=description)
+    weaker = finding("review.py", 158, 158, content=(
+        "进程故障未捕获，读取 `save_record` 没有异常记录，任务终止。"
+        "一旦服务发生状态漂移，后台控制台的列表和磁盘上的日志就会脱离同步。"
+        "`retry_queue` 里漏掉失败作业，重试时还会看到旧操作的退出标志。"
+        "用户认为每项工作都已经提交，后续清理可能丢掉其他批次刚创建的归档文件。"
+    ))
+    regular = finding("review.py", 160, 160, content=description)
+    assert ad.text_similarity(gpt, weaker) < ad.SIMILAR_TEXT
+    assert ad.same_finding(gpt, weaker)
+    assert ad.best_pairing([gpt], [weaker, regular]) == {0: 1}
+
+
 def test_findings_without_lines_match_on_shared_identifiers():
     a = finding("a.py", 10, 10, content="parse_config ignores reset_day overflow_guard")
     b = finding("a.py", None, None, content="reset_day overflow_guard in parse_config")
