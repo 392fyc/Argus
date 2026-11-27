@@ -440,13 +440,11 @@ cached_input = 0.10
 output = 10.00
 
 [argus_dual_review]
-# Dual review (argus_dual.py, Mercury #821): every review also asks Claude through
-# the Anthropic Messages API, at the same time as the GPT line, and merges the two
-# answers. Findings both lines report are marked as agreed; the review body shows a
-# comparison of the two lines. When one line is unavailable (no key, budget spent,
-# timeout, refusal, unparsable output) the review runs on the other line alone.
+# Two independent drafts, then both lines verify the same anonymous candidates.
+# Disable cross_check to retain the original dual-review behavior for a deployment.
 # Read from the global settings only: a repository's .pr_agent.toml cannot change it.
 enabled = true
+cross_check = true
 model = "claude-opus-5-5"
 effort = "high"          # low | medium | high | xhigh | max
 max_tokens = 32000       # thinking counts toward it

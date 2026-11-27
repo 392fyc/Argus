@@ -316,7 +316,7 @@ def _runtime_engine_info():
 
 def build_review_body_additions(findings: list, inline_count: int,
                                 diff_files=None, extra_filenames=None,
-                                dual_section=None, second_model=None) -> str:
+                                dual_section=None, second_model=None, show_models=True) -> str:
     """Build CodeRabbit-style additions to prepend/append to review body.
 
     Adds: actionable comments count, aggregated AI prompt, review info.
@@ -382,8 +382,9 @@ def build_review_body_additions(findings: list, inline_count: int,
     parts.append("")
     engine_version, model_name = _runtime_engine_info()
     parts.append(f"**Engine**: PR-Agent {engine_version} + Argus patches")
-    parts.append(f"**Model**: {model_name}"
-                 + (f" + {second_model}" if second_model else ""))
+    if show_models:
+        parts.append(f"**Model**: {model_name}"
+                     + (f" + {second_model}" if second_model else ""))
     parts.append("**Mode**: CodeRabbit-compatible")
     parts.append("")
     parts.append("</details>")
@@ -1987,6 +1988,12 @@ def apply_patch():
 
                 self.prediction, dropped = _filter_prediction(
                     self.prediction, load_yaml, apply_filters)
+                if dual is not None and dual.get("cross_state"):
+                    from argus_dual import filter_cross_extras
+                    dropped = dropped + filter_cross_extras(dual, lambda items: filter_findings(
+                        items,
+                        min_severity=_argus_review_setting("min_severity", DEFAULT_MIN_SEVERITY),
+                        skip_patterns=skip, threads=threads, suppress_repeats=threads is not None))
                 for issue, reason in dropped:
                     print(f"[Argus] Dropped finding on {issue.get('relevant_file', '?')} "
                           f"({str(issue.get('issue_header', ''))[:40]}): {reason}")
@@ -2138,10 +2145,22 @@ def apply_patch():
 
             # Phase 2: Run original /review
             result = await original_run(self)
+            if getattr(self, "_argus_cross_stale", False) is True:
+                from pr_agent.config_loader import get_settings
+                if get_settings().config.publish_output:
+                    original_publish_comment(self.git_provider, "本次审查的提交已更新或无法核对。请在当前提交重新触发审查。")
+                return result
 
+            dual = getattr(self, "_argus_dual", None)
+            cross = bool(dual and dual.get("cross_state"))
             review_body = getattr(self.git_provider, '_argus_review_body', None)
             if not review_body:
-                return result
+                if not cross or not (dual["cross_state"] == "partial" or dual["unverified"] or dual["confirmed"]):
+                    return result
+                from pr_agent.config_loader import get_settings
+                if not get_settings().config.publish_output:
+                    return result
+                review_body = ""
 
             _repo = getattr(getattr(self.git_provider, 'repo', None), 'full_name', None)
             emitter.emit(EventType.REVIEW_STARTED, pr_number=pr_number, repo=_repo)
@@ -2180,6 +2199,9 @@ def apply_patch():
                                     # output, not a reported concern.
                                     findings_valid = False
                         diff_files = self.git_provider.diff_files or self.git_provider.get_diff_files()
+                        if cross:
+                            from argus_dual import cross_diff_positions
+                            positions = cross_diff_positions(diff_files)
 
                         for issue in findings:
                             try:
@@ -2187,8 +2209,11 @@ def apply_patch():
                                 end_line = int(issue.get('end_line', 0))
                                 if not filepath or not end_line:
                                     continue
-                                position, _ = find_line_number_of_relevant_line_in_file(
-                                    diff_files, filepath, "", end_line)
+                                if cross:
+                                    position = positions.get((filepath, end_line), -1)
+                                else:
+                                    position, _ = find_line_number_of_relevant_line_in_file(
+                                        diff_files, filepath, "", end_line)
                                 if position == -1:
                                     continue
                                 body = format_review_finding_body(issue)
@@ -2250,6 +2275,10 @@ def apply_patch():
             if no_new_code and inline_comments:
                 print(f"[Argus] No new code: dropping all {len(inline_comments)} findings")
                 inline_comments = []
+            if no_new_code and cross:
+                from argus_dual import filter_cross_extras
+                filter_cross_extras(dual, lambda items: ([], [(f, "no new code") for f in items]))
+                dual["unverified"] = 0
 
             # (The former "Fix C" dropped any finding within a few lines of an open
             # thread, whatever it said, which hid a different problem next to an old
@@ -2260,6 +2289,12 @@ def apply_patch():
             # For documentation-only PRs, suppress Minor findings after
             # _DOC_NITS_SUPPRESS_AFTER iterations to break the nit-loop cycle.
             is_doc = _is_doc_pr(diff_files)
+            if is_doc and iteration > _DOC_NITS_SUPPRESS_AFTER and cross:
+                from argus_dual import filter_cross_extras
+                filter_cross_extras(dual, lambda items: (
+                    [f for f in items
+                     if _classify_finding_severity(f.get('issue_header', '')) in BLOCKING_SEVERITIES],
+                    []))
             if is_doc and iteration > _DOC_NITS_SUPPRESS_AFTER and inline_comments:
                 sev_map = {}
                 for _f in findings:
@@ -2288,6 +2323,12 @@ def apply_patch():
                 thread_state_trusted=thread_state_trusted,
                 findings_valid=findings_valid,
                 security_concern=security_concern)
+            if cross and dual["cross_state"] == "partial":
+                reason = "复核不完整，详见本次审查正文。"
+            elif cross and dual["unverified"]:
+                reason = "有待核实的意见，详见本次审查正文。"
+            elif cross and (dual["confirmed_body"] or dual.get("cut")):
+                reason = "已核验的问题见审查正文和行内意见。"
 
             # Collect config dotfiles pr-agent filtered out of diff_files
             # (e.g. .gitignore — its split('.')[-1] token is in
@@ -2326,23 +2367,25 @@ def apply_patch():
 
             # Build enhanced review body (CodeRabbit-style)
             dual_section = second_model = None
-            dual = getattr(self, "_argus_dual", None)
             if dual is not None:
                 try:
-                    from argus_dual import comparison_section
+                    from argus_dual import comparison_section, cross_check_section
                     # An unchanged head drops every inline finding; then listing the
                     # cut ones as "over the limit" would be wrong.
                     cut = () if no_new_code else (dual.get("cut") or ())
-                    dual_section = comparison_section(
-                        dual, dual.get("gpt_model"), dual.get("claude_model"), cut)
-                    if dual.get("claude_status") == "ok":
-                        second_model = dual.get("claude_model")
+                    if cross:
+                        dual_section = cross_check_section(dual, cut)
+                    else:
+                        dual_section = comparison_section(
+                            dual, dual.get("gpt_model"), dual.get("claude_model"), cut)
+                        if dual.get("claude_status") == "ok":
+                            second_model = dual.get("claude_model")
                 except Exception as e:
                     print(f"[Argus Dual] comparison section not built: {e}")
             body_additions = build_review_body_additions(
                 findings, len(inline_comments), diff_files,
                 extra_filenames=footer_extra,
-                dual_section=dual_section, second_model=second_model)
+                dual_section=dual_section, second_model=second_model, show_models=not cross)
 
             # Strip PR Reviewer Guide from repeat reviews (iteration >= 2: Argus has
             # already posted a review on this PR). This is about not repeating the
@@ -2354,7 +2397,10 @@ def apply_patch():
                     r'## PR Reviewer Guide.*?(?=\n## |\n---|\Z)',
                     '', review_body, flags=re.DOTALL).strip()
 
-            review_body = body_additions + "\n\n" + review_body
+            if cross:
+                review_body = body_additions
+            else:
+                review_body = body_additions + "\n\n" + review_body
 
             # Append decision footer
             review_body += f"\n\n---\n**Review Decision** (仅供参考): {reason}\n"
@@ -2368,6 +2414,12 @@ def apply_patch():
             review_body += "*"
 
             # Post unified review
+            if cross:
+                from argus_dual import fresh_cross_head
+                import asyncio
+                if not await asyncio.to_thread(fresh_cross_head, self.git_provider, dual["head_sha"]):
+                    original_publish_comment(self.git_provider, "本次审查的提交已更新或无法核对。请在当前提交重新触发审查。")
+                    return result
             # Strip internal keys before passing to PyGithub (GitHub API rejects unknown fields)
             api_comments = [{k: v for k, v in c.items() if not k.startswith('_')}
                             for c in inline_comments]
@@ -2384,6 +2436,31 @@ def apply_patch():
                 emitter.emit(EventType.FINDING_POSTED, pr_number=pr_number, repo=_repo,
                              finding_count=n, review_event=event, iteration=iteration)
             except Exception as e:
+                if cross:
+                    status = getattr(e, "status", None)
+                    if isinstance(status, int) and 400 <= status < 500:
+                        # GitHub refused the review, so nothing was posted; the body goes out
+                        # as one comment with the inline findings listed in it.
+                        from argus_dual import fresh_cross_head
+                        head = getattr(self.git_provider.last_commit_id, "sha", None)
+                        import asyncio
+                        if not await asyncio.to_thread(fresh_cross_head, self.git_provider, head):
+                            original_publish_comment(self.git_provider, "本次审查的提交已更新或无法核对。请在当前提交重新触发审查。")
+                            return result
+                        listed = "\n\n".join(f"**{c['path']}:{c['_end_line']}**\n\n{c['body']}"
+                                               for c in inline_comments)
+                        note = "（GitHub 拒绝了行内位置，以下意见改列在正文中。）"
+                        print(f"[Argus Cross] Review refused ({status}); posting the report as a comment")
+                        try:
+                            original_publish_comment(
+                                self.git_provider,
+                                review_body + ("\n\n" + note + "\n\n" + listed if listed else ""))
+                        except Exception as fallback_error:
+                            print(f"[Argus Cross] Fallback comment failed: {type(fallback_error).__name__}")
+                        return result
+                    print(f"[Argus Cross] Publication result could not be confirmed: {type(e).__name__}")
+                    original_publish_comment(self.git_provider, "无法确认本次审查报告是否已发布。请先检查 PR 审查记录。")
+                    return result
                 print(f"[Argus] Unified review failed ({e}), fallback to COMMENT")
                 try:
                     self.git_provider.pr.create_review(
