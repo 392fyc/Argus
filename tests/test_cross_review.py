@@ -167,7 +167,24 @@ def test_duplicate_chain_and_different_anchors(replay):
         a, b, c = candidates
         return [check(a, aliases=[b["id"]]), check(b, aliases=[c["id"]]), check(c)]
 
+    # A chain (a~b, b~c) never says a and c are one defect: all three stay pending.
     reviewer, _, event = replay(draft("甲", "乙"), draft("丙"), chain, chain)
+    assert event["confirmed"] == 0 and event["unverified"] == 3
+
+    def every_pair(candidates):
+        a, b, c = candidates
+        return [check(a, aliases=[b["id"], c["id"]]), check(b, aliases=[c["id"]]), check(c)]
+
+    # Both checks pair every member and share an anchor: one finding.
+    reviewer, _, event = replay(draft("甲", "乙"), draft("丙"), every_pair, every_pair)
+    assert (event["confirmed"], event["combined"], event["unverified"]) == (1, 2, 0)
+
+    def pair_only(candidates):
+        a, b, c = candidates
+        return [check(a, aliases=[b["id"]]), check(b), check(c)]
+
+    # The checks disagree about part of the group: every member stays pending.
+    reviewer, _, event = replay(draft("甲", "乙"), draft("丙"), chain, pair_only)
     assert event["confirmed"] == 0 and event["unverified"] == 3
     assert len(reviewer._argus_dual["pending"]) == 3
 
@@ -237,8 +254,9 @@ def test_gpt_budget_adapter_caps_cross_call_and_charges_cancellation():
     assert charges[0][1]["output_tokens"] == 8192
 
 
-@pytest.mark.parametrize(("stale", "captured"), [(False, True), (True, True), (False, False)])
-def test_publication_uses_one_source_free_review_and_rechecks_head(replay, monkeypatch, stale, captured):
+@pytest.mark.parametrize(("stale", "captured", "refused"),
+                         [(False, True, False), (True, True, False), (False, False, False), (False, True, True)])
+def test_publication_uses_one_source_free_review_and_rechecks_head(replay, monkeypatch, stale, captured, refused):
     from pr_agent.config_loader import get_settings
     from pr_agent.git_providers.github_provider import GithubProvider
     from pr_agent.tools.pr_code_suggestions import PRCodeSuggestions
@@ -252,7 +270,12 @@ def test_publication_uses_one_source_free_review_and_rechecks_head(replay, monke
     provider.repo = SimpleNamespace(
         full_name="example/repo",
         get_pull=lambda _: SimpleNamespace(head=SimpleNamespace(sha="b" * 40 if stale else HEAD)))
-    provider.pr = SimpleNamespace(create_review=lambda **kw: created.append(kw))
+    def create_review(**kw):
+        if refused:
+            raise type("Refused", (Exception,), {"status": 422})()
+        created.append(kw)
+
+    provider.pr = SimpleNamespace(create_review=create_review)
 
     async def upstream_run(self):
         if captured:
@@ -279,6 +302,10 @@ def test_publication_uses_one_source_free_review_and_rechecks_head(replay, monke
     if stale:
         assert not created and len(notices) == 1
         assert "提交已更新" in notices[0]
+    elif refused:
+        assert not created and len(notices) == 1
+        assert "交叉复核完成" in notices[0] and "会发布的已核验意见" in notices[0]
+        assert "GitHub 拒绝了行内位置" in notices[0]
     else:
         assert len(created) == 1 and not notices
         public = created[0]
@@ -449,3 +476,10 @@ def test_section_neutralises_mentions_and_bare_urls():
     section = dual.cross_check_section(stats, [])
     assert "@someone" not in section and "https://" not in section and "www." not in section
     assert "@​someone" in section
+
+
+def test_slow_head_query_past_the_deadline_skips_the_check_round(replay, monkeypatch):
+    import time
+    monkeypatch.setattr(dual, "fresh_cross_head", lambda *a: time.sleep(5) or True)
+    reviewer, calls, event = replay(draft("提交查询太慢"), draft())
+    assert len(calls) == 2 and event["cross_status"] == ["timeout", "timeout"]

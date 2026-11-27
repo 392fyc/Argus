@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import functools
+import itertools
 import json
 import os
 import re
@@ -923,20 +924,31 @@ def _cross_reduce(candidates, left, right, allowed_anchor):
     left_pairs, right_pairs = _duplicate_votes(left, supported), _duplicate_votes(right, supported)
     contested = {key for pair in left_pairs ^ right_pairs for key in pair}
     pairs = sorted(left_pairs & right_pairs)
-    occurrences = {key: sum(key in pair for pair in pairs) for key in supported}
-    inconsistent = contested | {key for key, count in occurrences.items() if count > 1}
-    inconsistent |= {key for a, b in pairs if not evidence[a] & evidence[b] for key in (a, b)}
-    # Every member of a conflicting group remains visible for human review.
-    inconsistent |= {key for a, b in pairs if {a, b} & inconsistent for key in (a, b)}
+    group = {key: {key} for key in supported}
+    for a, b in pairs:
+        if group[a] is not group[b]:
+            merged = group[a] | group[b]
+            for key in merged:
+                group[key] = merged
+    inconsistent = set(contested)
+    groups = {id(members): members for members in group.values() if len(members) > 1}
+    for members in groups.values():
+        common = set.intersection(*(set(evidence[key]) for key in members))
+        # Both checks must pair every two members; a chain through a broad finding does
+        # not prove its ends are one defect. Conflicting groups stay visible for review.
+        complete = all(tuple(sorted(pair)) in pairs for pair in itertools.combinations(members, 2))
+        if members & contested or not common or not complete:
+            inconsistent |= members
     kept = {key: candidates[key] for key in candidates if key in supported - inconsistent}
     duplicate_count = 0
-    for a, b in pairs:
-        if a not in kept or b not in kept:
+    for members in groups.values():
+        if not members <= kept.keys():
             continue
-        first, second = sorted((a, b), key=lambda key: (-_rank(kept[key]), key))
-        evidence[first] = evidence[a] & evidence[b]
-        kept.pop(second)
-        duplicate_count += 1
+        first, *rest = sorted(members, key=lambda key: (-_rank(kept[key]), key))
+        evidence[first] = frozenset.intersection(*(evidence[key] for key in members))
+        for key in rest:
+            kept.pop(key)
+        duplicate_count += len(rest)
     inline, body, pending = [], [], []
     for key, finding in kept.items():
         if evidence[key]:
@@ -1157,15 +1169,24 @@ async def _cross_prediction(reviewer, model, config, initial, prompt, head, dead
                                    reviewer.vars.get("extra_instructions") or "")
         output = cross_max_tokens(len(candidates))
         cross_config = replace(config, max_tokens=min(config.max_tokens, output))
-        fresh = await asyncio.to_thread(fresh_cross_head, reviewer.git_provider, head)
-        if not fresh:
+        fresh = ready = None
+        if deadline - asyncio.get_running_loop().time() >= CROSS_MIN_SECONDS:
+            try:
+                async with asyncio.timeout_at(deadline):
+                    fresh = await asyncio.to_thread(fresh_cross_head, reviewer.git_provider, head)
+                    if fresh:
+                        ready = await asyncio.to_thread(
+                            _cross_budget_ready, model, cross_config, messages, output)
+            except TimeoutError:
+                fresh = ready = None
+        if fresh is False:
             reviewer._argus_cross_stale = True
             return None, {"head_sha": head, "cross_state": "stale", "cross_status": ["skipped", "skipped"]}
-        if not await asyncio.to_thread(_cross_budget_ready, model, cross_config, messages, output):
+        if ready is False:
             check_status = ["budget", "budget"]
         else:
             remaining = deadline - asyncio.get_running_loop().time()
-            if remaining < CROSS_MIN_SECONDS:
+            if ready is None or remaining < CROSS_MIN_SECONDS:
                 check_status = ["timeout", "timeout"]
             else:
                 responses = await asyncio.gather(

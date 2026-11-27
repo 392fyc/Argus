@@ -2437,6 +2437,27 @@ def apply_patch():
                              finding_count=n, review_event=event, iteration=iteration)
             except Exception as e:
                 if cross:
+                    status = getattr(e, "status", None)
+                    if isinstance(status, int) and 400 <= status < 500:
+                        # GitHub refused the review, so nothing was posted; the body goes out
+                        # as one comment with the inline findings listed in it.
+                        from argus_dual import fresh_cross_head
+                        head = getattr(self.git_provider.last_commit_id, "sha", None)
+                        import asyncio
+                        if not await asyncio.to_thread(fresh_cross_head, self.git_provider, head):
+                            original_publish_comment(self.git_provider, "本次审查的提交已更新或无法核对。请在当前提交重新触发审查。")
+                            return result
+                        listed = "\n\n".join(f"**{c['path']}:{c['_end_line']}**\n\n{c['body']}"
+                                               for c in inline_comments)
+                        note = "（GitHub 拒绝了行内位置，以下意见改列在正文中。）"
+                        print(f"[Argus Cross] Review refused ({status}); posting the report as a comment")
+                        try:
+                            original_publish_comment(
+                                self.git_provider,
+                                review_body + ("\n\n" + note + "\n\n" + listed if listed else ""))
+                        except Exception as fallback_error:
+                            print(f"[Argus Cross] Fallback comment failed: {type(fallback_error).__name__}")
+                        return result
                     print(f"[Argus Cross] Publication result could not be confirmed: {type(e).__name__}")
                     original_publish_comment(self.git_provider, "无法确认本次审查报告是否已发布。请先检查 PR 审查记录。")
                     return result
