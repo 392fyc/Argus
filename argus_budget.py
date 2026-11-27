@@ -661,6 +661,17 @@ class BudgetLedger:
 # (for example the reply judge) failing after the review was posted is not
 # reported as a failed review.
 _run_state = contextvars.ContextVar("argus_model_run_state", default=None)
+_review_limits = contextvars.ContextVar("argus_review_limits", default=None)
+
+
+@contextlib.contextmanager
+def review_completion_limits(timeout, output_tokens=None):
+    """Cap the next review phase without changing another concurrent request."""
+    token = _review_limits.set((timeout, output_tokens))
+    try:
+        yield
+    finally:
+        _review_limits.reset(token)
 
 
 def _note_outcome(error):
@@ -721,8 +732,19 @@ def make_guarded_acompletion(original, ledger_getter):
         if state is not None and state["timed_out"]:
             raise ModelTimeout("an earlier call in this command timed out; not calling again")
         model = kwargs.get("model", args[0] if args else None)
+        limits = _review_limits.get()
+        if limits:
+            timeout, output_tokens = limits
+            kwargs["timeout"] = min(kwargs.get("timeout") or timeout, timeout)
+            if output_tokens is not None:
+                kwargs["max_tokens"] = min(kwargs.get("max_tokens") or output_tokens, output_tokens)
         try:
             response = await original(*args, **kwargs)
+        except asyncio.CancelledError:
+            if limits:
+                ledger.record_timeout(model, estimate_prompt_tokens(kwargs), kwargs.get("timeout"),
+                                      reason="cancelled", output_tokens=limits[1])
+            raise
         except BudgetExhausted:
             raise
         except Exception as exc:
@@ -733,7 +755,11 @@ def make_guarded_acompletion(original, ledger_getter):
             elif is_timeout_error(exc):
                 if state is not None:
                     state["timed_out"] = True
-                ledger.record_timeout(model, estimate_prompt_tokens(kwargs), kwargs.get("timeout"))
+                if limits and limits[1] is not None:
+                    ledger.record_timeout(model, estimate_prompt_tokens(kwargs), kwargs.get("timeout"),
+                                          output_tokens=limits[1])
+                else:
+                    ledger.record_timeout(model, estimate_prompt_tokens(kwargs), kwargs.get("timeout"))
                 raise ModelTimeout(f"model call timed out: {str(exc)[:200]}") from exc
             raise
         _note_outcome(None)
