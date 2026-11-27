@@ -957,7 +957,25 @@ def _cross_reduce(candidates, left, right, allowed_anchor):
         if cited:
             path, line = min(cited)
             pending.append(dict(finding, relevant_file=path, start_line=line, end_line=line))
+        elif _is_security(finding):
+            pending.append(dict(finding))
     return rank_findings(inline), body, pending, duplicate_count, len(refuted), len(unverified)
+
+
+def filter_cross_extras(stats, keep):
+    """Apply a publication filter to the body and pending items; returns the dropped pairs.
+
+    keep(items) -> (kept, dropped pairs). Counts shrink with the items, so the report
+    does not claim findings it no longer lists."""
+    dropped = []
+    for key, count in (("confirmed_body", "confirmed"), ("pending", "unverified")):
+        items = stats.get(key) or []
+        kept, gone = keep(items)
+        removed = len(items) - len(kept)
+        stats[key] = list(kept)
+        stats[count] = max(0, stats.get(count, 0) - removed)
+        dropped += list(gone)
+    return dropped
 
 
 def cross_check_section(stats, cut):
@@ -1049,11 +1067,43 @@ def _cross_budget_ready(gpt_model, config, messages, gpt_output=CROSS_MAX_TOKENS
 
 
 async def _run_to_deadline(call, deadline):
+    from argus_budget import ModelTimeout, _note_outcome, _run_state
     try:
         async with asyncio.timeout_at(deadline):
             return await call()
     except TimeoutError:
-        return LineFailed("timeout")
+        # Same stop as a provider timeout: no later call in this command (argus_budget).
+        state = _run_state.get()
+        if state is not None:
+            state["timed_out"] = True
+        stop = ModelTimeout("review deadline reached")
+        _note_outcome(stop)
+        return stop
+
+
+async def _gpt_draft(reviewer, model):
+    """PR-Agent's GPT draft, failing when the answer was cut off at the output limit."""
+    handler = reviewer.ai_handler
+    own = "chat_completion" in vars(handler)
+    original = handler.chat_completion
+    seen = {}
+
+    async def capture(*args, **kwargs):
+        text, finish_reason = await original(*args, **kwargs)
+        seen["finish_reason"] = finish_reason
+        return text, finish_reason
+
+    handler.chat_completion = capture
+    try:
+        text = await reviewer._get_prediction(model)
+    finally:
+        if own:
+            handler.chat_completion = original
+        else:
+            del handler.chat_completion
+    if seen.get("finish_reason") == "length":
+        raise LineFailed("max_tokens")
+    return text
 
 
 async def _gpt_cross_call(reviewer, model, messages, remaining, output=CROSS_MAX_TOKENS):
@@ -1152,7 +1202,7 @@ async def dual_prepare_prediction(reviewer, model, original, claude_call=None):
         head = _snapshot_head(reviewer.git_provider)
         with review_completion_limits(timeout):
             gpt_result, claude_result = await asyncio.gather(
-                _run_to_deadline(lambda: reviewer._get_prediction(model), deadline),
+                _run_to_deadline(lambda: _gpt_draft(reviewer, model), deadline),
                 _run_to_deadline(claude_call, deadline), return_exceptions=True)
     else:
         gpt_result, claude_result = await asyncio.gather(
@@ -1165,6 +1215,8 @@ async def dual_prepare_prediction(reviewer, model, original, claude_call=None):
     if not gpt_ok and not claude_ok:
         _emit(reviewer, model, config, {"gpt_status": _line_status(gpt_result),
                                         "claude_status": claude_status})
+        from argus_budget import note_command_failed
+        note_command_failed(gpt_result)
         raise gpt_result
     if config.cross_check:
         text, stats = await _cross_prediction(
@@ -1172,6 +1224,8 @@ async def dual_prepare_prediction(reviewer, model, original, claude_call=None):
         if not gpt_ok and stats.get("claude_status") != "ok":
             _emit(reviewer, model, config, {k: v for k, v in stats.items()
                                            if k not in ("pending", "confirmed_body")})
+            from argus_budget import note_command_failed
+            note_command_failed(gpt_result)
             raise gpt_result
         if not gpt_ok:
             _note_outcome(None)
@@ -1188,6 +1242,8 @@ async def dual_prepare_prediction(reviewer, model, original, claude_call=None):
     if not gpt_ok:
         if stats["claude_status"] != "ok":
             _emit(reviewer, model, config, stats)
+            from argus_budget import note_command_failed
+            note_command_failed(gpt_result)
             raise gpt_result
         # The review goes ahead on Claude alone: the command did not fail.
         _note_outcome(None)

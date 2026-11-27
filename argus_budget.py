@@ -674,6 +674,14 @@ def review_completion_limits(timeout, output_tokens=None):
         _review_limits.reset(token)
 
 
+def note_command_failed(error):
+    """The command produced nothing: report it even if a model call returned earlier."""
+    state = _run_state.get()
+    if state is not None:
+        state["error"] = error
+        state["succeeded"] = 0
+
+
 def _note_outcome(error):
     state = _run_state.get()
     if state is None:

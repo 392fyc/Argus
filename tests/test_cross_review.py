@@ -332,3 +332,71 @@ def test_security_candidate_refuted_by_both_checks_reports_no(replay):
 def test_gpt_failure_with_unusable_claude_draft_fails_the_command(replay):
     with pytest.raises(RuntimeError):
         replay(RuntimeError("gpt down"), "no review here")
+
+
+def test_truncated_gpt_draft_is_not_usable():
+    async def chat(**_):
+        return "review: {}", "length"
+
+    async def get_prediction(_model):
+        text, _ = await reviewer.ai_handler.chat_completion(model="gpt")
+        return text
+
+    handler = SimpleNamespace(chat_completion=chat)
+    reviewer = SimpleNamespace(ai_handler=handler, _get_prediction=get_prediction)
+    with pytest.raises(dual.LineFailed) as failed:
+        asyncio.run(dual._gpt_draft(reviewer, "gpt"))
+    assert failed.value.status == "max_tokens" and handler.chat_completion is chat
+
+
+def test_deadline_timeout_stops_later_calls_in_the_command():
+    import argus_budget
+
+    async def slow():
+        await asyncio.sleep(1)
+
+    async def run():
+        state = {"error": None, "succeeded": 0, "timed_out": False}
+        token = argus_budget._run_state.set(state)
+        try:
+            loop = asyncio.get_running_loop()
+            result = await dual._run_to_deadline(slow, loop.time() + 0.01)
+        finally:
+            argus_budget._run_state.reset(token)
+        return result, state
+
+    result, state = asyncio.run(run())
+    assert isinstance(result, argus_budget.ModelTimeout) and state["timed_out"]
+    assert dual._line_status(result) == "timeout"
+
+
+def test_unchecked_security_concern_without_location_stays_pending(replay):
+    flagged = yaml.safe_dump({"review": {"key_issues_to_review": [],
+                                         "security_concerns": "可能存在命令注入"}}, allow_unicode=True)
+    reviewer, _, event = replay(flagged, dual.LineFailed("budget"))
+    assert event["cross_state"] == "partial"
+    section = dual.cross_check_section(reviewer._argus_dual, [])
+    assert "可能存在命令注入" in section and "缺少可定位证据" not in section
+
+
+def test_publication_filters_shrink_body_and_pending_counts():
+    stats = {"confirmed_body": [{"issue_header": "Minor"}, {"issue_header": "Major"}],
+             "pending": [{"issue_header": "Minor"}], "confirmed": 3, "unverified": 2}
+    keep = lambda items: ([f for f in items if f["issue_header"] != "Minor"],
+                          [(f, "severity") for f in items if f["issue_header"] == "Minor"])
+    dropped = dual.filter_cross_extras(stats, keep)
+    assert len(dropped) == 2 and stats["confirmed"] == 2 and stats["unverified"] == 1
+    assert stats["pending"] == [] and len(stats["confirmed_body"]) == 1
+
+
+def test_truncated_gpt_draft_without_claude_reports_a_failed_command(replay):
+    import argus_budget
+
+    state = {"error": None, "succeeded": 1, "timed_out": False}
+    token = argus_budget._run_state.set(state)
+    try:
+        with pytest.raises(dual.LineFailed):
+            replay(dual.LineFailed("max_tokens"), dual.LineFailed("no_key"))
+    finally:
+        argus_budget._run_state.reset(token)
+    assert state["succeeded"] == 0 and isinstance(state["error"], dual.LineFailed)

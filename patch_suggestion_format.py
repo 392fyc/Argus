@@ -1988,6 +1988,12 @@ def apply_patch():
 
                 self.prediction, dropped = _filter_prediction(
                     self.prediction, load_yaml, apply_filters)
+                if dual is not None and dual.get("cross_state"):
+                    from argus_dual import filter_cross_extras
+                    dropped = dropped + filter_cross_extras(dual, lambda items: filter_findings(
+                        items,
+                        min_severity=_argus_review_setting("min_severity", DEFAULT_MIN_SEVERITY),
+                        skip_patterns=skip, threads=threads, suppress_repeats=threads is not None))
                 for issue, reason in dropped:
                     print(f"[Argus] Dropped finding on {issue.get('relevant_file', '?')} "
                           f"({str(issue.get('issue_header', ''))[:40]}): {reason}")
@@ -2140,7 +2146,9 @@ def apply_patch():
             # Phase 2: Run original /review
             result = await original_run(self)
             if getattr(self, "_argus_cross_stale", False) is True:
-                original_publish_comment(self.git_provider, "本次审查的提交已更新或无法核对。请在当前提交重新触发审查。")
+                from pr_agent.config_loader import get_settings
+                if get_settings().config.publish_output:
+                    original_publish_comment(self.git_provider, "本次审查的提交已更新或无法核对。请在当前提交重新触发审查。")
                 return result
 
             dual = getattr(self, "_argus_dual", None)
@@ -2267,6 +2275,10 @@ def apply_patch():
             if no_new_code and inline_comments:
                 print(f"[Argus] No new code: dropping all {len(inline_comments)} findings")
                 inline_comments = []
+            if no_new_code and cross:
+                from argus_dual import filter_cross_extras
+                filter_cross_extras(dual, lambda items: ([], [(f, "no new code") for f in items]))
+                dual["unverified"] = 0
 
             # (The former "Fix C" dropped any finding within a few lines of an open
             # thread, whatever it said, which hid a different problem next to an old
@@ -2277,6 +2289,12 @@ def apply_patch():
             # For documentation-only PRs, suppress Minor findings after
             # _DOC_NITS_SUPPRESS_AFTER iterations to break the nit-loop cycle.
             is_doc = _is_doc_pr(diff_files)
+            if is_doc and iteration > _DOC_NITS_SUPPRESS_AFTER and cross:
+                from argus_dual import filter_cross_extras
+                filter_cross_extras(dual, lambda items: (
+                    [f for f in items
+                     if _classify_finding_severity(f.get('issue_header', '')) in BLOCKING_SEVERITIES],
+                    []))
             if is_doc and iteration > _DOC_NITS_SUPPRESS_AFTER and inline_comments:
                 sev_map = {}
                 for _f in findings:
