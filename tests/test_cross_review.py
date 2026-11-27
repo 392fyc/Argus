@@ -39,6 +39,7 @@ def replay(monkeypatch):
     monkeypatch.setattr(dual, "_render_prompts", lambda _: ("draft system", PATCH))
     monkeypatch.setattr(dual, "_config", dual.DualConfig(enabled=True, cross_check=True))
     monkeypatch.setattr(dual, "_ai_timeout", lambda: 3)
+    monkeypatch.setattr(dual, "CROSS_MIN_SECONDS", 0)
     monkeypatch.setattr(dual, "get_claude_ledger", lambda: object())
     events = []
     monkeypatch.setattr(dual, "_emit", lambda *args: events.append(args[-1]))
@@ -147,11 +148,9 @@ def test_disagreement_and_rejection(replay):
     assert "双方驳回的发现" not in section
 
 
-@pytest.mark.parametrize("fault", ["timeout", "budget", "initial", "line", "duplicate-id"])
+@pytest.mark.parametrize("fault", ["timeout", "budget", "initial", "duplicate-id"])
 def test_incomplete_replays_keep_evidenced_candidates(replay, fault):
     gpt_vote = None
-    if fault == "line":
-        gpt_vote = lambda cs: [check(cs[0], line=157)]
     if fault == "duplicate-id":
         gpt_vote = lambda cs: [check(cs[0]), check(cs[0])]
     reviewer, calls, event = replay(
@@ -400,3 +399,53 @@ def test_truncated_gpt_draft_without_claude_reports_a_failed_command(replay):
     finally:
         argus_budget._run_state.reset(token)
     assert state["succeeded"] == 0 and isinstance(state["error"], dual.LineFailed)
+
+
+def test_evidence_outside_the_hunks_makes_the_verdict_uncertain(replay):
+    reviewer, calls, event = replay(draft("证据引用了上下文行"), draft(),
+                                    lambda cs: [check(cs[0], line=157)])
+    assert len(calls) == 4 and event["cross_state"] == "complete"
+    assert event["confirmed"] == 0 and len(reviewer._argus_dual["pending"]) == 1
+
+
+def test_too_little_time_left_skips_the_check_round(replay, monkeypatch):
+    monkeypatch.setattr(dual, "CROSS_MIN_SECONDS", 3600)
+    reviewer, calls, event = replay(draft("时间不够复核"), draft())
+    assert len(calls) == 2 and event["cross_status"] == ["timeout", "timeout"]
+    assert "时间不够复核" in dual.cross_check_section(reviewer._argus_dual, [])
+
+
+def test_incomplete_claude_draft_with_findings_is_published_when_gpt_fails(replay):
+    without_security = yaml.safe_dump({"review": {"key_issues_to_review": [
+        {"relevant_file": FILE, "start_line": 158, "end_line": 158,
+         "issue_header": "Possible Bug", "issue_content": "缺少安全字段的草稿"}]}}, allow_unicode=True)
+    reviewer, calls, event = replay(RuntimeError("gpt down"), without_security)
+    assert event["cross_state"] == "partial" and len(calls) == 2
+    assert "缺少安全字段的草稿" in dual.cross_check_section(reviewer._argus_dual, [])
+
+
+def test_ordinary_pending_item_does_not_block_security_no(replay):
+    reviewer, _, event = replay(
+        draft("双方有分歧的普通问题"), draft(),
+        lambda cs: [check(c) for c in cs], lambda cs: [check(c, verdict="reject") for c in cs])
+    assert event["cross_state"] == "complete" and event["unverified"] == 1
+    assert yaml.safe_load(reviewer.prediction)["review"]["security_concerns"] == "No"
+
+
+def test_section_renders_candidate_text_as_plain_text():
+    stats = {"cross_state": "complete", "cross_status": ["ok", "ok"], "confirmed_body": [],
+             "pending": [{"issue_content": "见 [说明](https://example.invalid) 与 ![图](x) 和 'q'",
+                          "relevant_file": FILE, "start_line": 158}], "unverified": 1}
+    section = dual.cross_check_section(stats, [])
+    assert "\\[说明\\]\\(https:​//example.invalid\\)" in section
+    assert "](" not in section and "![" not in section
+    assert "&#x27;" not in section and "'q'" in section
+
+
+def test_section_neutralises_mentions_and_bare_urls():
+    stats = {"cross_state": "complete", "cross_status": ["ok", "ok"], "confirmed_body": [],
+             "pending": [{"issue_content": "ping @someone, see https://bare.example or www.x.example"}],
+             "unverified": 1}
+    section = dual.cross_check_section(stats, [])
+    assert "@someone" not in section and "https://" not in section and "www." not in section
+    assert "@​someone" in section

@@ -893,16 +893,17 @@ def _parse_cross_checks(text, head, candidates, allowed_anchor):
         for item in evidence:
             path = _norm_path(item.get("file")) if isinstance(item, dict) else ""
             line = item.get("line") if isinstance(item, dict) else None
-            if not path or type(line) is not int or line < 1 or not allowed_anchor(path, line):
-                break
-            anchors.add((path, line))
-        else:
-            trigger, impact = (entry.get(k) for k in ("trigger", "impact"))
-            if verdict == "uncertain" or (
-                    anchors and isinstance(impact, str) and impact.strip()
-                    and (verdict == "reject" or isinstance(trigger, str) and trigger.strip())):
-                checks[key] = CandidateCheck(verdict, frozenset(anchors), frozenset(same_as))
-                continue
+            # Only changed-hunk lines can anchor a finding; other cited lines are ignored.
+            if path and type(line) is int and line >= 1 and allowed_anchor(path, line):
+                anchors.add((path, line))
+        if not anchors and verdict in ("support", "reject"):
+            verdict = "uncertain"
+        trigger, impact = (entry.get(k) for k in ("trigger", "impact"))
+        if verdict == "uncertain" or (
+                anchors and isinstance(impact, str) and impact.strip()
+                and (verdict == "reject" or isinstance(trigger, str) and trigger.strip())):
+            checks[key] = CandidateCheck(verdict, frozenset(anchors), frozenset(same_as))
+            continue
         valid = False
     return checks, "ok" if valid and len(checks) == len(candidates) else "unparsed"
 
@@ -978,6 +979,18 @@ def filter_cross_extras(stats, keep):
     return dropped
 
 
+_MARKDOWN_SPECIAL = re.compile(r"([\\`*_{}\[\]()#+!|~>-])")
+
+
+def _plain_markdown(text):
+    """Model-written text shown as plain text: no links, images, mentions or formatting."""
+    text = _MARKDOWN_SPECIAL.sub(r"\\\1", text)
+    # A zero-width space stops GitHub's mention and bare-URL autolinks.
+    for token in ("@", "://", "www."):
+        text = text.replace(token, token[0] + "​" + token[1:])
+    return text
+
+
 def cross_check_section(stats, cut):
     import html
     labels = {"complete": "交叉复核完成", "empty": "两线初审完成，未发现候选问题",
@@ -998,7 +1011,7 @@ def cross_check_section(stats, cut):
             message = " ".join(str(finding.get("issue_content") or "").split())
             file = finding.get("relevant_file")
             where = f" ({file}:{finding.get('start_line') or '?'})" if file else ""
-            lines.append("- " + html.escape(message + where))
+            lines.append("- " + _plain_markdown(html.escape(message + where, quote=False)))
     hidden = stats["unverified"] - len(stats["pending"])
     if hidden:
         lines += ["", f"另有 {hidden} 条候选缺少可定位证据，需人工核查。"]
@@ -1039,6 +1052,7 @@ def cross_diff_positions(diff_files):
 
 CROSS_MAX_TOKENS = 8192
 CROSS_TOKENS_PER_CANDIDATE = 2048
+CROSS_MIN_SECONDS = 30  # a check round with less time left would only time out
 CROSS_MAX_TOKENS_CAP = 32000
 
 
@@ -1151,7 +1165,7 @@ async def _cross_prediction(reviewer, model, config, initial, prompt, head, dead
             check_status = ["budget", "budget"]
         else:
             remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
+            if remaining < CROSS_MIN_SECONDS:
                 check_status = ["timeout", "timeout"]
             else:
                 responses = await asyncio.gather(
@@ -1174,10 +1188,10 @@ async def _cross_prediction(reviewer, model, config, initial, prompt, head, dead
     base = copy.deepcopy(next((line[0] for line in parsed if line), {"review": {}}))
     base["review"]["key_issues_to_review"] = inline
     base["review"].pop("security_concerns", None)
-    if any(_is_security(f) for f in inline + body + pending) or security and unverified:
+    # Every unverified security candidate is in pending (with or without a location).
+    if any(_is_security(f) for f in inline + body + pending):
         base["review"]["security_concerns"] = "请检查本报告中的安全性意见及复核状态。"
-    elif not unverified and state != "partial" and (
-            security_answers == ["clear", "clear"] or security and state == "complete"):
+    elif state != "partial" and (security_answers == ["clear", "clear"] or security):
         base["review"]["security_concerns"] = "No"
     return yaml.safe_dump(base, sort_keys=False, allow_unicode=True, width=10 ** 6), stats
 
@@ -1221,7 +1235,7 @@ async def dual_prepare_prediction(reviewer, model, original, claude_call=None):
     if config.cross_check:
         text, stats = await _cross_prediction(
             reviewer, model, config, (gpt_result, claude_result), user, head, deadline, load_yaml)
-        if not gpt_ok and stats.get("claude_status") != "ok":
+        if not gpt_ok and stats.get("claude_status") != "ok" and not stats.get("pending"):
             _emit(reviewer, model, config, {k: v for k, v in stats.items()
                                            if k not in ("pending", "confirmed_body")})
             from argus_budget import note_command_failed
