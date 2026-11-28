@@ -50,7 +50,8 @@ def replay(monkeypatch):
         provider = SimpleNamespace(
             last_commit_id=SimpleNamespace(sha=HEAD),
             pr_num=75,
-            repo=SimpleNamespace(get_pull=lambda _: SimpleNamespace(head=SimpleNamespace(sha=head))),
+            repo="example/repo",
+            _get_repo=lambda: SimpleNamespace(get_pull=lambda _: SimpleNamespace(head=SimpleNamespace(sha=head))),
             diff_files=[SimpleNamespace(filename=FILE, patch=PATCH)])
         monkeypatch.setattr(dual, "_cross_budget_ready", lambda *args: budget)
 
@@ -256,7 +257,7 @@ def test_gpt_budget_adapter_caps_cross_call_and_charges_cancellation():
 
 @pytest.mark.parametrize(("stale", "captured", "refused"),
                          [(False, True, False), (True, True, False), (False, False, False), (False, True, True)])
-def test_publication_uses_one_source_free_review_and_rechecks_head(replay, monkeypatch, stale, captured, refused):
+def test_publication_uses_one_source_free_review_and_rechecks_head(replay, monkeypatch, capsys, stale, captured, refused):
     from pr_agent.config_loader import get_settings
     from pr_agent.git_providers.github_provider import GithubProvider
     from pr_agent.tools.pr_code_suggestions import PRCodeSuggestions
@@ -267,7 +268,8 @@ def test_publication_uses_one_source_free_review_and_rechecks_head(replay, monke
     result, _, _ = replay(draft("会发布的已核验意见"), draft())
     created, notices = [], []
     provider = result.git_provider
-    provider.repo = SimpleNamespace(
+    provider.repo = "example/repo"
+    provider._get_repo = lambda: SimpleNamespace(
         full_name="example/repo",
         get_pull=lambda _: SimpleNamespace(head=SimpleNamespace(sha="b" * 40 if stale else HEAD)))
     def create_review(**kw):
@@ -302,6 +304,8 @@ def test_publication_uses_one_source_free_review_and_rechecks_head(replay, monke
     if stale:
         assert not created and len(notices) == 1
         assert "提交已更新" in notices[0]
+        # A real head change, not a failed head query.
+        assert "could not verify the PR head" not in capsys.readouterr().out
     elif refused:
         assert not created and len(notices) == 1
         assert "交叉复核完成" in notices[0] and "会发布的已核验意见" in notices[0]
@@ -483,3 +487,30 @@ def test_slow_head_query_past_the_deadline_skips_the_check_round(replay, monkeyp
     monkeypatch.setattr(dual, "fresh_cross_head", lambda *a: time.sleep(5) or True)
     reviewer, calls, event = replay(draft("提交查询太慢"), draft())
     assert len(calls) == 2 and event["cross_status"] == ["timeout", "timeout"]
+
+
+def test_head_check_uses_the_repository_object_of_the_real_provider():
+    """pr-agent keeps the repository name in `repo`; the head check must not call it."""
+    pytest.importorskip("pr_agent")
+    from pr_agent.git_providers.github_provider import GithubProvider
+
+    provider = GithubProvider.__new__(GithubProvider)
+    provider.repo, provider.pr_num, provider.repo_obj = "example/repo", 75, None
+    pulls = []
+    repository = SimpleNamespace(
+        full_name="example/repo",
+        get_pull=lambda number: pulls.append(number) or SimpleNamespace(head=SimpleNamespace(sha=HEAD)))
+    provider.github_client = SimpleNamespace(get_repo=lambda name: repository if name == "example/repo" else None)
+
+    assert dual.fresh_cross_head(provider, HEAD) is True
+    assert dual.fresh_cross_head(provider, "b" * 40) is False
+    assert pulls == [75, 75]
+
+
+def test_dual_review_event_records_the_repository_name(monkeypatch):
+    import argus_events
+    sent = []
+    monkeypatch.setattr(argus_events.emitter, "emit", lambda *a, **k: sent.append(k))
+    reviewer = SimpleNamespace(git_provider=SimpleNamespace(repo="example/repo", pr_num=75))
+    dual._emit(reviewer, "gpt", SimpleNamespace(model="claude"), {})
+    assert sent and sent[0]["repo"] == "example/repo"
