@@ -1036,11 +1036,15 @@ def _snapshot_head(provider):
 
 
 def fresh_cross_head(provider, head):
-    """Read a new PR object. The provider's original PR/commit describes the input."""
+    """Read a new PR object. The provider's original PR/commit describes the input.
+
+    In pr-agent's GithubProvider `repo` is the "owner/name" string; the repository
+    object comes from `_get_repo()`.
+    """
     try:
-        return bool(head) and provider.repo.get_pull(provider.pr_num).head.sha == head
+        return bool(head) and provider._get_repo().get_pull(provider.pr_num).head.sha == head
     except Exception as exc:
-        print(f"[Argus Cross] could not verify the PR head: {type(exc).__name__}")
+        print(f"[Argus Cross] could not verify the PR head: {type(exc).__name__}: {str(exc)[:200]}")
         return False
 
 
@@ -1304,7 +1308,8 @@ def _emit(reviewer, model, config, stats):
     try:
         from argus_events import emitter, EventType
         provider = reviewer.git_provider
-        repo = getattr(getattr(provider, "repo", None), "full_name", None)
+        repo = getattr(provider, "repo", None)
+        repo = getattr(repo, "full_name", None) or (str(repo) if repo else None)
         emitter.emit(EventType.DUAL_REVIEW, pr_number=getattr(provider, "pr_num", None), repo=repo,
                      gpt_model=str(model), claude_model=config.model, **dict(stats))
     except Exception as e:
